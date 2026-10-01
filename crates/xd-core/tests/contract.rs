@@ -35,7 +35,7 @@ fn ping_response_matches_golden() {
     let expected = Response::Ok(RpcOk {
         jsonrpc: "2.0".into(),
         id: serde_json::json!(1),
-        result: serde_json::json!({"pong": true, "version": "0.1.0", "protocol": PROTOCOL_VERSION}),
+        result: serde_json::json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}),
     });
     assert_eq!(parsed, expected);
     assert_eq!(serde_json::to_value(&expected).unwrap(), v);
@@ -68,10 +68,8 @@ fn error_response_matches_golden() {
         Response::Err(RpcErr {
             jsonrpc: "2.0".into(),
             id: serde_json::json!(7),
-            error: RpcError {
-                code: -32601,
-                message: "Method not found: scan.start".into()
-            },
+            error: RpcError::method_not_found("scan.start"),
         })
     );
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), v);
 }
