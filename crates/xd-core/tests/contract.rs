@@ -20,6 +20,15 @@ fn ping_request_matches_golden() {
 }
 
 #[test]
+fn device_list_request_matches_golden() {
+    let parsed: Request = serde_json::from_value(golden("device_list.request.json")).unwrap();
+    assert_eq!(parsed.jsonrpc, "2.0");
+    assert_eq!(parsed.id, serde_json::json!(2));
+    assert_eq!(parsed.method, "device.list");
+    assert_eq!(parsed.params, None);
+}
+
+#[test]
 fn ping_response_matches_golden() {
     let v = golden("ping.response.json");
     let parsed: Response = serde_json::from_value(v.clone()).unwrap();
