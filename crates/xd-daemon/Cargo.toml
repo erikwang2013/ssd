@@ -1,0 +1,9 @@
+[package]
+name = "xd-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+xd-core = { path = "../xd-core" }
+xd-device = { path = "../xd-device" }

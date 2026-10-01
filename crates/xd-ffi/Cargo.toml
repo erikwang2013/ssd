@@ -1,0 +1,4 @@
+[package]
+name = "xd-ffi"
+version.workspace = true
+edition.workspace = true

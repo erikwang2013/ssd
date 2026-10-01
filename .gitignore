@@ -1,0 +1,25 @@
+# Ruflo local secrets and runtime data
+.env
+.env.local
+.env.*.local
+.claude-flow/data/
+.claude-flow/logs/
+.claude-flow/sessions/
+.claude
+.agents
+.swarm
+.mcp.json
+ruvector.db
+
+# Codex local configuration
+.codex/
+# Claude Flow runtime data
+# Environment variables
+
+# Rust
+target/
+
+# Flutter
+ui/build/
+ui/.dart_tool/
+ui/.flutter-plugins*
