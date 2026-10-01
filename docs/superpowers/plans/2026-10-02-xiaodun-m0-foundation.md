@@ -532,6 +532,15 @@ fn ping_request_matches_golden() {
 }
 
 #[test]
+fn device_list_request_matches_golden() {
+    let parsed: Request = serde_json::from_value(golden("device_list.request.json")).unwrap();
+    assert_eq!(parsed.jsonrpc, "2.0");
+    assert_eq!(parsed.id, serde_json::json!(2));
+    assert_eq!(parsed.method, "device.list");
+    assert_eq!(parsed.params, None);
+}
+
+#[test]
 fn ping_response_matches_golden() {
     let v = golden("ping.response.json");
     let parsed: Response = serde_json::from_value(v.clone()).unwrap();
@@ -666,7 +675,7 @@ pub mod api;
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test -p xd-core`
-Expected: 4 passed。
+Expected: 5 passed。
 
 - [ ] **Step 6: Commit**
 
@@ -809,7 +818,7 @@ tempfile = { workspace = true }
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test -p xd-core`
-Expected: 8 passed（4 contract + 4 handlers）。
+Expected: 9 passed（5 contract + 4 handlers）。
 
 - [ ] **Step 6: Commit**
 
@@ -1112,6 +1121,11 @@ void main() {
   test('encodeRequest matches golden request', () {
     final encoded = jsonDecode(encodeRequest(id: 1, method: 'ping', params: null));
     expect(encoded, golden('ping.request.json'));
+  });
+
+  test('encodeRequest matches device_list request golden', () {
+    final encoded = jsonDecode(encodeRequest(id: 2, method: 'device.list', params: null));
+    expect(encoded, golden('device_list.request.json'));
   });
 
   test('error golden throws RpcException with code', () {
@@ -1547,7 +1561,7 @@ Run:
 ```bash
 cd ui && flutter analyze && flutter test
 ```
-Expected: analyze 无 error；protocol_test 4 passed、home_page_test 2 passed。
+Expected: analyze 无 error；protocol_test 5 passed、home_page_test 2 passed。
 
 - [ ] **Step 7: 真实 daemon 集成测试 `ui/test/ipc_integration_test.dart`**
 
