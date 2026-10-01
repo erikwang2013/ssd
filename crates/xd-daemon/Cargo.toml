@@ -7,3 +7,6 @@ edition.workspace = true
 serde_json = { workspace = true }
 xd-core = { path = "../xd-core" }
 xd-device = { path = "../xd-device" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
