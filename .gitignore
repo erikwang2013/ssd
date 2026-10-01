@@ -23,3 +23,6 @@ target/
 ui/build/
 ui/.dart_tool/
 ui/.flutter-plugins*
+
+# Generated test images
+fixtures/*.img

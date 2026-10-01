@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 生成确定性测试镜像：默认 1 MiB，字节模式 (i*7+13) mod 256。
 set -euo pipefail
-out="${1:-fixtures/test.img}"
+out="${1:-$(dirname "$0")/test.img}"
 size="${2:-1048576}"
 python3 - "$out" "$size" <<'PY'
 import sys

@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# M0 端到端冒烟：构建 daemon → 生成镜像 → 走 stdio 发 ping + device.list → 断言。
+# M0 端到端冒烟：生成镜像 → 走 stdio 发 ping + device.list → 断言。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build -p xd-daemon --quiet
 bash fixtures/gen_image.sh /tmp/xiaodun-m0-test.img 65536 >/dev/null
 
 out=$(printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' \
   '{"jsonrpc":"2.0","id":2,"method":"device.list","params":null}' \
-  | ./target/debug/xd-daemon --image /tmp/xiaodun-m0-test.img)
+  | cargo run -q -p xd-daemon -- --image /tmp/xiaodun-m0-test.img)
 
 echo "$out"
 echo "$out" | grep -q '"pong":true'  || { echo "FAIL: ping"; exit 1; }
