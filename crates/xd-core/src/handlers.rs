@@ -115,4 +115,16 @@ mod tests {
         .unwrap();
         assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
     }
+
+    #[test]
+    fn error_round_trip_matches_response_golden() {
+        // err() 输出路径同样钉死（jsonrpc 字面量在 Err 分支独立存在）
+        let ctx = CoreCtx::new(vec![]);
+        let resp = handle_request(&ctx, &req(7, "scan.start"));
+        let expected: serde_json::Value = serde_json::from_str(
+            include_str!("../../../proto/v0/examples/error_method_not_found.response.json").trim(),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+    }
 }
