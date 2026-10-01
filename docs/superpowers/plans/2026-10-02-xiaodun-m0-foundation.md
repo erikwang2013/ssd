@@ -547,7 +547,7 @@ fn ping_response_matches_golden() {
     let expected = Response::Ok(RpcOk {
         jsonrpc: "2.0".into(),
         id: serde_json::json!(1),
-        result: serde_json::json!({"pong": true, "version": "0.1.0", "protocol": PROTOCOL_VERSION}),
+        result: serde_json::json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}),
     });
     assert_eq!(parsed, expected);
     assert_eq!(serde_json::to_value(&expected).unwrap(), v);
@@ -580,12 +580,11 @@ fn error_response_matches_golden() {
         Response::Err(RpcErr {
             jsonrpc: "2.0".into(),
             id: serde_json::json!(7),
-            error: RpcError {
-                code: -32601,
-                message: "Method not found: scan.start".into()
-            },
+            error: RpcError::method_not_found("scan.start"),
         })
     );
+    // encode 方向：RpcErr 独立于 RpcOk，需单独钉死
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), v);
 }
 ```
 
@@ -1693,4 +1692,4 @@ git commit -m "ci: Rust 三平台矩阵与 Flutter job"
 
 - M1 起点：`xd-fs-fat`（FAT/exFAT 快速扫描）、carving v1（JPEG/PNG）、扫描三页 UI、Windows 提权打包。届时按需新增 crate 成员与 proto 方法（`scan.start`/`scan.progress` 事件流）。
 - M0 未做但已为此预留的形状：BlockDevice trait（物理设备后端直接实现它）、RpcError 错误码表、golden 契约流程（新方法 = 新 golden + 两侧测试）。
-- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现。
+- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）。
