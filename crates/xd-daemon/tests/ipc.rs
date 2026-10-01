@@ -1,8 +1,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 struct Daemon {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
@@ -18,6 +19,15 @@ impl Daemon {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        let child = Arc::new(Mutex::new(child));
+        // watchdog：daemon 活着但不回话时 30 秒杀进程，避免测试挂死（CI 上会长挂而非失败）
+        let watchdog = Arc::clone(&child);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Ok(mut c) = watchdog.lock() {
+                let _ = c.kill();
+            }
+        });
         Self {
             child,
             stdin,
@@ -36,8 +46,10 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
@@ -82,4 +94,33 @@ fn malformed_line_does_not_kill_stream() {
     let resp = d.call(r#"{"jsonrpc":"2.0","id":11,"method":"ping","params":null}"#);
     assert_eq!(resp["id"], 11);
     assert_eq!(resp["result"]["pong"], true);
+}
+
+#[test]
+fn arg_errors_exit_with_code_2() {
+    // 未知参数
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .arg("--bogus")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown argument"));
+
+    // --image 缺路径
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .arg("--image")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires a path"));
+
+    // --image 指向不存在的文件
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .args(["--image", "/nonexistent/xiaodun-test.img"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot open image"));
 }

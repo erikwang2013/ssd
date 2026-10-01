@@ -39,7 +39,13 @@ fn main() {
     let mut stdout = std::io::stdout().lock();
 
     for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("error: read failed: {e}");
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
