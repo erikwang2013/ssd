@@ -1088,6 +1088,7 @@ git commit -m "feat(daemon): stdio JSON-RPC 服务与 --image 设备注册"
 
 **Files:**
 - Create: `fixtures/gen_image.sh`、`scripts/e2e.sh`
+- Modify: `.gitignore`（追加 `fixtures/*.img`）
 
 - [ ] **Step 1: 写 `fixtures/gen_image.sh`（确定性镜像：同样参数永远同样字节）**
 
@@ -1095,7 +1096,7 @@ git commit -m "feat(daemon): stdio JSON-RPC 服务与 --image 设备注册"
 #!/usr/bin/env bash
 # 生成确定性测试镜像：默认 1 MiB，字节模式 (i*7+13) mod 256。
 set -euo pipefail
-out="${1:-fixtures/test.img}"
+out="${1:-$(dirname "$0")/test.img}"
 size="${2:-1048576}"
 python3 - "$out" "$size" <<'PY'
 import sys
@@ -1114,13 +1115,12 @@ echo "wrote ${out} (${size} bytes)"
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build -p xd-daemon --quiet
 bash fixtures/gen_image.sh /tmp/xiaodun-m0-test.img 65536 >/dev/null
 
 out=$(printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' \
   '{"jsonrpc":"2.0","id":2,"method":"device.list","params":null}' \
-  | ./target/debug/xd-daemon --image /tmp/xiaodun-m0-test.img)
+  | cargo run -q -p xd-daemon -- --image /tmp/xiaodun-m0-test.img)
 
 echo "$out"
 echo "$out" | grep -q '"pong":true'  || { echo "FAIL: ping"; exit 1; }
@@ -1717,6 +1717,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: bash scripts/e2e.sh
+        if: runner.os == 'Linux'
 
   flutter:
     runs-on: ubuntu-latest
@@ -1769,4 +1771,4 @@ git commit -m "ci: Rust 三平台矩阵与 Flutter job"
 
 - M1 起点：`xd-fs-fat`（FAT/exFAT 快速扫描）、carving v1（JPEG/PNG）、扫描三页 UI、Windows 提权打包。届时按需新增 crate 成员与 proto 方法（`scan.start`/`scan.progress` 事件流）。
 - M0 未做但已为此预留的形状：BlockDevice trait（物理设备后端直接实现它）、RpcError 错误码表、golden 契约流程（新方法 = 新 golden + 两侧测试）。
-- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）；⑤ M1 设计输入（Task 6 审查）：daemon 是同步阻塞单线程——`scan.start` 类长任务会阻塞 ping/device.list；进度事件与响应共写 stdout 需要单写者串行化（writer 线程或互斥保证行原子性）。
+- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）；⑤ M1 设计输入（Task 6 审查）：daemon 是同步阻塞单线程——`scan.start` 类长任务会阻塞 ping/device.list；进度事件与响应共写 stdout 需要单写者串行化（writer 线程或互斥保证行原子性）；⑥ e2e.sh 无超时（M1 scan 阻塞前需加 timeout，注意 macOS 无 GNU timeout 需探测）。
