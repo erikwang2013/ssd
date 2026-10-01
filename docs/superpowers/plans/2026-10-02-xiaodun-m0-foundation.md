@@ -1100,7 +1100,7 @@ void main() {
     final msg = golden('ping.response.json');
     final ping = PingResult.fromJson(msg['result'] as Map<String, dynamic>);
     expect(ping.pong, isTrue);
-    expect(ping.version, '0.1.0');
+    expect(ping.version, isNotEmpty); // 版本值随发版变动（与 Rust 侧 env! 策略对齐），此处只验证字段解析
     expect(ping.protocol, 0);
   });
 
