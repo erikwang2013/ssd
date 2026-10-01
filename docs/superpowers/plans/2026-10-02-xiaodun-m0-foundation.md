@@ -70,7 +70,7 @@ ui/                                 # Flutter app（flutter create 生成）
 
 ```toml
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/xd-core",
     "crates/xd-device",
