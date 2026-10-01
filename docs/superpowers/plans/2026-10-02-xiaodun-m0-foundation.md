@@ -206,9 +206,9 @@ git commit -m "build: Rust workspace 骨架（xd-core/xd-device/xd-daemon/xd-ffi
 ```markdown
 # 小盾 IPC 契约 v0
 
-- 传输：stdio，每行一条 JSON（LF 结尾），UTF-8。**stdout 仅输出 JSON-RPC 响应行；日志与诊断一律走 stderr。**
+- 传输：stdio，每行一条 JSON（LF 结尾），UTF-8。**stdout 仅输出 JSON-RPC 响应行；日志与诊断一律走 stderr。** 空行被忽略（不产生响应）。
 - 信封：JSON-RPC 2.0。`id` 为请求方生成的整数，必须原样回显。
-- 版本：`protocol = 0`。破坏性变更递增；daemon 与 UI 不匹配时由 `ping` 比对 `protocol` 检出。
+- 版本：`protocol = 0`。破坏性变更递增；daemon 与 UI 不匹配时由 `ping` 比对 `protocol` 检出。M0 不校验信封 `jsonrpc` 字段值。
   `version` 随 workspace 版本更新；仅因发版改动 golden 中的 `version` 不属于契约变更。
 - **golden 规则**：`examples/*.json` 是契约唯一事实源。Rust（`crates/xd-core/tests/contract.rs`）
   与 Dart（`ui/test/protocol_test.dart`）两侧测试都对同一组文件断言：解析（decode）须逐字段一致，
@@ -867,9 +867,10 @@ git commit -m "feat(core): ping 与 device.list 处理器"
 ```rust
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 struct Daemon {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
@@ -885,6 +886,15 @@ impl Daemon {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        let child = Arc::new(Mutex::new(child));
+        // watchdog：daemon 活着但不回话时 30 秒杀进程，避免测试挂死（CI 上会长挂而非失败）
+        let watchdog = Arc::clone(&child);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if let Ok(mut c) = watchdog.lock() {
+                let _ = c.kill();
+            }
+        });
         Self { child, stdin, stdout }
     }
 
@@ -899,8 +909,10 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
@@ -945,6 +957,35 @@ fn malformed_line_does_not_kill_stream() {
     let resp = d.call(r#"{"jsonrpc":"2.0","id":11,"method":"ping","params":null}"#);
     assert_eq!(resp["id"], 11);
     assert_eq!(resp["result"]["pong"], true);
+}
+
+#[test]
+fn arg_errors_exit_with_code_2() {
+    // 未知参数
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .arg("--bogus")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown argument"));
+
+    // --image 缺路径
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .arg("--image")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires a path"));
+
+    // --image 指向不存在的文件
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .args(["--image", "/nonexistent/xiaodun-test.img"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot open image"));
 }
 ```
 
@@ -1003,7 +1044,13 @@ fn main() {
     let mut stdout = std::io::stdout().lock();
 
     for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("error: read failed: {e}");
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -1026,7 +1073,7 @@ fn main() {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-daemon`
-Expected: 4 passed。
+Expected: 5 passed。
 
 - [ ] **Step 5: Commit**
 
@@ -1661,6 +1708,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -1672,6 +1720,7 @@ jobs:
 
   flutter:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ui
@@ -1720,4 +1769,4 @@ git commit -m "ci: Rust 三平台矩阵与 Flutter job"
 
 - M1 起点：`xd-fs-fat`（FAT/exFAT 快速扫描）、carving v1（JPEG/PNG）、扫描三页 UI、Windows 提权打包。届时按需新增 crate 成员与 proto 方法（`scan.start`/`scan.progress` 事件流）。
 - M0 未做但已为此预留的形状：BlockDevice trait（物理设备后端直接实现它）、RpcError 错误码表、golden 契约流程（新方法 = 新 golden + 两侧测试）。
-- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）。
+- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）；⑤ M1 设计输入（Task 6 审查）：daemon 是同步阻塞单线程——`scan.start` 类长任务会阻塞 ping/device.list；进度事件与响应共写 stdout 需要单写者串行化（writer 线程或互斥保证行原子性）。
