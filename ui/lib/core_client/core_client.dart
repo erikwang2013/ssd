@@ -4,4 +4,7 @@ import 'protocol.dart';
 abstract class CoreClient {
   Future<PingResult> ping();
   Future<List<DeviceInfo>> listDevices();
+
+  /// 释放底层资源（桌面实现：关闭 daemon 进程；测试 fake：空实现）。
+  Future<void> close();
 }

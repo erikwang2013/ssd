@@ -5,12 +5,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:xiaodun_ui/core_client/protocol.dart';
 
 Map<String, dynamic> golden(String name) =>
-    jsonDecode(File('../proto/v0/examples/$name').readAsStringSync()) as Map<String, dynamic>;
+    jsonDecode(File('../proto/v0/examples/$name').readAsStringSync())
+        as Map<String, dynamic>;
 
 void main() {
   test('ping response golden decodes', () {
     final msg = golden('ping.response.json');
-    final ping = PingResult.fromJson(msg['result'] as Map<String, dynamic>);
+    final ping = PingResult.fromJson(decodeResult(msg));
     expect(ping.pong, isTrue);
     expect(ping.version, isNotEmpty); // 版本值随发版变动（与 Rust 侧 env! 策略对齐），此处只验证字段解析
     expect(ping.protocol, 0);
@@ -18,7 +19,7 @@ void main() {
 
   test('device_list response golden decodes', () {
     final msg = golden('device_list.response.json');
-    final devices = (msg['result']['devices'] as List)
+    final devices = (decodeResult(msg)['devices'] as List)
         .map((e) => DeviceInfo.fromJson(e as Map<String, dynamic>))
         .toList();
     expect(devices, hasLength(1));
@@ -30,12 +31,16 @@ void main() {
   });
 
   test('encodeRequest matches golden request', () {
-    final encoded = jsonDecode(encodeRequest(id: 1, method: 'ping', params: null));
+    final encoded = jsonDecode(
+      encodeRequest(id: 1, method: 'ping', params: null),
+    );
     expect(encoded, golden('ping.request.json'));
   });
 
   test('encodeRequest matches device_list request golden', () {
-    final encoded = jsonDecode(encodeRequest(id: 2, method: 'device.list', params: null));
+    final encoded = jsonDecode(
+      encodeRequest(id: 2, method: 'device.list', params: null),
+    );
     expect(encoded, golden('device_list.request.json'));
   });
 

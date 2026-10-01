@@ -18,36 +18,40 @@ class DeviceInfo {
   final String? fsGuess;
 
   factory DeviceInfo.fromJson(Map<String, dynamic> json) => DeviceInfo(
-        id: json['id'] as String,
-        name: json['name'] as String,
-        kind: json['kind'] as String,
-        sizeBytes: json['sizeBytes'] as int,
-        removable: json['removable'] as bool,
-        fsGuess: json['fsGuess'] as String?,
-      );
+    id: json['id'] as String,
+    name: json['name'] as String,
+    kind: json['kind'] as String,
+    sizeBytes: json['sizeBytes'] as int,
+    removable: json['removable'] as bool,
+    fsGuess: json['fsGuess'] as String?,
+  );
 
   Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'kind': kind,
-        'sizeBytes': sizeBytes,
-        'removable': removable,
-        'fsGuess': fsGuess,
-      };
+    'id': id,
+    'name': name,
+    'kind': kind,
+    'sizeBytes': sizeBytes,
+    'removable': removable,
+    'fsGuess': fsGuess,
+  };
 }
 
 class PingResult {
-  const PingResult({required this.pong, required this.version, required this.protocol});
+  const PingResult({
+    required this.pong,
+    required this.version,
+    required this.protocol,
+  });
 
   final bool pong;
   final String version;
   final int protocol;
 
   factory PingResult.fromJson(Map<String, dynamic> json) => PingResult(
-        pong: json['pong'] as bool,
-        version: json['version'] as String,
-        protocol: json['protocol'] as int,
-      );
+    pong: json['pong'] as bool,
+    version: json['version'] as String,
+    protocol: json['protocol'] as int,
+  );
 }
 
 class RpcException implements Exception {
@@ -58,10 +62,20 @@ class RpcException implements Exception {
   String toString() => 'RpcException($code): $message';
 }
 
-String encodeRequest({required Object id, required String method, Object? params}) =>
-    jsonEncode({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params});
+String encodeRequest({
+  required Object id,
+  required String method,
+  Object? params,
+}) => jsonEncode({
+  'jsonrpc': '2.0',
+  'id': id,
+  'method': method,
+  'params': params,
+});
 
 /// 从一条完整响应消息中取出 result；错误响应抛出 [RpcException]。
+/// 输入须是本 daemon 产出的合法信封（error 为对象、result 为对象）；
+/// 畸形输入会抛 [TypeError]——上层按通用异常捕获处理。
 Map<String, dynamic> decodeResult(Map<String, dynamic> message) {
   final error = message['error'];
   if (error != null) {
