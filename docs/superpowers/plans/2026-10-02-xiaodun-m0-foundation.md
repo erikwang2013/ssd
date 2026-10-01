@@ -1148,7 +1148,6 @@ git commit -m "test: 确定性镜像生成与 M0 端到端冒烟脚本"
 **前置：** Flutter SDK 可用（`flutter --version` 有输出；本机在 `~/flutter/bin/flutter`）。
 **Files:**
 - Create: `ui/`（`flutter create`）、`ui/lib/core_client/protocol.dart`、`ui/lib/core_client/core_client.dart`、`ui/test/protocol_test.dart`
-- Modify: `ui/lib/main.dart`（替换模板）
 
 - [ ] **Step 1: 生成 Flutter 工程**
 
@@ -1173,7 +1172,7 @@ Map<String, dynamic> golden(String name) =>
 void main() {
   test('ping response golden decodes', () {
     final msg = golden('ping.response.json');
-    final ping = PingResult.fromJson(msg['result'] as Map<String, dynamic>);
+    final ping = PingResult.fromJson(decodeResult(msg));
     expect(ping.pong, isTrue);
     expect(ping.version, isNotEmpty); // 版本值随发版变动（与 Rust 侧 env! 策略对齐），此处只验证字段解析
     expect(ping.protocol, 0);
@@ -1181,7 +1180,7 @@ void main() {
 
   test('device_list response golden decodes', () {
     final msg = golden('device_list.response.json');
-    final devices = (msg['result']['devices'] as List)
+    final devices = (decodeResult(msg)['devices'] as List)
         .map((e) => DeviceInfo.fromJson(e as Map<String, dynamic>))
         .toList();
     expect(devices, hasLength(1));
@@ -1284,6 +1283,8 @@ String encodeRequest({required Object id, required String method, Object? params
     jsonEncode({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params});
 
 /// 从一条完整响应消息中取出 result；错误响应抛出 [RpcException]。
+/// 输入须是本 daemon 产出的合法信封（error 为对象、result 为对象）；
+/// 畸形输入会抛 [TypeError]——上层按通用异常捕获处理。
 Map<String, dynamic> decodeResult(Map<String, dynamic> message) {
   final error = message['error'];
   if (error != null) {
@@ -1303,13 +1304,16 @@ import 'protocol.dart';
 abstract class CoreClient {
   Future<PingResult> ping();
   Future<List<DeviceInfo>> listDevices();
+
+  /// 释放底层资源（桌面实现：关闭 daemon 进程；测试 fake：空实现）。
+  Future<void> close();
 }
 ```
 
 - [ ] **Step 6: 运行测试确认通过**
 
 Run: `cd ui && flutter test test/protocol_test.dart`
-Expected: 4 passed。
+Expected: 5 passed。
 
 - [ ] **Step 7: Commit**
 
@@ -1344,6 +1348,9 @@ class FakeCoreClient implements CoreClient {
 
   @override
   Future<List<DeviceInfo>> listDevices() async => devices;
+
+  @override
+  Future<void> close() async {}
 }
 
 class FailingCoreClient implements CoreClient {
@@ -1352,6 +1359,9 @@ class FailingCoreClient implements CoreClient {
 
   @override
   Future<List<DeviceInfo>> listDevices() async => throw const RpcException(-1, 'boom');
+
+  @override
+  Future<void> close() async {}
 }
 
 void main() {
@@ -1450,7 +1460,8 @@ class IpcCoreClient implements CoreClient {
     if (completer == null) return;
     try {
       completer.complete(decodeResult(message));
-    } on RpcException catch (e) {
+    } catch (e) {
+      // RpcException 或畸形信封导致的 TypeError：都让调用方收到错误而不是悬挂
       completer.completeError(e);
     }
   }
@@ -1624,6 +1635,9 @@ class _MissingDaemonClient implements CoreClient {
   @override
   Future<List<DeviceInfo>> listDevices() async =>
       throw StateError('未找到 daemon：请设置 XD_DAEMON_BIN');
+
+  @override
+  Future<void> close() async {}
 }
 ```
 
@@ -1728,11 +1742,15 @@ jobs:
         working-directory: ui
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+      - run: cargo build -p xd-daemon
       - run: flutter analyze
       - run: flutter test
+        env:
+          XD_DAEMON_BIN: ${{ github.workspace }}/target/debug/xd-daemon
 ```
 
 - [ ] **Step 2: 本地全量验证（模拟 CI）**
