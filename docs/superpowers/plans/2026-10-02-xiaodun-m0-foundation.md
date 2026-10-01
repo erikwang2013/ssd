@@ -749,6 +749,22 @@ mod tests {
         assert_eq!(e.error.code, -32601);
         assert_eq!(e.error.message, "Method not found: scan.start");
     }
+
+    #[test]
+    fn ping_round_trip_matches_response_golden() {
+        // 走真实输出路径：请求 golden → handle_request → 与响应 golden 全等（含 jsonrpc 字段）
+        let ctx = CoreCtx::new(vec![]);
+        let req: Request = serde_json::from_str(
+            include_str!("../../../proto/v0/examples/ping.request.json").trim(),
+        )
+        .unwrap();
+        let resp = handle_request(&ctx, &req);
+        let expected: serde_json::Value = serde_json::from_str(
+            include_str!("../../../proto/v0/examples/ping.response.json").trim(),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+    }
 }
 ```
 
@@ -817,7 +833,7 @@ tempfile = { workspace = true }
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test -p xd-core`
-Expected: 9 passed（5 contract + 4 handlers）。
+Expected: 10 passed（5 contract + 5 handlers）。
 
 - [ ] **Step 6: Commit**
 
