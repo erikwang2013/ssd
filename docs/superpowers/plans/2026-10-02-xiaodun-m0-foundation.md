@@ -822,7 +822,7 @@ Expected: 9 passed（5 contract + 4 handlers）。
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/xd-core
+git add crates/xd-core Cargo.lock
 git commit -m "feat(core): ping 与 device.list 处理器"
 ```
 
@@ -1003,7 +1003,7 @@ Expected: 4 passed。
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/xd-daemon
+git add crates/xd-daemon Cargo.lock
 git commit -m "feat(daemon): stdio JSON-RPC 服务与 --image 设备注册"
 ```
 
