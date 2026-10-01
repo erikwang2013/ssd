@@ -347,7 +347,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] 同时把 `crates/xd-device/src/lib.rs` 先改成一行 `pub mod image;`（否则 image.rs 不会被编译，Step 2 不会如预期失败）。
+
+**Step 2: 运行测试确认失败**
 
 Run: `cargo test -p xd-device`
 Expected: 编译失败（`ImageFileDevice` 未定义）。
