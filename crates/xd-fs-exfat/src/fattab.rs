@@ -53,6 +53,7 @@ impl<'d> Fat32<'d> {
         let mut cur = start;
         while (out.len() as u64) <= max_cluster {
             let v = self.next_raw(cur)?;
+            // is_eoc/BAD_CLUSTER 在合法几何下被上界覆盖（非承重，保留以对齐规范可读性）
             if v < 2 || is_eoc(v) || v == BAD_CLUSTER || (v as u64) > max_cluster {
                 break;
             }
@@ -74,6 +75,7 @@ pub fn read_allocation(
     data_length: u64,
 ) -> Result<Vec<u8>, ExfatError> {
     if data_length == 0 {
+        // dl==0：空分配直接 Ok(0)，不校验起点（调用点均先验；顺序语义见 qual-t3 Minor 7）
         return Ok(Vec::new());
     }
     if data_length > 64 * 1024 * 1024 {
