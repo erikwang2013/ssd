@@ -29,8 +29,9 @@ fn main() {
                 };
                 // root 模式（pkexec 兜底）纵深防御：O_NOFOLLOW 打开 + 属主须为 PKEXEC_UID。
                 // 常规路径（uaccess，euid != 0）不做此校验：权限由 udev ACL 与文件属主决定。
+                // root_mode 对 euid 读不到（None）失败关闭——不静默跳过校验。
                 #[cfg(target_os = "linux")]
-                if euid == Some(0) {
+                if privcheck::root_mode(euid) {
                     use std::os::unix::fs::MetadataExt;
                     let file = match privcheck::open_image_no_follow(&PathBuf::from(&path)) {
                         Ok(f) => f,

@@ -21,15 +21,21 @@ class IpcCoreClient implements CoreClient {
   }
 
   /// 启动 daemon。[daemonPath] 缺省取环境变量 XD_DAEMON_BIN。
+  /// [environment] 追加到子进程环境（测试用；root 宿主注入 PKEXEC_UID）。
   static Future<IpcCoreClient> start({
     String? daemonPath,
     List<String> extraArgs = const [],
+    Map<String, String>? environment,
   }) async {
     final path = daemonPath ?? Platform.environment['XD_DAEMON_BIN'];
     if (path == null) {
       throw StateError('设置 XD_DAEMON_BIN 或传入 daemonPath 指向 xd-daemon 可执行文件');
     }
-    final process = await Process.start(path, extraArgs);
+    final process = await Process.start(
+      path,
+      extraArgs,
+      environment: environment,
+    );
     return IpcCoreClient._(process);
   }
 

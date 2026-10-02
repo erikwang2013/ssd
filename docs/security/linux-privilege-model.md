@@ -15,7 +15,7 @@
 | 方案 | 内容 | 决策 |
 |------|------|------|
 | **A. udev uaccess（主）** | 规则对 USB 存储/SD 卡打 `TAG+="uaccess"`，systemd-logind 给**活动会话**用户加 ACL | **采用**——零代码改动、零提示、无 root 进程 |
-| **C. pkexec 白名单（兜底）** | polkit action 限定 exec.path，通过 pkexec 以 root 拉起 `xd-daemon`；root 模式对参数做纵深校验 | **采用**（兜底：logind 缺席/非活动会话/权 ACL 未命中时） |
+| **C. pkexec 白名单（兜底）** | polkit action 限定 exec.path，通过 pkexec 以 root 拉起 `xd-daemon`；root 模式对参数做纵深校验 | **采用**（兜底：ACL 未命中/无活动会话时；注意 SSH/无会话场景因 `allow_any=no` 可能**硬拒且无提示**，不可用即不可用） |
 | **D. AppImage 自带提权** | 打包 AppImage 并让其中二进制提权 | **不做**——结构性冲突：AppImage 走 FUSE 挂载，默认 `nosuid`，且无法安装 udev/polkit 系统文件 |
 
 产品形态因此是 **deb + uaccess 主 / pkexec 兜底 / AppImage 不做**。
@@ -53,24 +53,37 @@ logind 翻译为 `g:user:rw`）。因此只读铁律**不在权限层**，而在
 **残留缺口（已知，未修）**：`ImageFileDevice::open` 内部按**路径**二次打开（跟随符号链接），
 与上面的 `O_NOFOLLOW` 检查之间存在 TOCTOU 窗口：理论上可在检查通过后把路径换成指向他人文件的
 符号链接。实际可达性受第一道约束：须诱导真人完成一次认证（`auth_admin` 给的是**每次调用的一次性
-授权**，既非缓存授权，也不等于攻击者拿到 admin 口令），故 M1 不修，交由中期硬化一并处理（见下节）。M2+ 需要动 `xd-device`
-（新增 fd 版构造函数）才能闭合。
+授权**，既非缓存授权，也不等于攻击者拿到 admin 口令）。**诚实边界**：残窗对已认证的执意调用者
+理论可赢（在自有目录内 rename 轮换符号链接）；第二道主要防 keep 误配与非竞速攻击者，闭合归 M4
+的 `from_file`（需动 `xd-device`）。
+
+**已考虑并排除的同类面**：硬链接（`link()` 需对目标有写权限或 `Protected_hardlinks` 放行，
+他人文件到不了手）；bind mount（同理性，且挂载需 CAP_SYS_ADMIN——此时攻击者已是 root）；
+user namespace（userns 内的 root 无宿主 CAP_DAC_OVERRIDE，读不了宿主他人文件）。三者结论：
+不构成绕过第二道的路径。
 
 ## 4. 中期硬化方向（M4 提权设计时执行）
 
-- **root 只做最小动作**：root 进程只负责 `open()`，随即 `setuid(PKEXEC_UID)` 回调落回调用者
-  身份再跑解析——root 窗口缩到一次 open；顺带自然闭合第 3 节的 TOCTOU（后续读取都在 fd 上）。
+- **root 只做最小动作**：root 进程只负责 `open()`，随即降权回调用者身份再跑解析——root 窗口
+  缩到一次 open；顺带自然闭合第 3 节的 TOCTOU（后续读取都在 fd 上）。降权顺序：
+  `setgroups(0)` → `setresgid` → `setresuid`（gid/uid 取 pkexec 提供的 `PKEXEC_UID` 与同源 GID，
+  真机核 pkexec 是否给 GID），配上 `PR_SET_NO_NEW_PRIVS`，
+  且**必须在建任何线程之前**（多线程进程降权不彻底；daemon 现为单线程入口，改动时勿破坏）。
+  成本句：**降权后无法再 open** 新的设备节点（ACL 不再适用/无权限），故所有 `open` 必须前置到
+  降权之前一次做完，后续解析只走已打开的 fd。
 - **fd 化构造**：`ImageFileDevice` 增 `from_file(File, name)`，`privcheck` 打开的 `O_NOFOLLOW`
   fd 直接下沉，不再按路径二次打开。
 - 依赖已就位：`rustix` / `libc` 已在 `Cargo.lock`（无需新增依赖即可做 setuid/openat2）。
 
 ## 5. 未验证清单（平台专有，交付标注"未验证"；M1 出口真机手测）
 
-- [ ] udev uaccess 真机生效：装 deb → 插 U 盘 → 普通用户免密扫描（对照 `getfacl /dev/sdX1` 应见
-      当前会话用户 `rw` ACL）。
-- [ ] SD 卡（`mmcblk[0-9]*`）同上。
-- [ ] polkit 真实认证路径：非活动会话/`allow_any=no` 下 pkexec 弹认证框；**认证一次后再次调用仍弹框**
-      （证明非 keep）。
-- [ ] `euid==0` 参数防御：`pkexec xd-daemon --image <他人文件>` → exit 2 且打印属主不符；
-      `--image <符号链接>` → 打开失败。
+- [ ] udev uaccess 真机生效（两场景都要打）：①U 盘/易驱线/移动 SSD（`SUBSYSTEMS=="usb"`，
+      **含 RMB=0 的硬盘盒**）②SD 卡（`mmcblk[0-9]*` + `removable==1`）；普通用户免密扫描
+      （对照 `getfacl /dev/sdX1` 应见当前会话用户 `rw` ACL）。
+- [ ] 内置 eMMC（`mmcblk0`，removable=0）与 `mmcblk0boot0/rpmb` **未获** uaccess（收窄逻辑
+      待真机 SD 读卡器 + eMMC 双场景验证）。
+- [ ] polkit 真实认证路径：本机非活动会话（`allow_inactive=auth_admin`）弹认证框；**认证一次后
+      再次调用仍弹框**（证明非 keep）；SSH/无本地会话 → `allow_any=no` 硬拒（不弹框）。
+- [ ] `euid==0` 参数防御：`pkexec /usr/libexec/xiaodun/xd-daemon --image <他人文件>` → exit 2
+      且打印属主不符；`--image <符号链接>` → 打开失败；`--image <fifo>` → 不挂死。
 - [ ] 真 U 盘删除照片全链路恢复（对真实介质，非环回）。

@@ -5,7 +5,7 @@
   <vendor>erik.xyz</vendor>
   <action id="com.erik.xiaodun.daemon.run">
     <description>小盾数据恢复：以特权只读访问磁盘</description>
-    <message>需要授权以只读方式读取磁盘设备</message>
+    <message>需要授权：小盾以只读方式访问所选设备或镜像</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
