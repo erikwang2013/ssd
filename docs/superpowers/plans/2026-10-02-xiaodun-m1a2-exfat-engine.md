@@ -1021,16 +1021,17 @@ mod tests {
 ```toml
 [package]
 name = "xd-fs-exfat"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 xd-device = { path = "../xd-device" }
 
 [dev-dependencies]
 xd-fixtures = { path = "../xd-fixtures" }
-tempfile = "3"
+tempfile = { workspace = true }
 ```
+（与 `xd-fs-fat/Cargo.toml` 的 workspace 继承写法逐字一致——避免 2021/2024 edition 混用。）
 
 `crates/xd-fs-exfat/src/lib.rs`：
 ```rust
@@ -1245,6 +1246,12 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<ExfatBoot, ExfatError> {
 - [ ] **Step 4: 运行 `cargo test -p xd-fs-exfat`** → 预期 **9 passed**；workspace 其余不回归。（T2 无测试计数变化于 T1 修复轮。）
 
 - [ ] **Step 5: Commit** `feat(fs-exfat): 引导区解析（几何校验/checksum/Backup 回退）`
+
+**修订轮（执行侧，2026-10-02）**：实施提交 `ea1c04a`（workspace 113→122）。偏离 6 条均为最小修正：
+① Cargo.toml 改 workspace 继承（与 xd-fs-fat 逐字一致，本文件已就地更正）；②③ 类型后缀与 `as u64` 括号消歧（E0689/泛型解析）；
+④ `!(1..=0xFFFF_FFF6).contains(...)`（clippy 门禁）；⑤ 三个新文件补 © 头行；⑥ rustfmt 展开。
+**计划外实证**：`boot::parse` 已对真实 `mkfs.exfat` 8MB 镜像跑通（Main stored==calc==912DFBC6、
+fat_offset=2048/fat_length=15/heap=4096/count=1536/root=5、无 Backup 回退）——首次非合成镜像验证。
 
 ---
 
