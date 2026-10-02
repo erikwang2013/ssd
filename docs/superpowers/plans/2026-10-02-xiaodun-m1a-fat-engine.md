@@ -1929,6 +1929,17 @@ mod tests {
             assert!(entries.iter().any(|e| e.name == "K.TXT"), "scan failed for {:?}", entries);
         }
     }
+
+    #[test]
+    fn skips_volume_label_entries() {
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "REAL.TXT", b"x").build();
+        let mut patched = image.clone();
+        let slot = 18 * 512; // FAT16 根目录第 1 槽（data_start=50 推导：root_start=18）
+        patched[slot + 11] = 0x08; // 把该条目改成卷标属性
+        let (_f, dev) = device_with(&patched);
+        let entries = scan(&dev).unwrap();
+        assert!(entries.is_empty(), "卷标不应出现在结果中: {entries:?}");
+    }
 }
 ```
 
@@ -2039,6 +2050,9 @@ fn append_parsed(
     out: &mut Vec<FatEntry>,
 ) -> Result<(), FatError> {
     for e in parsed {
+        if e.attr & 0x08 != 0 {
+            continue; // 卷标（真实盘根目录必有一条）不是文件，与 dot 同理过滤
+        }
         let ext = e.name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
         let quality = if e.is_dir {
             RecoverQuality::Complete
