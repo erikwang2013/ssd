@@ -193,15 +193,23 @@ impl ExfatImageBuilder {
         self.check_name(name);
         self.check_dir(dir);
         assert!(!clusters.is_empty(), "clusters 不得为空");
-        assert!(
-            clusters.len() * CBS >= data.len(),
-            "簇数不足：{} 簇容不下 {} 字节",
+        assert_eq!(
+            clusters.len(),
+            data.len().div_ceil(CBS),
+            "簇数必须精确等于 ceil(len/CBS)：{} 簇 vs {} 字节",
             clusters.len(),
             data.len()
         );
+        assert!(
+            !contiguous || clusters.windows(2).all(|w| w[1] == w[0] + 1),
+            "contiguous=true 要求簇号连续递增（NoFatChain 语义：读侧按 FirstCluster..+n 解释）"
+        );
+        let mut seen: Vec<u32> = Vec::new();
         for c in clusters {
             assert!((2..=CLUSTER_COUNT + 1).contains(c), "cluster 越界：{c}");
             assert!(!self.allocated.contains(c), "cluster 已占用：{c}");
+            assert!(!seen.contains(c), "clusters 列表不得含重复簇：{c}");
+            seen.push(*c);
         }
         self.allocated.extend(clusters);
         self.cursor = self.cursor.max(clusters.iter().max().unwrap() + 1);
@@ -493,8 +501,8 @@ impl Default for ExfatImageBuilder {
 /// 先用 unused 项（0x01——扫描器跳过且不终止目录）补齐，使项集从下一簇首槽开始。
 fn push_dir_unit(buf: &mut Vec<u8>, unit: &[u8]) {
     debug_assert!(
-        unit.len().is_multiple_of(32) && unit.len() <= CBS,
-        "unit 前提：32 倍数且 ≤ 1 簇"
+        buf.len().is_multiple_of(32) && unit.len().is_multiple_of(32) && unit.len() <= CBS,
+        "前提：buf 已对齐到槽、unit 为 32 倍数且 ≤ 1 簇"
     );
     let off = buf.len() % CBS;
     if off != 0 && off + unit.len() > CBS {
@@ -936,11 +944,47 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "簇数不足")]
+    #[should_panic(expected = "簇数必须精确")]
     fn panics_when_explicit_clusters_too_few() {
         let _ = ExfatImageBuilder::new()
             .add_file_in_clusters("/", "B.BIN", &[5u8; 4500], &[7], false)
             .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "连续递增")]
+    fn panics_when_contiguous_flag_violates_physical_order() {
+        let _ = ExfatImageBuilder::new().add_file_in_clusters(
+            "/",
+            "B.BIN",
+            &[5u8; 9000],
+            &[7, 6, 8],
+            true,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "重复簇")]
+    fn panics_on_duplicate_clusters_in_list() {
+        let _ = ExfatImageBuilder::new().add_file_in_clusters(
+            "/",
+            "B.BIN",
+            &[5u8; 9000],
+            &[6, 6, 8],
+            false,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "簇数必须精确")]
+    fn panics_on_extra_clusters() {
+        let _ = ExfatImageBuilder::new().add_file_in_clusters(
+            "/",
+            "B.BIN",
+            &[5u8; 100],
+            &[6, 7],
+            false,
+        );
     }
 
     #[test]
