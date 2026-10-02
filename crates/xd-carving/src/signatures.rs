@@ -9,6 +9,17 @@ pub enum Signature {
     Png,
 }
 
+impl Signature {
+    /// 扩展名反推（小写，与 `CarvedEntry::ext()` 输出的值域一致；未知 → None）。
+    pub fn from_ext(ext: &str) -> Option<Self> {
+        match ext {
+            "jpg" => Some(Signature::Jpeg),
+            "png" => Some(Signature::Png),
+            _ => None,
+        }
+    }
+}
+
 pub const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 /// 扫描窗口需在块边界保留的重叠字节数（≥ 最长签名 + 余量）。
 pub const OVERLAP: usize = 16;
@@ -142,6 +153,29 @@ impl<'a> Cursor<'a> {
         let mut v = vec![0u8; n];
         self.take(&mut v)?;
         Some(v)
+    }
+
+    /// 重读 `[start, start+n)`（n 以本游标右界 `end` 截断）：只交付实际读到的**连续前缀**——
+    /// 坏读/设备外/短读即停，绝不伪造（与走链期交付同判）。收集版回读用（`collect_*`）。
+    pub fn read_prefix_at(&self, start: u64, n: u64) -> Vec<u8> {
+        let n = n.min(self.end.saturating_sub(start));
+        let mut out = Vec::with_capacity((n as usize).min(PREFETCH));
+        let mut buf = vec![0u8; PREFETCH.min(n.max(1) as usize)];
+        let mut done: u64 = 0;
+        while done < n {
+            let want = ((n - done) as usize).min(buf.len());
+            match self.dev.read_at(start + done, &mut buf[..want]) {
+                Ok(k) if k > 0 => {
+                    out.extend_from_slice(&buf[..k]);
+                    done += k as u64;
+                    if k < want {
+                        break; // 短读：诚实短前缀
+                    }
+                }
+                _ => break, // 坏读/设备外（0 读）：前缀到此为止
+            }
+        }
+        out
     }
 }
 

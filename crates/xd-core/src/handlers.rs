@@ -867,6 +867,7 @@ mod tests {
                 quality: "complete".into(),
                 first_cluster: 0,
                 byte_offset: None,
+                contiguous: None,
             });
         }
         store.insert_entries(id, &entries).unwrap();

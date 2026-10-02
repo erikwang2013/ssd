@@ -20,6 +20,11 @@ pub struct ScanEntry {
     /// 雕刻条目在未分配空间内的起始字节坐标；FS 条目恒 None（序列化省略）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_offset: Option<u64>,
+    /// exfat 专用拓扑提示：`Some(true)` = NoFatChain（规范保证连续）；`Some(false)` = 走 FAT 链。
+    /// fat/carved/迁移前旧行为 None（序列化省略）——反构造读取时按 `false` 处理（只信链，
+    /// 不猜连续）；旧客户端缺省解析为 None，语义与 M1d 前一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contiguous: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

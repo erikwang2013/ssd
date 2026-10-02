@@ -705,6 +705,7 @@ mod tests {
             quality: "carved".into(),
             first_cluster: 0,
             byte_offset: Some(byte_offset),
+            contiguous: None,
         }
     }
 

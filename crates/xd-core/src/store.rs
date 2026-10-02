@@ -133,6 +133,8 @@ impl Store {
                  -- byte_offset 三态：NULL = 未知（迁移前旧行 / FS 条目）；0 是合法雕刻偏移
                  --（文件恰在未分配区间起点）——不得用 0 表示未知。
                  byte_offset INTEGER,
+                 -- contiguous 同三态：NULL = 未知（迁移前旧行 / fat / 雕刻）；1/0 = exfat 显式拓扑。
+                 contiguous INTEGER,
                  PRIMARY KEY (task_id, idx)
              );",
         )?;
@@ -172,6 +174,17 @@ impl Store {
                 conn.execute("ALTER TABLE tasks ADD COLUMN carved_offset INTEGER", [])?;
             }
             conn.execute_batch("PRAGMA user_version = 4")?;
+        }
+        // v4 → v5 迁移（M1d T2）：entries.contiguous（exfat 拓扑提示，M1d read.EntryRange 反构造
+        // 承重）。模版同 v2；**可空且不给 DEFAULT**——旧行 NULL 反构造时按 false（只信链）。
+        if ver < 5 {
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'contiguous'")?
+                .exists([])?;
+            if !has {
+                conn.execute("ALTER TABLE entries ADD COLUMN contiguous INTEGER", [])?;
+            }
+            conn.execute_batch("PRAGMA user_version = 5")?;
         }
         Ok(())
     }
@@ -258,8 +271,8 @@ impl Store {
             let mut st = tx.prepare(
                 "INSERT OR REPLACE INTO entries
                  (task_id, idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster,
-                  byte_offset)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  byte_offset, contiguous)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for e in entries {
                 st.execute(params![
@@ -273,7 +286,8 @@ impl Store {
                     e.is_dir,
                     e.quality,
                     e.first_cluster as i64,
-                    e.byte_offset.map(|v| v as i64)
+                    e.byte_offset.map(|v| v as i64),
+                    e.contiguous
                 ])?;
             }
         }
@@ -332,7 +346,7 @@ impl Store {
         )?;
         let mut st = conn.prepare(&format!(
             "SELECT idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster,
-                    byte_offset
+                    byte_offset, contiguous
              FROM entries WHERE task_id = ?1{filter} ORDER BY idx LIMIT ?2 OFFSET ?3"
         ))?;
         let rows = st.query_map(params![task_id as i64, limit as i64, offset as i64], |r| {
@@ -347,6 +361,7 @@ impl Store {
                 quality: r.get(7)?,
                 first_cluster: r.get::<_, i64>(8)? as u32,
                 byte_offset: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                contiguous: r.get(10)?,
             })
         })?;
         let mut out = Vec::new();
@@ -385,6 +400,7 @@ mod tests {
             quality: "complete".into(),
             first_cluster: 6 + idx as u32,
             byte_offset: None,
+            contiguous: None,
         }
     }
 
@@ -627,8 +643,8 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v4() {
-        // 手工造 v1 库（无 byte_offset 列、user_version=1，含一条真实旧行）→ Store::open 迁移后可读写
+    fn v1_database_migrates_to_v5() {
+        // 手工造 v1 库（无 byte_offset/contiguous 列、user_version=1，含一条真实旧行）→ Store::open 迁移后可读写
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
         {
@@ -655,12 +671,16 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 4, "迁移后版本标记必须前进到 4（v1 连跳 v2/v3/v4）");
+        assert_eq!(ver, 5, "迁移后版本标记必须前进到 5（v1 连跳 v2..v5）");
         // 迁移前已存在的旧行：偏移未知，必须读回 NULL（DEFAULT 0 会把未知伪造成「偏移=0」）
         let (_, old) = s.entries(1, 0, 10, false).unwrap();
         assert_eq!(
             old[0].byte_offset, None,
             "迁移前旧行未知必须 NULL——DEFAULT 0 伪造「偏移=0」"
+        );
+        assert_eq!(
+            old[0].contiguous, None,
+            "迁移前旧行拓扑未知必须 NULL——DEFAULT 1 会伪造「连续」（读取猜连续=错报）"
         );
         assert_eq!(
             s.task(1).unwrap().unwrap().carved_offset,
@@ -678,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_database_migrates_to_v4_and_old_rows_default_quick() {
+    fn v2_database_migrates_to_v5_and_old_rows_default_quick() {
         // 手工造 v2 库（有 byte_offset、无 scan_mode、user_version=2，含一条真实旧行）→
         // Store::open 迁移后旧行 scan_mode == 'quick'（M1c 前只有 quick），且新任务可写 deep。
         let dir = tempfile::tempdir().unwrap();
@@ -706,7 +726,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 4, "v2 库必须前进到 4");
+        assert_eq!(ver, 5, "v2 库必须前进到 5");
         assert_eq!(
             s.task(1).unwrap().unwrap().scan_mode,
             "quick",
@@ -717,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_database_migrates_to_v4_and_old_rows_have_null_checkpoint() {
+    fn v3_database_migrates_to_v5_and_old_rows_have_null_checkpoint() {
         // 手工造 v3 库（有 scan_mode、无 carved_offset、user_version=3，含一条 deep 旧行）→
         // Store::open 迁移后旧行 carved_offset == None（从未写过检查点），且可写入新值。
         let dir = tempfile::tempdir().unwrap();
@@ -746,7 +766,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 4, "v3 库必须前进到 4");
+        assert_eq!(ver, 5, "v3 库必须前进到 5");
         assert_eq!(
             s.task(1).unwrap().unwrap().carved_offset,
             None,
@@ -754,6 +774,84 @@ mod tests {
         );
         s.set_carved_offset(1, 2048, 0).unwrap();
         assert_eq!(s.task(1).unwrap().unwrap().carved_offset, Some(2048));
+    }
+
+    #[test]
+    fn v4_database_migrates_to_v5_and_old_rows_have_null_contiguous() {
+        // 手工造 v4 库（有 byte_offset/carved_offset、无 contiguous、user_version=4，含一条旧行）→
+        // 迁移后旧行 contiguous == None（未知拓扑）；新写 Some(true)/Some(false) 可往返。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, fs TEXT NOT NULL,
+                     state TEXT NOT NULL, read_bytes INTEGER NOT NULL DEFAULT 0, found_count INTEGER NOT NULL DEFAULT 0,
+                     elapsed_ms INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL,
+                     scan_mode TEXT NOT NULL DEFAULT 'quick', carved_offset INTEGER);
+                 CREATE TABLE entries (task_id INTEGER NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+                     ext TEXT NOT NULL, size_bytes INTEGER NOT NULL, deleted INTEGER NOT NULL, is_dir INTEGER NOT NULL,
+                     quality TEXT NOT NULL, first_cluster INTEGER NOT NULL, byte_offset INTEGER,
+                     PRIMARY KEY (task_id, idx));
+                 INSERT INTO tasks (id, device_id, fs, state, total_bytes, scan_mode)
+                     VALUES (1, 'image:v4.img', 'exfat', 'completed', 8192, 'quick');
+                 INSERT INTO entries (task_id, idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster, byte_offset)
+                     VALUES (1, 0, 'OLD_V4.BIN', '/', 'bin', 4096, 0, 0, 'complete', 5, NULL);
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let ver: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 5, "v4 库必须前进到 5");
+        let (_, old) = s.entries(1, 0, 10, false).unwrap();
+        assert_eq!(
+            old[0].contiguous, None,
+            "旧行无 contiguous 必须 NULL——反构造时按 false（只信链）而非猜连续"
+        );
+        let id = s.create_task("d", "exfat", "quick", 1).unwrap();
+        let mut a = entry(0, "A.BIN", false);
+        a.contiguous = Some(true);
+        let mut b = entry(1, "B.BIN", false);
+        b.contiguous = Some(false);
+        s.insert_entries(id, &[a, b]).unwrap();
+        let (_, new) = s.entries(id, 0, 10, false).unwrap();
+        assert_eq!(new[0].contiguous, Some(true));
+        assert_eq!(new[1].contiguous, Some(false));
+    }
+
+    #[test]
+    fn contiguous_roundtrips_three_states() {
+        // 三态（None/Some(true)/Some(false)）各自往返：None 不得被压成 false（= 伪造「非连续」
+        // 会白白退化读取路径）或 true（= 伪造「连续」→ 错报）
+        let s = Store::open_memory().unwrap();
+        let id = s.create_task("d", "exfat", "quick", 4096).unwrap();
+        s.insert_entries(
+            id,
+            &[
+                entry(0, "CARVED.JPG", true),
+                {
+                    let mut e = entry(1, "CONTIG.BIN", false);
+                    e.contiguous = Some(true);
+                    e
+                },
+                {
+                    let mut e = entry(2, "CHAINED.BIN", false);
+                    e.contiguous = Some(false);
+                    e
+                },
+            ],
+        )
+        .unwrap();
+        let (_, page) = s.entries(id, 0, 10, false).unwrap();
+        assert_eq!(page[0].contiguous, None, "None 往返（雕刻/迁移前旧行）");
+        assert_eq!(page[1].contiguous, Some(true), "NoFatChain 往返");
+        assert_eq!(page[2].contiguous, Some(false), "FAT 链往返");
     }
 
     #[test]
