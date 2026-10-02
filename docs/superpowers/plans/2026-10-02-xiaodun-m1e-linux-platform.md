@@ -773,7 +773,8 @@ ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="mmcblk[0-9]*", TAG+="uaccess"
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin</allow_active>
       <!-- 安全注（勿改）：pkexec 不校验参数；一旦改为 auth_admin_keep 或 yes，
-           `pkexec xd-daemon --image /etc/shadow` 即本地任意文件读取。 -->
+           攻击者可用 pkexec 以 root 读任意文件（例如影子口令文件）。
+           注：本注释体不得出现双连字符（XML 1.0 —— 早期版本曾因此致 polkitd 拒绝解析）。 -->
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/xiaodun/xd-daemon</annotate>
   </action>
@@ -843,6 +844,22 @@ main.rs 接入：处理 `--image` 前，若 `effective_uid() == Some(0)` 走：`
 - [ ] **Step 2: 运行** → daemon 新增 2 测试（xd-daemon 首次有测试）；workspace 全绿
 - [ ] **Step 3: 标注**：udev/polkit 的**真机生效**为"未验证（需真机 root）"——E3 出口需手测（装包 → 插 U 盘 → 免密扫）。
 - [ ] **Step 4: Commit** `feat(security): udev uaccess + polkit auth_admin 策略与 root 参数纵深防御`
+
+**执行记录（2026-10-02）**：实施提交 `b3688ba`（workspace 110）。偏离 3 条：① privcheck 与调用处
+`#[cfg(target_os="linux")]`（跨平台编译必要，Windows 交叉 check 为证）；② main.rs 文件头注释更新；
+③ **TOCTOU 残留披露**（O_NOFOLLOW 校验后 `ImageFileDevice::open` 按路径重开；硬约束未动 xd-device；
+docs 第 3 节含可达性分析与 M4 硬化路径）。
+**超计划验证**：`unshare -r` 造 euid==0 对真二进制 10 例（缺/空 PKEXEC_UID→exit 2、属主匹配→0、不符→2、
+ELOOP 40、目录→2、`--device` 不受 root 检查）——CI 覆盖不到的 root 路径由此闭环。
+
+**修复轮（spec-m1e-t3，2026-10-02）**：规格审查 **❌ 1 项（发布级）**——`com.erik.xiaodun.policy:14` 注释体含
+`--`（**计划终稿原生缺陷逐字传导**）：XML 1.0 禁止注释体内 `--`，polkitd 实链 expat 会拒绝解析
+→ action 不注册 → pkexec 兜底（方案 C）失效（CI 无 xmllint 未拦）。证据链三层独立（xmllint / expat C 探针
+REJECTED / 仅改注释的对照 ACCEPTED）。修复提交 `043bb86`：注释改写为无 `--` 文本 + 防回归说明；
+docs 可达性措辞改"须诱导真人完成一次认证（auth_admin 是每次调用的一次性授权，非缓存、非口令）"；
+全仓 `git ls-files | grep -E '\.(xml|policy|svg)$'` 逐个 `xmllint --noout` 无 BAD。
+**门禁增补（T4 打包脚本落实）**：`packaging/` 下 XML 类文件纳入 `xmllint --noout` 校验。
+**账（记 M1e）**：XML 注释体是校验盲区——模板文本必须过一遍真实 parser，不能只靠肉眼。
 
 ---
 
