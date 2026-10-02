@@ -715,4 +715,23 @@ mod tests {
         let dir = seen.iter().find(|(n, _)| n == "DIR").unwrap();
         assert_eq!(dir.1, RecoverQuality::MaybeDamaged, "流式层拿到终值分级");
     }
+
+    #[test]
+    fn observer_stream_matches_table_with_volume_label() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "REAL.TXT", b"x")
+            .add_file("/", "KEEP.TXT", b"y")
+            .build();
+        let mut patched = image.clone();
+        patched[18 * 512 + 11] = 0x08; // 首槽改卷标属性（既有手法）
+        let (_f, dev) = dev_for(&patched);
+        let mut n = 0usize;
+        let entries = scan_with_observer(&dev, &mut |_| n += 1).unwrap();
+        assert_eq!(entries.len(), 1, "KEEP.TXT 在列、卷标不在");
+        assert_eq!(
+            n,
+            entries.len(),
+            "回调条数须与返回表长一致（卷标不得进回调流）"
+        );
+    }
 }
