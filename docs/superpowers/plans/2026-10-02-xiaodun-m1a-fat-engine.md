@@ -2637,13 +2637,19 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
 
 ---
 
-## M1a 出口验收
+## M1a 出口验收（2026-10-02 已执行 ✅）
 
-- [ ] `cargo test --workspace --locked` 全绿；`cargo clippy --workspace --all-targets --locked -- -D warnings` 零告警
-- [ ] `cargo fmt --all --check` 干净
-- [ ] 端到端测试 `deleted_photo_recovered_byte_exact_from_image_file` 通过（字节级）
-- [ ] `cargo run -p xd-fixtures --example gen_fat_image` 能产出可被 `xd-daemon` 后续切片直接挂载的镜像
-- [ ] `bash scripts/apply-copyright.sh` 对新文件补版权头（幂等）；`provenance.sha256` 重生成（若本计划作为发布前工作）
+- [x] `cargo test --workspace --locked` 全绿（**88 passed**）；`cargo clippy --workspace --all-targets --locked -- -D warnings` 零告警
+- [x] `cargo fmt --all --check` 干净
+- [x] 端到端测试 `deleted_photo_recovered_byte_exact_from_image_file` 通过（字节级；含只读断言与删除回退锁定）
+- [x] `cargo run -p xd-fixtures --example gen_fat_image` 产出 2,162,688 字节镜像；`file(1)` 判为合法 FAT16
+      （"可被 daemon 挂载"的准确表述见移交注 16：三重确认成立，RPC 接线属 M1b）
+- [x] `bash scripts/apply-copyright.sh` 幂等（0 新盖 / 37 已盖）；`provenance.sha256` 重生成——**待发布时执行**
+      （本计划作为发布前工作的一部分另行排期）
+
+**执行记录**：T1-T8 经 8 轮 impl→spec→qual 管线（含 5 个修复轮）；累计 18 个任务级命名代理 + 2 个调研代理。
+关键提交：`044959f`（扫描）→ `aa296fa`（T6 修复）→ `9257254`+`8e887d1`+`38d8804`（读取与修复）→
+`6f74f20`+`6aa550c`（端到端与强化）。
 
 ## 后续切片（各自独立计划）
 
