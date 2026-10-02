@@ -828,6 +828,7 @@ pub mod scan;
 
 /// 引擎统一错误类型。
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FatError {
     Device(xd_device::DeviceError),
     InvalidBpb(String),
@@ -902,6 +903,10 @@ mod tests {
         let (_f, dev) = device_with(&image);
         let bpb = parse(&dev).unwrap();
         assert_eq!(bpb.fat_type, FatType::Fat12);
+        assert_eq!(bpb.fat_start_sector, 1);
+        assert_eq!(bpb.root_start_sector, 4);
+        assert_eq!(bpb.data_start_sector, 18);
+        assert_eq!(bpb.data_cluster_count(), 1006);
     }
 
     #[test]
@@ -910,7 +915,10 @@ mod tests {
         let mut bad = image.clone();
         bad[510] = 0;
         let (_f, dev) = device_with(&bad);
-        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "missing 0x55AA boot signature"
+        ));
     }
 
     #[test]
@@ -920,7 +928,55 @@ mod tests {
         bad[11] = 0;
         bad[12] = 1; // 256，非法
         let (_f, dev) = device_with(&bad);
-        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "bad bytes per sector: 256"
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_sectors_per_cluster() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut bad = image.clone();
+        bad[13] = 3;
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "bad sectors per cluster: 3"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_fat_count() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut bad = image.clone();
+        bad[16] = 0;
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "zero fat count"
+        ));
+    }
+
+    #[test]
+    fn rejects_fat32_without_root_cluster() {
+        let image = xd_fixtures::FatImageBuilder::fat32().build();
+        let mut bad = image.clone();
+        bad[44..48].copy_from_slice(&1u32.to_le_bytes());
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "fat32 without root cluster"
+        ));
+    }
+
+    #[test]
+    fn rejects_tiny_image() {
+        let (_f, dev) = device_with(&[0u8; 100]);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "image smaller than 512 bytes"
+        ));
     }
 
     #[test]
@@ -981,6 +1037,8 @@ mod tests {
 use crate::FatError;
 use xd_device::BlockDevice;
 
+// M1a 刻意接受、M2 处理真实损坏盘时重估：reserved_sectors==0；12/16 的 root_entry_count==0；
+// num_fats>2；total16/total32 同时非零时取 t16；total_sectors 不比对设备实际长度。
 pub const SECTOR0_LEN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -991,6 +1049,7 @@ pub enum FatType {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Bpb {
     pub fat_type: FatType,
     pub bytes_per_sector: u16,
@@ -1018,6 +1077,8 @@ impl Bpb {
         self.data_start_sector + (cluster - 2) * self.sectors_per_cluster as u32
     }
 
+    /// # Panics
+    /// 同 [`Self::cluster_to_sector`] 的前置条件（经其继承）。
     pub fn cluster_to_byte(&self, cluster: u32) -> u64 {
         self.cluster_to_sector(cluster) as u64 * self.bytes_per_sector as u64
     }
@@ -1140,7 +1201,7 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<Bpb, FatError> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 9 passed（含 total16 分支与溢出防护、fat_entry_byte 覆盖）。
+Expected: 13 passed（校验分支全覆 + FAT12 几何 + 溢出/偏移覆盖）。
 
 - [ ] **Step 5: Commit**
 
@@ -1324,7 +1385,7 @@ impl<'d> Fat<'d> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 14 passed（9 + 5）。
+Expected: 18 passed（13 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1597,7 +1658,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 20 passed（14 + 6）。
+Expected: 24 passed（18 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -1855,7 +1916,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 25 passed（20 + 5）。
+Expected: 29 passed（24 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1954,7 +2015,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 28 passed（25 + 3）。
+Expected: 32 passed（29 + 3）。
 
 - [ ] **Step 5: Commit**
 
@@ -2016,7 +2077,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 29 passed（28 + 1，含新 e2e）。
+Expected: 33 passed（32 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
