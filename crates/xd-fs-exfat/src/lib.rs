@@ -4,6 +4,7 @@ pub mod bitmap;
 pub mod boot;
 pub mod dirent;
 pub mod fattab;
+pub mod freespace;
 pub mod read;
 pub mod scan;
 
