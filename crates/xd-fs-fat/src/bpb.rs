@@ -53,7 +53,7 @@ impl Bpb {
         let per_entry: u64 = match self.fat_type {
             FatType::Fat32 => 4,
             FatType::Fat16 => 2,
-            FatType::Fat12 => u64::MAX, // FAT12 特例，调用方不走此路径
+            FatType::Fat12 => unreachable!("FAT12 用 12 位寻址，请走 Fat::entry 的专用路径"),
         };
         self.fat_start_sector as u64 * self.bytes_per_sector as u64 + cluster as u64 * per_entry
     }
