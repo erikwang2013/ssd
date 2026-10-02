@@ -214,18 +214,26 @@ mod tests {
 
     #[test]
     fn iend_nonzero_len_accepted_complete() {
-        // IEND len=3（非空、CRC 合法）：结构已收束 → complete；且停在**第一个** IEND，
-        // 尾随垃圾不并入（头注：IEND 不校验 len==0——len≠0 属坏编码不属假阳性）
-        let mut p = PNG_MAGIC.to_vec();
-        xd_fixtures::chunk(&mut p, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
-        xd_fixtures::chunk(&mut p, b"IDAT", b"z");
-        xd_fixtures::chunk(&mut p, b"IEND", &[0x11, 0x22, 0x33]); // len=3
-        let iend_end = p.len();
-        p.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // 尾垃圾：不得并入
-        let (_f, dev) = dev_for(&p);
-        let r = carve_all(&dev, 0, p.len() as u64, 64 << 20).unwrap();
-        assert!(r.complete, "IEND len≠0 结构已收束 → complete：{r:?}");
-        assert_eq!(r.len, iend_end as u64, "必须停在第一个 IEND 结束处：{r:?}");
+        // 裁定（spec）：IEND 只要求 CRC 合法，不校验 len==0。真实 PNG 的 IEND 恒为空，
+        // len≠0 属坏编码；但此时结构已收束（CRC 是强判据），按 complete 交付——
+        // 严格拒收会把「尾部一个字段损坏」升级为「整文件不完整」，与诚实截断的取舍相悖。
+        let mut p = xd_fixtures::mini_png(b"idat");
+        p.truncate(p.len() - 12); // 去掉空 IEND（4 len + 4 type + 0 data + 4 crc）
+        xd_fixtures::chunk(&mut p, b"IEND", b"abc"); // len=3、CRC 合法
+        let first_end = p.len();
+        p.extend_from_slice(&xd_fixtures::mini_png(b"tail")); // 尾部再挂一整个 PNG
+        let mut img = vec![0u8; p.len()];
+        img.copy_from_slice(&p);
+        let (_f, dev) = dev_for(&img);
+        let r = carve_all(&dev, 0, img.len() as u64, 64 << 20).unwrap();
+        assert!(
+            r.complete,
+            "IEND（len=3、CRC 合法）应收束为 complete：{r:?}"
+        );
+        assert_eq!(
+            r.len, first_end as u64,
+            "必须停在第一个 IEND，不得续走尾部：{r:?}"
+        );
     }
 
     #[test]
@@ -242,44 +250,42 @@ mod tests {
 
     #[test]
     fn png_cut_short_truncates_honest() {
-        // run 界（cursor end）三砍点皆诚实截断：!complete 且**欠报不过报**（len 不越过 run 界）。
-        // 构型 mini_png(payload=64B) 文件 121B：IDAT 头 33..41、数据 41..105、
-        // CRC 105..109、IEND 109..121。三砍点来历：
-        //   41  = IDAT 数据起点（首轮 64B 读不满 → take 失败不推进游标，欠报到数据起点）
-        //   105 = IDAT CRC 字段内（数据已全交付，CRC 的 u32 读不全）
-        //   109 = IEND 块头（IDAT 整块 CRC 已验证，下一块 len 字段读不到）
-        let p = xd_fixtures::mini_png(&[0x77; 64]);
-        assert_eq!(p.len(), 121, "构型前提");
-        let (_f, dev) = dev_for(&p);
-        for end in [41u64, 105, 109] {
-            let r = carve_all(&dev, 0, end, 64 << 20).unwrap();
-            assert!(!r.complete, "run 界截断不得 complete（end={end}）：{r:?}");
-            assert_eq!(r.len, end, "欠报不过报：len 恰为已核实字节数（end={end}）");
+        // 无 IEND 的残片（对照 jpeg `img_without_eoi_truncates_at_run_end`）：三种砍点
+        // 皆 !complete；砍点落在 chunk 边界（109=IDAT 尾、105=IDAT CRC 前）交付到砍点，
+        // 砍在数据段中间（70）交付到最后一个完整读取轮（41=IDAT 头末）——**绝不过报**。
+        let p = xd_fixtures::mini_png(&[0xAA; 64]);
+        assert_eq!(p.len(), 121, "构型前提：8+25+8+64+4+12");
+        for (cut, want) in [(p.len() - 12, 109u64), (p.len() - 16, 105), (70, 41)] {
+            let (_f, dev) = dev_for(&p[..cut]);
+            let r = carve_all(&dev, 0, cut as u64, 64 << 20).unwrap();
+            assert!(!r.complete, "残片不得 complete（砍点 {cut}）：{r:?}");
+            assert_eq!(r.len, want, "交付到最后一个完整读取轮（砍点 {cut}）：{r:?}");
         }
     }
 
     #[test]
     fn max_chunk_gate_bounds_length_field() {
-        // MAX_CHUNK 门是 `>`（恰 16MiB 放行，不误伤边界）且门在长度字段读毕即判（不吞 type）。
-        // 构型：magic + 合法 IHDR(13) 后接第二个块，cap=41：
-        //   len == MAX_CHUNK   → 门放行（读到 type，pos=41）→ 由 cap 收束 → len=41
-        //   len == MAX_CHUNK+1 → 门在长度字段处截断（pos=8+25+4=37）→ len=37
-        // 门改 `>=` 或删门，两态分别必红。
-        let mut head = PNG_MAGIC.to_vec();
-        xd_fixtures::chunk(&mut head, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
-        for (len, want) in [(MAX_CHUNK, 41u64), (MAX_CHUNK + 1, 37)] {
-            let mut p = head.clone();
-            p.extend_from_slice(&len.to_be_bytes());
-            p.extend_from_slice(b"IDAT");
-            p.extend_from_slice(&[0u8; 64]); // 数据不足也无妨：两态都在上限/门处先收束
-            let (_f, dev) = dev_for(&p);
-            let mut cur = Cursor::new(&dev, 0, p.len() as u64);
-            let r = carve_png(&mut cur, 41).unwrap();
-            assert!(
-                r.len == want && !r.complete,
-                "长度字段 {len} 应得 len={want}：{r:?}"
-            );
-        }
+        // MAX_CHUNK 门（长度字段攻击防线）的存在性与边界：恰 16MiB 放行（交由 run 界/cap
+        // 裁量），超 1 字节即在长度字段处截断。`>=`、或整门删除，都会在此测变红。
+        let head = png_with_first_chunk(b"IHDR", &[0u8; 13]); // magic + 合法 IHDR = 33B
+        let with_len = |len: u32| {
+            let mut v = head.clone();
+            v.extend_from_slice(&len.to_be_bytes());
+            v.extend_from_slice(b"IDAT");
+            v
+        };
+        let (_f, dev) = dev_for(&with_len(MAX_CHUNK));
+        let r = carve_all(&dev, 0, 41, 64 << 20).unwrap();
+        assert!(
+            r.len == 41 && !r.complete,
+            "恰 MAX_CHUNK 须放行进数据读取：{r:?}"
+        );
+        let (_f, dev) = dev_for(&with_len(MAX_CHUNK + 1));
+        let r = carve_all(&dev, 0, 41, 64 << 20).unwrap();
+        assert!(
+            r.len == 37 && !r.complete,
+            "超 MAX_CHUNK 须在长度字段处截断：{r:?}"
+        );
     }
 
     #[test]
