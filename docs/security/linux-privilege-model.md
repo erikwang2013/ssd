@@ -94,3 +94,39 @@ user namespace（userns 内的 root 无宿主 CAP_DAC_OVERRIDE，读不了宿主
       （≥250ms 或 ≥1MiB 节流）②暂停后磁盘读停（iotop/`/proc/<pid>/io` 冻结）③取消后 `scan.finished
       state=canceled` 且 daemon stderr 无 panic 噪声 ④`--db` 库落 XDG 路径、重启 daemon 后结果可查
       ⑤大介质（≥32GB）进度百分比为真百分比（readBytes/totalBytes）而非假动。
+- [ ] 导出降权路径（`--export-worker`，M1d T3）：本机非 root 走不到降权臂，三项真机核对见 §6 末。
+
+## 6. 导出降权子进程模型（M1d T3）
+
+**模型**：父 daemon（可能经 pkexec 为 root）`spawn 自身 --export-worker` →
+① 子**按父权限**打开源设备 fd（降权前唯一 `open` 出口）→ ② 子在降权前**复核**目标三重校验
+（权威；父侧同类校验只为同步错误码）→ ③ root 且 `PKEXEC_UID` 存在时降权到调用者 →
+④ **此后所有文件写入均以普通用户身份**。父只转发子 stdout 的 JSON 行
+（`progress`/`item`/`fatal`/`finished`）；子崩溃/被杀 = 导出终止，已写文件保留；取消 = SIGTERM 子进程。
+
+顺序即安全性质：降权后**无法再 open**（§4 成本句），故所有 `open`（设备、目标目录 stat/statvfs）
+必须前置到降权之前一次做完。子进程为**单线程**且在降权前不建任何线程，
+故 `rustix::thread::set_thread_res_uid/-gid` + `set_thread_groups` 与进程级降权等价
+（满足 §4「必须在建任何线程之前」）。顺序 `setgroups(0)` → `setresgid` → `setresuid`（反序即失败）。
+库连接为 `OpenFlags::SQLITE_OPEN_READ_ONLY`（不跑迁移、不写库）。
+
+**相对 §3 的威胁面差异与一处主动加闸**：设备 id 取自**自家任务库**（daemon 写的行），不经 RPC
+参数——RPC 侧镜像只能经 `--image` 注册（`DaemonOpener` 拒 `image:`）。但常规路径下库文件属主即
+调用者用户、可被其改写，故 `image:` 分支在 **root 模式复用 `--image` 同闸**
+（`privcheck`：`O_NOFOLLOW` + 属主须为 `PKEXEC_UID`）。不设此闸，伪造库行 `image:/etc/shadow`
+会让提权 worker 沦为任意 root 可读文件的读取器（§3 攻击 1 的另一扇门，同一类面的另一入口）。
+**这是对 T3 计划「此路径无越权面」断言的偏离**（记为：论断对 RPC 层成立，对库层不成立）。
+非 root 模式与原 `--image` 常规路径同语义（不做属主校验）。
+
+**已知盲区（明记不修）**：
+1. **同盘校验是节点 st_rdev 的相等判定**：`st_dev(target) == st_rdev(source 节点)`。整盘 `/dev/sdb`
+   (8,16) 与其分区 sdb1 (8,17) 不相等 ⇒ 目标在源盘分区上时不报 -32006。镜像源恒 `None`
+   （不做同盘校验——目标是文件生态，不触碰镜像内容）。真环回设备的 -32006 端到端断言归 T9/scripts
+   （e2e-loop 挂载环回后导出到挂载点），本任务只做纯函数假值单测。
+2. 父侧校验（同步错误码）与子侧复核之间的目标目录换靶 TOCTOU：子侧复核为权威且其在降权前单线程
+   完成，残窗仅文件系统竞争（无外部输入面）。闭合归 M4（fd 化 + `openat2`）。
+
+**未验证（需真机 root/pkexec）**——本机非 root，集成/单测只覆盖纯决策函数（`drop_plan`）：
+- [ ] 真机 pkexec 拉起后导出：落盘文件属主 == `PKEXEC_UID` 用户（进程未降权时会是 root）。
+- [ ] `setgroups(0)` 生效（`/proc/<pid>/status` 的 `Groups` 为空，无残留附加组）。
+- [ ] `/etc/passwd` 无该 uid 时只降 uid 的警告路径（组属主保留 root，stderr 有留痕）。

@@ -1,15 +1,20 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! RPC 处理器：daemon（stdio）与 M4 的 ffi 共用同一入口。
 
+use std::path::Path;
 use std::sync::Arc;
 
 use xd_device::{BlockDevice, DeviceInfo};
 
 use crate::api::{
-    PROTOCOL_VERSION, Request, Response, RpcError, ScanResultsParams, ScanStartParams,
-    TaskIdParams, err, ok,
+    ExportIdParams, ExportStartParams, FsReadParams, PROTOCOL_VERSION, Request, Response, RpcError,
+    ScanResultsParams, ScanStartParams, TaskIdParams, err, ok,
 };
-use crate::scan_task::{DeviceOpener, NoopOpener, OpenError, Resume, ScanError, ScanManager};
+use crate::export::{ExportError, ExportManager, MAX_IDXS, dedupe_idxs};
+use crate::fs_read::{MAX_PREVIEW, MAX_READ, ReadError, read_entry_range, to_base64};
+use crate::scan_task::{
+    DeviceOpener, FsKind, NoopOpener, OpenError, Resume, ScanError, ScanManager,
+};
 
 pub struct CoreCtx {
     devices: Vec<Arc<dyn BlockDevice>>,
@@ -17,6 +22,8 @@ pub struct CoreCtx {
     list_only: Vec<DeviceInfo>,
     scans: Arc<ScanManager>,
     opener: Arc<dyn DeviceOpener>,
+    /// 恢复导出（父侧）。默认内存库实例：export.start 诚实回 -32603（无 --db 无从起子进程）。
+    exports: Arc<ExportManager>,
 }
 
 impl CoreCtx {
@@ -29,6 +36,11 @@ impl CoreCtx {
                 Arc::new(|_| {}),
             )),
             opener: Arc::new(NoopOpener),
+            exports: Arc::new(ExportManager::new(
+                Arc::new(crate::store::Store::open_memory().expect("sqlite in-memory")),
+                Arc::new(|_| {}),
+                None,
+            )),
         }
     }
 
@@ -41,6 +53,13 @@ impl CoreCtx {
     pub fn with_scan(mut self, scans: Arc<ScanManager>, opener: Arc<dyn DeviceOpener>) -> Self {
         self.scans = scans;
         self.opener = opener;
+        self
+    }
+
+    /// daemon 注入：导出管理器（共享同一 store；`--db` 文件路径供子进程只读打开）。
+    /// 选择「最小 with_export」而非改造 `with_scan` 签名：既有调用点零改动。
+    pub fn with_export(mut self, exports: Arc<ExportManager>) -> Self {
+        self.exports = exports;
         self
     }
 
@@ -87,6 +106,9 @@ pub fn handle_request(ctx: &CoreCtx, req: &Request) -> Response {
         "scan.pause" => scan_pause(ctx, req),
         "scan.resume" => scan_resume(ctx, req),
         "scan.cancel" => scan_cancel(ctx, req),
+        "fs.read" => fs_read(ctx, req),
+        "export.start" => export_start(ctx, req),
+        "export.cancel" => export_cancel(ctx, req),
         other => err(req, RpcError::method_not_found(other)),
     }
 }
@@ -232,6 +254,133 @@ fn scan_cancel(ctx: &CoreCtx, req: &Request) -> Response {
             serde_json::json!({ "taskId": p.task_id, "state": "canceled" }),
         ),
         Err(e) => scan_err(req, e),
+    }
+}
+
+/// 导出错误 → 契约错误码（含 `export.cancel` 未知 id 的 -32602 裁定，见 proto/v1/README v1.2）。
+fn export_err(req: &Request, e: ExportError) -> Response {
+    match e {
+        ExportError::TaskNotFound(id) => err(req, RpcError::task_not_found(id)),
+        ExportError::EntryNotFound(idx) => err(req, RpcError::entry_not_found(idx)),
+        ExportError::NoEntries => err(req, RpcError::invalid_params("idxs is empty after dedupe")),
+        ExportError::ExportNotFound(id) => err(
+            req,
+            RpcError::invalid_params(&format!("unknown exportId: {id}")),
+        ),
+        ExportError::TargetOnSource(d) => err(req, RpcError::target_on_source(&d)),
+        ExportError::TargetNotWritable(d) => err(req, RpcError::target_not_writable(&d)),
+        ExportError::InsufficientSpace(need) => err(req, RpcError::insufficient_space(need)),
+        ExportError::Internal(msg) => {
+            eprintln!("warn: export internal: {msg}");
+            err(req, RpcError::internal())
+        }
+    }
+}
+
+fn fs_read(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: FsReadParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !(1..=MAX_READ).contains(&p.length) {
+        return err(
+            req,
+            RpcError::invalid_params("length out of range 1..=1048576"),
+        ); // 契约
+    }
+    let row = match ctx.scans.status(p.task_id) {
+        Ok(t) => t,
+        Err(e) => return scan_err(req, e),
+    };
+    let entry = match ctx.scans.entry(p.task_id, p.idx) {
+        Ok(Some(e)) => e,
+        Ok(None) => return err(req, RpcError::entry_not_found(p.idx)),
+        Err(e) => {
+            eprintln!("warn: fs.read entry lookup failed: {e}");
+            return err(req, RpcError::internal());
+        }
+    };
+    if entry.size_bytes > MAX_PREVIEW {
+        return err(req, RpcError::entry_too_large(entry.size_bytes)); // -32009（导出不受此限）
+    }
+    let Some(fs) = row.fs.parse::<FsKind>().ok() else {
+        eprintln!("warn: fs.read unknown fs in task row: {}", row.fs);
+        return err(req, RpcError::internal());
+    };
+    let dev = match ctx.resolve_device(&row.device_id) {
+        Ok(d) => d,
+        Err(e) => return err(req, e),
+    };
+    match read_entry_range(&*dev, fs, &entry, p.offset, p.length) {
+        Ok((bytes, eof)) => ok(
+            req,
+            serde_json::json!({ "bytesBase64": to_base64(&bytes), "eof": eof }),
+        ),
+        Err(ReadError::TooLarge(size)) => err(req, RpcError::entry_too_large(size)),
+        Err(ReadError::Internal(msg)) => {
+            eprintln!("warn: fs.read failed: {msg}");
+            err(req, RpcError::internal())
+        }
+    }
+}
+
+fn export_start(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: ExportStartParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !Path::new(&p.target_dir).is_absolute() {
+        return err(
+            req,
+            RpcError::invalid_params("targetDir must be an absolute path"),
+        );
+    }
+    // 契约：idxs 去重后非空且 ≤100000（manager 侧另有纵深防御，见 ExportManager::start）
+    let idxs = dedupe_idxs(&p.idxs);
+    if idxs.is_empty() {
+        return err(req, RpcError::invalid_params("idxs is empty after dedupe"));
+    }
+    if idxs.len() > MAX_IDXS {
+        return err(
+            req,
+            RpcError::invalid_params("idxs exceeds 100000 after dedupe"),
+        );
+    }
+    let row = match ctx.scans.status(p.task_id) {
+        Ok(t) => t,
+        Err(e) => return scan_err(req, e),
+    };
+    // source_rdev 由已解析设备给出（镜像/未知 → None：不做同盘校验，契约 v1.2）
+    let dev = match ctx.resolve_device(&row.device_id) {
+        Ok(d) => d,
+        Err(e) => return err(req, e),
+    };
+    match ctx
+        .exports
+        .start(p.task_id, &idxs, &p.target_dir, dev.source_rdev())
+    {
+        Ok(s) => ok(
+            req,
+            serde_json::json!({
+                "exportId": s.export_id, "fileCount": s.file_count,
+                "estimatedBytes": s.estimated_bytes,
+            }),
+        ),
+        Err(e) => export_err(req, e),
+    }
+}
+
+fn export_cancel(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: ExportIdParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match ctx.exports.cancel(p.export_id) {
+        Ok(state) => ok(
+            req,
+            serde_json::json!({ "exportId": p.export_id, "state": state }),
+        ),
+        Err(e) => export_err(req, e),
     }
 }
 
@@ -982,5 +1131,301 @@ mod tests {
         )
         .unwrap();
         assert_eq!(serde_json::to_value(&o).unwrap(), expected);
+    }
+
+    /// M1d T3：真 exfat 夹具快扫至 completed 的 ctx——scans 与 exports 共享同一 store
+    /// （exports 无 `--db`：导出起子进程臂在单测不可达，仅走校验/参数路径）。
+    fn scanned_ctx() -> (tempfile::NamedTempFile, Arc<ScanManager>, CoreCtx) {
+        let (f, dev) = crate::testutil::exfat_fixture();
+        let dev_id = dev.info().id.clone();
+        let mgr = Arc::new(ScanManager::new(
+            crate::store::Store::open_memory().unwrap(),
+            Arc::new(|_| {}),
+        ));
+        let ctx = CoreCtx::new(vec![dev])
+            .with_scan(mgr.clone(), Arc::new(NoopOpener))
+            .with_export(Arc::new(ExportManager::new(
+                mgr.store_arc(),
+                Arc::new(|_| {}),
+                None,
+            )));
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(1, "scan.start", serde_json::json!({"device": dev_id})),
+        ) else {
+            panic!()
+        };
+        let id = o.result["taskId"].as_u64().unwrap();
+        wait_state(&ctx, id, "completed");
+        (f, mgr, ctx)
+    }
+
+    #[test]
+    fn fs_read_happy_slices_and_eof() {
+        let (_f, _mgr, ctx) = scanned_ctx();
+        // LIVE_A.TXT = "aaaa"（idx 0）：整读有 eof
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                21,
+                "fs.read",
+                serde_json::json!({"taskId": 1, "idx": 0, "offset": 0, "length": 16}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(o.result["bytesBase64"], "YWFhYQ==", "base64(aaaa)");
+        assert_eq!(o.result["eof"], true);
+        // LIVE_B.PNG = [5;100]（idx 1）：中段非 eof、恰到尾 eof
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                22,
+                "fs.read",
+                serde_json::json!({"taskId": 1, "idx": 1, "offset": 10, "length": 10}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            o.result["bytesBase64"],
+            crate::fs_read::to_base64(&[5u8; 10])
+        );
+        assert_eq!(o.result["eof"], false);
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                23,
+                "fs.read",
+                serde_json::json!({"taskId": 1, "idx": 1, "offset": 50, "length": 50}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(o.result["eof"], true, "恰到条目尾 → eof");
+    }
+
+    #[test]
+    fn fs_read_error_paths() {
+        let (_f, mgr, ctx) = scanned_ctx();
+        // -32008：无此条目
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                21,
+                "fs.read",
+                serde_json::json!({"taskId": 1, "idx": 99, "offset": 0, "length": 16}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32008);
+        assert_eq!(e.error.message, "Entry not found: 99");
+        // -32003：无此任务（先于条目判定）
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                21,
+                "fs.read",
+                serde_json::json!({"taskId": 42, "idx": 0, "offset": 0, "length": 16}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32003);
+        // -32602：length 越契约（0 与 >1MiB）
+        for len in [0u64, (1 << 20) + 1] {
+            let Response::Err(e) = handle_request(
+                &ctx,
+                &req_with(
+                    21,
+                    "fs.read",
+                    serde_json::json!({"taskId": 1, "idx": 0, "offset": 0, "length": len}),
+                ),
+            ) else {
+                panic!()
+            };
+            assert_eq!(e.error.code, -32602, "length={len}");
+            assert_eq!(
+                e.error.message,
+                "Invalid params: length out of range 1..=1048576"
+            );
+        }
+        // -32009：条目 > 64MiB（预览上限；导出不受此限）
+        mgr.store_arc()
+            .insert_entries(
+                1,
+                &[crate::api::ScanEntry {
+                    idx: 9,
+                    name: "HUGE.BIN".into(),
+                    path: "/".into(),
+                    ext: "bin".into(),
+                    size_bytes: crate::fs_read::MAX_PREVIEW + 1,
+                    deleted: false,
+                    is_dir: false,
+                    quality: "complete".into(),
+                    first_cluster: 6,
+                    byte_offset: None,
+                    contiguous: None,
+                }],
+            )
+            .unwrap();
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                21,
+                "fs.read",
+                serde_json::json!({"taskId": 1, "idx": 9, "offset": 0, "length": 16}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32009);
+        assert_eq!(
+            e.error.message,
+            format!("Entry too large: {}", crate::fs_read::MAX_PREVIEW + 1)
+        );
+    }
+
+    #[test]
+    fn export_start_param_errors_are_32602() {
+        let ctx = CoreCtx::new(vec![]);
+        let t = tempfile::tempdir().unwrap();
+        let tdir = t.path().to_str().unwrap().to_string();
+        // 空 idxs → -32602
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": [], "targetDir": tdir}),
+            ),
+        ) else {
+            panic!("空 idxs 必须 -32602")
+        };
+        assert_eq!(e.error.code, -32602);
+        // 重复项去重后非空（[5,5] → [5]）：不属参数层错误——继续走到任务判定（-32003 证去重语义）
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": [5, 5], "targetDir": tdir}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32003, "[5,5] 去重后为 [5]：须过参数层");
+        // >100000（去重后）→ -32602
+        let many: Vec<u64> = (0..(MAX_IDXS as u64 + 1)).collect();
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": many, "targetDir": tdir}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
+        // 相对路径 targetDir → -32602（契约：必须绝对路径）
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": [0], "targetDir": "relative/out"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
+        // 缺字段
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(31, "export.start", serde_json::json!({"idxs": [0]})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
+    }
+
+    #[test]
+    fn export_start_target_and_db_error_paths() {
+        let (_f, _mgr, ctx) = scanned_ctx();
+        // -32003：无此任务
+        let t = tempfile::tempdir().unwrap();
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 42, "idxs": [0], "targetDir": t.path().to_str().unwrap()}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32003);
+        // -32008：无此条目（先于目标校验——错误码优先级）
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": [99], "targetDir": "/nonexistent-export-dir"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32008);
+        // -32007：目标不存在（条目齐备）
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": [0], "targetDir": "/nonexistent-export-dir"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32007);
+        assert_eq!(
+            e.error.message,
+            "Target not writable: /nonexistent-export-dir"
+        );
+        // -32603：无 --db（内存库）——校验全过后诚实拒绝（子进程无从读库）
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                31,
+                "export.start",
+                serde_json::json!({"taskId": 1, "idxs": [0], "targetDir": t.path().to_str().unwrap()}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32603);
+    }
+
+    #[test]
+    fn export_cancel_unknown_id_is_32602() {
+        let ctx = CoreCtx::new(vec![]);
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(41, "export.cancel", serde_json::json!({"exportId": 7})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
+        assert_eq!(e.error.message, "Invalid params: unknown exportId: 7");
+        // 缺字段 → -32602（params 解析层）
+        let Response::Err(e) =
+            handle_request(&ctx, &req_with(41, "export.cancel", serde_json::json!({})))
+        else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
     }
 }

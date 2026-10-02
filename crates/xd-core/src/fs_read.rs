@@ -16,6 +16,10 @@ use crate::scan_task::FsKind;
 
 pub const MAX_READ: u64 = 1024 * 1024;
 
+/// `fs.read` 预览上限（契约 v1.2）：`size_bytes` 超过 → -32009（**导出不受此限**：
+/// 导出走 4MiB 片流式，见 xd-daemon 的 export_worker）。
+pub const MAX_PREVIEW: u64 = 64 * 1024 * 1024;
+
 /// 读取失败：`TooLarge` 供上层（handlers）映射 -32009；其余一律内部错误。
 #[derive(Debug)]
 pub enum ReadError {
