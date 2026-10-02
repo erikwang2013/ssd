@@ -9,6 +9,7 @@ pub const ATTR_DIRECTORY: u8 = 0x10;
 pub struct Sfn {
     pub name83: [u8; 11],
     pub attr: u8,
+    pub nt_res: u8,
     pub first_cluster: u32,
     pub size: u32,
     pub deleted: bool,
@@ -37,6 +38,7 @@ pub fn parse_slot(raw: &[u8; 32]) -> Slot {
     let deleted = raw[0] == 0xE5;
     if raw[11] == ATTR_LFN {
         let mut chars = Vec::with_capacity(13);
+        // 0x0000/0xFFFF 终止符按段生效（规范槽的后续段以 0xFFFF 填充）
         for &(a, b) in &[(1usize, 10usize), (14, 25), (28, 31)] {
             let mut i = a;
             while i < b + 1 && i < 31 {
@@ -59,6 +61,7 @@ pub fn parse_slot(raw: &[u8; 32]) -> Slot {
     Slot::Sfn(Sfn {
         name83,
         attr: raw[11],
+        nt_res: raw[12],
         first_cluster: ((u16::from_le_bytes([raw[20], raw[21]]) as u32) << 16)
             | u16::from_le_bytes([raw[26], raw[27]]) as u32,
         size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
@@ -66,7 +69,7 @@ pub fn parse_slot(raw: &[u8; 32]) -> Slot {
     })
 }
 
-/// 组装 8.3 名。`lcase` 为属性字节（bit3=基名小写, bit4=扩展名小写）；删除项首字符不可知 → '?'。
+/// 组装 8.3 名。`lcase` 为 NTRes 字节（raw[12]，bit3=基名小写, bit4=扩展名小写）；删除项首字符不可知 → '?'。
 /// 字节按 Latin-1 逐字节映射为字符（SFN 是 OEM 码页原始字节，不做 UTF-8 猜测——0xE5 保留为 U+00E5）。
 pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
     let mut base: Vec<u8> = name83[..8]
@@ -146,17 +149,18 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
             Slot::End => break,
             Slot::Lfn(l) => lfn_run.push(l),
             Slot::Sfn(s) => {
-                let (name, has_lfn) = if lfn_run.is_empty() {
-                    (assemble_sfn_name(&s.name83, s.attr), false)
+                // 删除态一致才配对：存活文件不得冠删除残留的 LFN 名
+                let pair = !lfn_run.is_empty() && lfn_run.iter().all(|l| l.deleted) == s.deleted;
+                let (name, has_lfn) = if !pair {
+                    (assemble_sfn_name(&s.name83, s.nt_res), false)
                 } else {
                     let joined = assemble_lfn(&lfn_run);
-                    let fallback = assemble_sfn_name(&s.name83, s.attr);
-                    let name = if joined.trim().is_empty() {
-                        fallback
+                    let fallback = assemble_sfn_name(&s.name83, s.nt_res);
+                    if joined.trim().is_empty() {
+                        (fallback, false) // 回退时 has_lfn 如实为 false
                     } else {
-                        joined
-                    };
-                    (name, true)
+                        (joined, true)
+                    }
                 };
                 lfn_run.clear();
                 out.push(ParsedEntry {
@@ -189,6 +193,7 @@ mod tests {
             Slot::Sfn(Sfn {
                 name83: *b"HELLO   TXT",
                 attr: 0x20,
+                nt_res: 0,
                 first_cluster: 0,
                 size: 0,
                 deleted: false
@@ -264,5 +269,77 @@ mod tests {
         };
         let slots = vec![mk("0.bin"), mk("my_ph")]; // 物理序：先尾段 "0.bin" 后头段 "my_ph"
         assert_eq!(assemble_lfn(&slots), "my_ph0.bin");
+    }
+
+    #[test]
+    fn lowercase_flags_come_from_ntres() {
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(b"README  TXT");
+        raw[11] = 0x20; // attr=archive（bit3/4 不参与小写）
+        raw[12] = 0x18; // NTRes：基名+扩展名小写
+        let Slot::Sfn(s) = parse_slot(&raw) else {
+            panic!()
+        };
+        assert_eq!(s.nt_res, 0x18);
+        assert_eq!(assemble_sfn_name(&s.name83, s.nt_res), "readme.txt");
+        // 卷标（attr 0x08）不得被误小写
+        let mut vol = [0u8; 32];
+        vol[..11].copy_from_slice(b"MYDISK     ");
+        vol[11] = 0x08;
+        let Slot::Sfn(s) = parse_slot(&vol) else {
+            panic!()
+        };
+        assert_eq!(assemble_sfn_name(&s.name83, s.nt_res), "MYDISK");
+    }
+
+    /// LFN 槽内第 k 个 UTF-16 单元的字节偏移（窗口 1←0..4、2←5..10、3←11..12）。
+    fn lfn_char_offset(k: usize) -> usize {
+        match k {
+            0..=4 => 1 + k * 2,
+            5..=10 => 14 + (k - 5) * 2,
+            _ => 28 + (k - 11) * 2,
+        }
+    }
+
+    #[test]
+    fn lfn_slots_parse_from_raw_bytes() {
+        // 手工构造一条完整 LFN 槽（13 个 UTF-16 单元）——覆盖 (1,10)/(14,25)/(28,31) 三窗口
+        let mut raw = [0u8; 32];
+        raw[0] = 0x41; // seq=1 | 0x40（唯一段）
+        raw[11] = 0x0F;
+        let text: Vec<u16> = "photo_2024.jp".encode_utf16().collect();
+        assert_eq!(text.len(), 13);
+        for (k, &u) in text.iter().enumerate() {
+            let i = lfn_char_offset(k);
+            raw[i..i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let Slot::Lfn(l) = parse_slot(&raw) else {
+            panic!()
+        };
+        assert_eq!(String::from_utf16_lossy(&l.chars), "photo_2024.jp");
+        assert!(!l.deleted);
+    }
+
+    #[test]
+    fn mixed_run_falls_back_to_sfn_name() {
+        // 删除孤儿 LFN + 存活 SFN → 不配对，用 SFN 名
+        let mut lfn = [0u8; 32];
+        lfn[0] = 0xE5; // 删除
+        lfn[11] = 0x0F; // attr 在窗口外，须保持不被字符写入覆盖
+        for (k, u) in "to.jpg".encode_utf16().enumerate() {
+            let i = lfn_char_offset(k);
+            lfn[i..i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let mut sfn = [0u8; 32];
+        sfn[..11].copy_from_slice(b"B       TXT");
+        sfn[11] = 0x20;
+        let mut data = Vec::new();
+        data.extend_from_slice(&lfn);
+        data.extend_from_slice(&sfn);
+        let parsed = parse_directory_bytes(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "B.TXT");
+        assert!(!parsed[0].deleted);
+        assert!(!parsed[0].has_lfn);
     }
 }
