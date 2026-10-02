@@ -4,7 +4,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
-use xd_core::api::{Request, Response, RpcErr, RpcError};
+use xd_core::api::{PROTOCOL_VERSION, Request, Response, RpcErr, RpcError};
 use xd_core::handlers::{CoreCtx, handle_request};
 use xd_device::BlockDevice;
 use xd_device::image::ImageFileDevice;
@@ -33,6 +33,13 @@ fn main() {
             }
         }
     }
+
+    eprintln!(
+        "小盾 xd-daemon {} · protocol {} · {} 个镜像设备已注册",
+        env!("CARGO_PKG_VERSION"),
+        PROTOCOL_VERSION,
+        devices.len()
+    );
 
     let ctx = CoreCtx::new(devices);
     let stdin = std::io::stdin();
