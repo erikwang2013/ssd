@@ -899,6 +899,8 @@ git commit -m "feat(carving): PNG chunk 走链重组（CRC 逐块验证/IEND 收
 
 - [ ] **Step 1: carver.rs（全代码）**
 
+> **T2 移交决策点（qual-m1c-t2 裁定）**：fat `unallocated_runs` 在 **FAT 全表不可读**时退化为 `Ok(空)`，与"全盘已分配"**不可区分**（exfat 位图不可读则 `Err`——有意不对称，保守方向=绝不虚报空闲，已被专测钉死）。**本任务（T6 深扫接线）需显式裁定**：深扫对 fat 空 runs 的 UX 是照常"扫到 0 个"还是需要区分信号？若需要，最小改法 = `runs_from_fat` 记录 `saw_err`，`Err` 场景返回 `Err`（T2 注释已留此路径）；若不需要，在 `unallocated_runs_of` 处加注释记录该取舍。二选一必须显式落纸。
+
 ```rust
 // © 2026 erik · https://erik.xyz · erik@erik.xyz
 //! 顺序块扫描器（不变量见计划 T6 头注 1-5）。只做 I/O 与调度；暂停/取消/落库由 `ev` 回调承载。
@@ -1363,6 +1365,15 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 - **spec 四类库探针**：全新库 user_version==2、列集精确（含 byte_offset、无 scan_mode/carved_offset）；手造含数据 v1 库迁移后旧行一字不差 + NULL→None；二次 open 幂等；畸形/只读库如实记录（只读 v1 库现无法 open——迁移需写；生产无只读打开路径，M1d `open_read_only` 场景为已迁移库 ✓ 记录备查）。
 - **qual 变异 8 条**：5 强杀（键省略/无探测 ALTER/读写翻转/limit/golden 全等）；2 等价/冗余（闸门整体删除、None→无键断言为 golden 全等所覆盖）；**2 真缺口当场补测**：①版本标记前进 `assert_eq!(ver, 2)`（T6/T7 迁移将依赖；删 `PRAGMA user_version=2` 变异 red `1/2`）②**迁移前旧行必须 NULL**（`ALTER … DEFAULT 0` 会把未知伪造成"偏移=0"；变异 red `Some(0)/None`）；+ 三态语义 doc 一行（NULL=未知；0 是合法偏移）。
 - **里程碑级排序现实（记录）**：README 声明「deep 自 M1c 起有效」而 handlers 仍拒 deep（-32602）——T6 接线后转正，测试注释已明示。
+
+### T2（两引擎 unallocated_runs）—— impl-m1c-t2。提交沿革：`3a646e9`（主）→ `81a1e54`（MAX_RUNS 截断可测性）→ `f02b54e`（末簇用例 + 文档）。DONE → spec **PASS**（208 探针）→ qual ISSUES(minor) → 补丁两段式有牙（T2 关闭，308/0）
+
+- **计划缺陷 2 处（实施者实修）**：exfat 计划夹具口算错（5000B/1 簇触发 builder fail-fast）→ 自洽构型，断言 `(1+1+244)*cb` 原样成立；`cluster_to_byte(max+1)` 越出函数文档契约域 → `cluster_to_byte(253)+cluster_bytes()`（spec 实算恒等 1048576）。**lead 派发稿 "255" 笔误被 spec 抓出**（255 式=1052672）。
+- **spec 独立探针（含自写 FAT12 nibble 编解码）**：208 PASS/0——17 构型 runs 与 raw 合并逐字段全等；Σ 双通道（引擎 is_free 与 raw）一致；已分配簇 0 落入；奇偶簇边界专测；`>=`→`>` 每引擎恰 2 红。
+- **qual 变异 12 条**：6 KILL；等价 4（exfat Err 死臂——`Bitmap::load` 保证长度、防御性；final-flush 守卫仅 m=0 有判别力；exfat count+2 与线性几何恒等）；**缺口 2（M5/M6 末簇已分配）当场补**——两段式证明：**未加新测时 `2..=max`→`2..max` 变异下 164 项全绿（结构性漏杀：单簇差被 final-flush 补回）**，新测下逐引擎恰 1 红（Σ 超报恰 1 簇）。
+- **裁定与记录**：两引擎合并循环**不抽公共层**（算法冻结、差异在关键处、抽取成本>收益；复访触发=第三个 fs 后端）；**fat「FAT 全表不可读→Ok(空)」与"全盘已分配"不可区分**——保守方向已被专测钉死，**列为 T6 显式决策点**（计划 T6 已注）；exfat 拒绝加"恒真无牙"的 m=0 断言（诚实，非假覆盖）。
+- **流程教训（实施者自查拦下）**：水印拼装 `tail -n +2` 误吞模块 doc 首行——`git diff` 审阅拦下未入库；建议拼装后必 `diff` 首几行。
+- 遗留（防御性代码，记录）：fat final-flush 守卫冗余；`pub fn unallocated_runs`/`MAX_RUNS` doc 已齐（I2 四项）。
 
 ---
 
