@@ -718,6 +718,24 @@ ci.yml：Linux e2e 步骤后追加一步 `bash scripts/e2e-loop.sh`（手动触�
 `cargo check --target x86_64-pc-windows-msvc --all-targets` 干净；`--device` 四类错误路径 exit 2 清晰。
 计划教训（两条断言漏改）记 M1e 账：**daemon 行为变更必须同步扫 Rust 与 Dart 两侧测试**。
 
+**修复轮（qual-t2，2026-10-02）**：质量审查 2 Important + 5 Minor（+增量复审 Important-δ），修复提交
+`cef6654` + 终修 `6c719d7`：
+
+- **I1（CI 阻断）**：非特权 `cargo test` 打不开 `brw-rw---- root:disk` 的环回节点 → `sudo chmod 666 "$loop"`；
+  **增量复审再修**：udevd 会在 loop attach 的 change 事件按**编译默认值（0660）拉回**节点权限（udev(7)
+  原文 + /dev/loop0 实测 0660 佐证）——chmod 前加 `sudo udevadm settle`（一行），消除毫秒级竞态
+  （否则出口 CI 掷硬币）。
+- **I2（去重丢型号名）**：`compose_disk_name` 纯函数（trim 收进函数内）供 parse/open 共用，`open_with_sysfs`
+  读 vendor/model → `--device /dev/sda` 行名与枚举一致。真机核到文件级（`/sys/block` 与 `/sys/class/block`
+  同符号链接目标；`device/{model,vendor}` 非特权可读）。CI 只覆盖 loop 无 `device/` 的回退分支——
+  **M1 出口手测清单加一行：`--device /dev/sdb` → 行名应为 `Samsung SSD 850`**。
+- **Minor 1-5**：trap 守卫式清理（`loop=""` + `rm -f img`，防 EXIT trap 非零翻转成功脚本）；env 配对 panic；
+  两处 `n==64` 断言；枚举失败 `warn:` 入 stderr；双向 first-wins 去重 + 双开测试。
+- **裁量**：多出的 xd-core 去重测试**保留**（行为分支应有守护）→ 计数 **108**；`linux.rs` **534 行**接受。
+- **M2 tripwire（收紧版）**：**linux.rs 任何实质改动（netlink 热插拔/卷级）开工前先拆** `linux/mod.rs` +
+  `pub use`（保持 `xd_device::linux::{LinuxBlockDevice, BlockEnumerator, RawDisk}` 路径——xd-daemon 依赖）
+  + `linux/device.rs`；私有 `is_listable_name` 与其测试同文件搬入子模块，无需放宽可见性。
+
 ---
 
 ### Task 3: 提权落地件（udev uaccess + polkit + root 参数纵深防御）
