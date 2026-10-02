@@ -1970,11 +1970,14 @@ imports 更新：`use std::sync::Arc; use crate::api::{..., ScanStartParams, Tas
         }
         let Response::Err(e) = handle_request(&ctx, &req_with(9, "scan.start", serde_json::json!({})));
         assert_eq!(e.error.code, -32602, "缺 device");
+        // qual-t1 裁定 (c)：-32602 的 message 逐字钉前缀（reason 不属契约、前缀属之）
+        assert_eq!(e.error.message, "Invalid params: missing or malformed params");
         let Response::Err(e2) = handle_request(
             &ctx,
             &req_with(9, "scan.results", serde_json::json!({"taskId": 1, "offset": 0, "limit": 0})),
         );
         assert_eq!(e2.error.code, -32602, "limit=0 越契约");
+        assert_eq!(e2.error.message, "Invalid params: limit out of range 1..=1000");
     }
 
     #[test]
@@ -2277,7 +2280,8 @@ git commit -m "feat(daemon): 扫描线程接线（stdout 串行化/通知/--db/�
 - [ ] **Step 2: fat 拆分**：`scan.rs` 中 `read_file` 及其私有助手整体迁 `read.rs`；scan.rs 顶部留 `pub use crate::read::read_file;`（与 exfat 同款路径兼容）；`read_file` 的测试随迁 `read.rs` 的 `mod tests`。lib.rs 注册 `mod read;`（公开面不变）。
 - [ ] **Step 3: exfat 测试内移**：`scan.rs` 的 `mod tests` → `scan_tests.rs`，scan.rs 顶部 `#[cfg(test)] #[path = "scan_tests.rs"] mod tests;`（**不是** tests/ 外部目录——testutil 是 crate 内 cfg(test)）；`read.rs` 同法 → `read_tests.rs`。内移后 scan.rs、read.rs 各 ≤ 500 行（仓库线宽纪律）。
 - [ ] **Step 4: 助手去重**：`set_checksum`/`refix_deleted_checksum` 迁 `xd-fixtures`（`pub fn`，文档注释随迁，含"删除只清 bit7、不重算"语义）；exfat 各测试与 roundtrip 换 import，删本地副本。
-- [ ] **Step 5: 门禁与提交**（纯重构：测试全绿且**行为零变化**；测试绝对数略降只因副本合并——在提交信息里说明）
+- [ ] **Step 5: `linux.rs` 拆分（qual-t1 结构欠账：585 行 > 500 行规则，T1 +51）**：机械拆分——`crates/xd-device/src/linux.rs` 的枚举/归类（`BlockEnumerator`、`classify_transport`、`sysfs_transport`、transport 映射）迁 `crates/xd-device/src/linux/enumerate.rs`（或 `linux_enum.rs`，二者取一以 rustfmt/模块风格顺眼为准；`linux.rs` 保留 `pub use` 重导出 + `LinuxBlockDevice` 读取层）；`mod linux` 改为目录模块若选目录形态。**公开路径不变**（`xd_device::linux::*` 全部可用）。可读性优先，不做行为性重构。纯机械迁移 → 测试集合与计数**不得变化**（与 Step 4 的副本合并不同：本步是零计数变化）。
+- [ ] **Step 6: 门禁与提交**（纯重构：测试全绿且**行为零变化**；测试绝对数略降只因副本合并——在提交信息里说明；linux.rs 拆分项零计数变化）
 ```bash
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings && cargo fmt --check
@@ -2575,6 +2579,13 @@ bash scripts/e2e.sh
 - **A（已修，`f5ec631`）**：`notify.rs:1` 字面 `// WATERMARK` 占位（全仓唯一无水印头 .rs；`apply-copyright.sh` prepend 式不会清它）→ 按「head -1 现文件」逐字节置换真水印头 + `cmp` 验证 + 零行为变化复跑。**纪律遵守：追加提交、未 amend、未 push。**
 - **B（本次订正）**：记录标题 SHA 与行号漂移（`:47→:50`、`:79→:80`、Dart `:34→:36`）已在上文修正。
 - provenance 对 api.rs 已过期——按 Task 9 Step 3 约定归发版时重签，非 T1 门禁（仅记录）。
+
+**qual 评审（qual-m1b-t1）——结论 ISSUES（非阻塞）→ 补丁 `a563cb1` → 复审增量待跑**。变异表：10 条 9 KILL + 1 等价变异体（#6 `#[serde(default)]` 对 `Option` 冗余——serde 隐式缺失=None，保留作自文档）；加分变异 **11 存活 = 真缺口**（`enumerate` 的 transport 赋值零覆盖）。三个探针结论：ping 归一行删掉仍全绿（独立价值仅自洽，净覆盖由 `ping_returns_pong_and_protocol` 兜底）；三态无关歧义（missing/null→None、编码一律省略键，单向 daemon→UI + README 声明充分）；notify.rs 水印首行与 api.rs 逐字节相同。补丁（`a563cb1`，4 文件，232 测试）：
+- (b) `enumerate_classifies_transport_from_sysfs`（假 sysfs 根含 `/usb` → list() 断言 `Some("usb")`）；实施者手工复验变异 11 → 该测红 → 还原。
+- (a) `scan_state_all_variants_serialize_to_contract_literals`（pending/failed 字面量补齐）+ 订正 `contract_v1.rs` 假注释「全量覆盖」。
+- (d) Dart 侧 golden 集合钉死（21 名单全等）。
+- (c) README 补 -32602 文案说明（`Invalid params: <reason>` 中 reason 不属契约；`Cannot open device: <id>` 固定文案）——**其逐字测试归 T5**（无 producer 时不可钉；已加入 T5 测试清单）。
+- 结构欠账（预存）：`linux.rs` 585 行超 500 行规则（T1 +51）——已加入 **T7** 拆分项。
 
 ---
 
