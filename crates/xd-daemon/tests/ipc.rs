@@ -7,6 +7,8 @@ struct Daemon {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// T6 起 daemon 无 `--db` 时会自建状态库；测试一律重定向 XDG_STATE_HOME，不碰真实 $HOME。
+    _state: tempfile::TempDir,
 }
 
 /// root 宿主上 daemon 的 `--image` 会走 PKEXEC_UID 校验（privcheck，失败关闭）；以测试进程自身
@@ -27,8 +29,10 @@ fn inject_pkexec_uid(cmd: &mut Command) {
 
 impl Daemon {
     fn start(args: &[&str]) -> Self {
+        let state = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_xd-daemon"));
         cmd.args(args)
+            .env("XDG_STATE_HOME", state.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -49,6 +53,7 @@ impl Daemon {
             child,
             stdin,
             stdout,
+            _state: state,
         }
     }
 
