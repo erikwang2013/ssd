@@ -63,6 +63,8 @@ pub struct TaskRow {
     pub found_count: u64,
     pub elapsed_ms: u64,
     pub total_bytes: u64,
+    /// "quick" | "deep"（T7 断点续跑按此分派 worker）。
+    pub scan_mode: String,
 }
 
 /// 连接锁中毒即 fail-stop（`unwrap`）——重启后的任务态由 `mark_interrupted`/`recover_after_restart` 兜底。
@@ -98,7 +100,8 @@ impl Store {
                  read_bytes INTEGER NOT NULL DEFAULT 0,
                  found_count INTEGER NOT NULL DEFAULT 0,
                  elapsed_ms INTEGER NOT NULL DEFAULT 0,
-                 total_bytes INTEGER NOT NULL
+                 total_bytes INTEGER NOT NULL,
+                 scan_mode TEXT NOT NULL DEFAULT 'quick'
              );
              CREATE TABLE IF NOT EXISTS entries (
                  task_id INTEGER NOT NULL,
@@ -129,6 +132,20 @@ impl Store {
             }
             conn.execute_batch("PRAGMA user_version = 2")?;
         }
+        // v2 → v3 迁移（M1c T6）：tasks.scan_mode（quick/deep，断点续跑按此分派）。
+        // 模版同 v2：闸门 + 列探测；旧行由 DEFAULT 'quick' 得保守值（M1c 前只有 quick）。
+        if ver < 3 {
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'scan_mode'")?
+                .exists([])?;
+            if !has {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN scan_mode TEXT NOT NULL DEFAULT 'quick'",
+                    [],
+                )?;
+            }
+            conn.execute_batch("PRAGMA user_version = 3")?;
+        }
         Ok(())
     }
 
@@ -136,16 +153,19 @@ impl Store {
         &self,
         device_id: &str,
         fs: &str,
+        mode: &str,
         total_bytes: u64,
     ) -> Result<u64, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO tasks (device_id, fs, state, total_bytes) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO tasks (device_id, fs, state, total_bytes, scan_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 device_id,
                 fs,
                 state_str(ScanState::Scanning),
-                total_bytes as i64
+                total_bytes as i64,
+                mode
             ],
         )?;
         Ok(conn.last_insert_rowid() as u64)
@@ -232,7 +252,8 @@ impl Store {
     pub fn task(&self, id: u64) -> Result<Option<TaskRow>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
-            "SELECT id, device_id, fs, state, read_bytes, found_count, elapsed_ms, total_bytes
+            "SELECT id, device_id, fs, state, read_bytes, found_count, elapsed_ms, total_bytes,
+                    scan_mode
              FROM tasks WHERE id = ?1",
         )?;
         let mut rows = st.query(params![id as i64])?;
@@ -250,6 +271,7 @@ impl Store {
             found_count: r.get::<_, i64>(5)? as u64,
             elapsed_ms: r.get::<_, i64>(6)? as u64,
             total_bytes: r.get::<_, i64>(7)? as u64,
+            scan_mode: r.get(8)?,
         }))
     }
 
@@ -328,20 +350,23 @@ mod tests {
     #[test]
     fn create_task_defaults_to_scanning() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("image:test.img", "exfat", 4096).unwrap();
+        let id = s
+            .create_task("image:test.img", "exfat", "quick", 4096)
+            .unwrap();
         assert_eq!(id, 1);
         let t = s.task(id).unwrap().unwrap();
         assert_eq!(t.state, ScanState::Scanning);
         assert_eq!(t.device_id, "image:test.img");
         assert_eq!(t.total_bytes, 4096);
         assert_eq!((t.read_bytes, t.found_count, t.elapsed_ms), (0, 0, 0));
+        assert_eq!(t.scan_mode, "quick");
         assert!(s.task(99).unwrap().is_none());
     }
 
     #[test]
     fn insert_and_page_entries() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 1).unwrap();
+        let id = s.create_task("d", "fat", "quick", 1).unwrap();
         let all = vec![
             entry(0, "A.JPG", true),
             entry(1, "B.TXT", false),
@@ -358,7 +383,7 @@ mod tests {
     #[test]
     fn deleted_only_filter_counts_and_pages() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 1).unwrap();
+        let id = s.create_task("d", "fat", "quick", 1).unwrap();
         s.insert_entries(
             id,
             &[
@@ -379,7 +404,7 @@ mod tests {
     #[test]
     fn unicode_names_roundtrip() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "exfat", 1).unwrap();
+        let id = s.create_task("d", "exfat", "quick", 1).unwrap();
         let e = entry(0, "照片 ①🌸.JPG", true);
         s.insert_entries(id, std::slice::from_ref(&e)).unwrap();
         let (_, page) = s.entries(id, 0, 1, false).unwrap();
@@ -389,7 +414,7 @@ mod tests {
     #[test]
     fn reinsert_same_key_replaces_row() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 1).unwrap();
+        let id = s.create_task("d", "fat", "quick", 1).unwrap();
         s.insert_entries(id, &[entry(0, "OLD.JPG", true)]).unwrap();
         let mut new = entry(0, "NEW.JPG", false);
         new.path = "/NEW.JPG".into();
@@ -416,7 +441,7 @@ mod tests {
     #[test]
     fn set_progress_roundtrips() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 10).unwrap();
+        let id = s.create_task("d", "fat", "quick", 10).unwrap();
         s.set_progress(id, 7, 3, 250).unwrap();
         let t = s.task(id).unwrap().unwrap();
         assert_eq!(
@@ -430,7 +455,7 @@ mod tests {
     #[test]
     fn unknown_state_reads_as_failed() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 1).unwrap();
+        let id = s.create_task("d", "fat", "quick", 1).unwrap();
         s.conn
             .lock()
             .unwrap()
@@ -449,8 +474,8 @@ mod tests {
     #[test]
     fn entries_and_clear_are_task_scoped() {
         let s = Store::open_memory().unwrap();
-        let a = s.create_task("d", "fat", 1).unwrap();
-        let b = s.create_task("d", "fat", 1).unwrap();
+        let a = s.create_task("d", "fat", "quick", 1).unwrap();
+        let b = s.create_task("d", "fat", "quick", 1).unwrap();
         s.insert_entries(a, &[entry(0, "A.JPG", false)]).unwrap();
         s.insert_entries(b, &[entry(0, "B.JPG", false)]).unwrap();
         let (ta, pa) = s.entries(a, 0, 10, false).unwrap();
@@ -463,7 +488,7 @@ mod tests {
     #[test]
     fn clear_entries_empties_task() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 1).unwrap();
+        let id = s.create_task("d", "fat", "quick", 1).unwrap();
         s.insert_entries(id, &[entry(0, "A", false)]).unwrap();
         s.clear_entries(id).unwrap();
         assert_eq!(s.entries(id, 0, 10, false).unwrap().0, 0);
@@ -472,10 +497,10 @@ mod tests {
     #[test]
     fn mark_interrupted_fails_active_but_keeps_paused_and_terminal() {
         let s = Store::open_memory().unwrap();
-        let a = s.create_task("d", "fat", 1).unwrap(); // scanning
-        let b = s.create_task("d", "fat", 1).unwrap();
+        let a = s.create_task("d", "fat", "quick", 1).unwrap(); // scanning
+        let b = s.create_task("d", "fat", "quick", 1).unwrap();
         s.set_state(b, ScanState::Paused).unwrap();
-        let c = s.create_task("d", "fat", 1).unwrap();
+        let c = s.create_task("d", "fat", "quick", 1).unwrap();
         s.set_state(c, ScanState::Completed).unwrap();
         assert_eq!(s.mark_interrupted().unwrap(), 1);
         assert_eq!(s.task(a).unwrap().unwrap().state, ScanState::Failed);
@@ -490,7 +515,7 @@ mod tests {
     #[test]
     fn set_state_if_active_guards_terminal_states() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "fat", 1).unwrap();
+        let id = s.create_task("d", "fat", "quick", 1).unwrap();
         s.set_state(id, ScanState::Completed).unwrap();
         s.set_state_if_active(id, ScanState::Paused).unwrap();
         assert_eq!(
@@ -498,7 +523,7 @@ mod tests {
             ScanState::Completed,
             "终态不被暂停覆写"
         );
-        let id2 = s.create_task("d", "fat", 1).unwrap();
+        let id2 = s.create_task("d", "fat", "quick", 1).unwrap();
         s.set_state_if_active(id2, ScanState::Canceled).unwrap();
         assert_eq!(s.task(id2).unwrap().unwrap().state, ScanState::Canceled);
     }
@@ -506,7 +531,7 @@ mod tests {
     #[test]
     fn byte_offset_roundtrips_and_defaults_null() {
         let s = Store::open_memory().unwrap();
-        let id = s.create_task("d", "exfat", 1).unwrap();
+        let id = s.create_task("d", "exfat", "quick", 1).unwrap();
         let mut carved = entry(0, "", true);
         carved.quality = "carved".into();
         carved.byte_offset = Some(835584);
@@ -518,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v2() {
+    fn v1_database_migrates_to_v3() {
         // 手工造 v1 库（无 byte_offset 列、user_version=1，含一条真实旧行）→ Store::open 迁移后可读写
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
@@ -546,14 +571,14 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 2, "迁移后版本标记必须前进到 2");
+        assert_eq!(ver, 3, "迁移后版本标记必须前进到 3（v1 连跳 v2/v3）");
         // 迁移前已存在的旧行：偏移未知，必须读回 NULL（DEFAULT 0 会把未知伪造成「偏移=0」）
         let (_, old) = s.entries(1, 0, 10, false).unwrap();
         assert_eq!(
             old[0].byte_offset, None,
             "迁移前旧行未知必须 NULL——DEFAULT 0 伪造「偏移=0」"
         );
-        let id = s.create_task("d", "exfat", 1).unwrap();
+        let id = s.create_task("d", "exfat", "quick", 1).unwrap();
         let mut e = entry(0, "OLD.JPG", true);
         e.byte_offset = Some(4096);
         s.insert_entries(id, &[e]).unwrap();
@@ -564,12 +589,53 @@ mod tests {
     }
 
     #[test]
+    fn v2_database_migrates_to_v3_and_old_rows_default_quick() {
+        // 手工造 v2 库（有 byte_offset、无 scan_mode、user_version=2，含一条真实旧行）→
+        // Store::open 迁移后旧行 scan_mode == 'quick'（M1c 前只有 quick），且新任务可写 deep。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, fs TEXT NOT NULL,
+                     state TEXT NOT NULL, read_bytes INTEGER NOT NULL DEFAULT 0, found_count INTEGER NOT NULL DEFAULT 0,
+                     elapsed_ms INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL);
+                 CREATE TABLE entries (task_id INTEGER NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+                     ext TEXT NOT NULL, size_bytes INTEGER NOT NULL, deleted INTEGER NOT NULL, is_dir INTEGER NOT NULL,
+                     quality TEXT NOT NULL, first_cluster INTEGER NOT NULL, byte_offset INTEGER,
+                     PRIMARY KEY (task_id, idx));
+                 INSERT INTO tasks (id, device_id, fs, state, total_bytes)
+                     VALUES (1, 'image:v2.img', 'exfat', 'completed', 512);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let ver: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 3, "v2 库必须前进到 3");
+        assert_eq!(
+            s.task(1).unwrap().unwrap().scan_mode,
+            "quick",
+            "迁移前旧行（M1c 前只有快扫）必须读回 quick——NULL/空串会把断点续跑分派错"
+        );
+        let id = s.create_task("d", "exfat", "deep", 1).unwrap();
+        assert_eq!(s.task(id).unwrap().unwrap().scan_mode, "deep");
+    }
+
+    #[test]
     fn file_store_persists_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tasks.db");
         let id = {
             let s = Store::open(&path).unwrap();
-            let id = s.create_task("image:x.img", "exfat", 8192).unwrap();
+            let id = s
+                .create_task("image:x.img", "exfat", "quick", 8192)
+                .unwrap();
             s.insert_entries(id, &[entry(0, "KEEP.JPG", true)]).unwrap();
             id
         };

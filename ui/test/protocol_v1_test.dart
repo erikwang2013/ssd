@@ -123,8 +123,8 @@ void expectRpcError(String file, int code, String message) {
 }
 
 void main() {
-  test('golden set is exactly the 22 contract files', () {
-    // 与 Rust 侧 golden_set_is_exactly_the_22_contract_files 对称：
+  test('golden set is exactly the 23 contract files', () {
+    // 与 Rust 侧 golden_set_is_exactly_the_23_contract_files 对称：
     // 新增/删除契约文件必须同步两侧测试（flutter test 的 cwd 为 ui/）。
     final names = Directory(
       '../proto/v1/examples',
@@ -134,6 +134,7 @@ void main() {
       'device_list.response.json',
       'error_device_permission.response.json',
       'error_task_not_active.response.json',
+      'error_unallocated_unavailable.response.json',
       'error_unsupported_fs.response.json',
       'ping.request.json',
       'ping.response.json',
@@ -311,6 +312,11 @@ void main() {
       'error_task_not_active.response.json',
       -32004,
       'Task not active: 1',
+    );
+    expectRpcError(
+      'error_unallocated_unavailable.response.json',
+      -32005,
+      'Cannot determine free space',
     );
   });
 }

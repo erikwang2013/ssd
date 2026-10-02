@@ -6,6 +6,7 @@
 //! worker 内部（计数设备 / 进度节流 / 引擎条目适配 / 线程体）见 `crate::scan_worker`。
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -70,6 +71,9 @@ pub enum ScanError {
     TaskNotFound(u64),
     TaskNotActive(u64),
     UnsupportedFs,
+    /// 空闲空间不可判定（深扫前置：exfat 位图 / FAT 表不可读）→ -32005。
+    /// 与「无空闲」必须区分：后者是合法空扫（total_bytes=0），前者是拒绝。
+    UnallocatedUnavailable,
     Store(StoreError),
     Internal(String),
 }
@@ -98,6 +102,24 @@ impl DeviceOpener for NoopOpener {
     fn open(&self, id: &str) -> Result<Arc<dyn BlockDevice>, OpenError> {
         Err(OpenError::Other(format!("no opener configured: {id}")))
     }
+}
+
+/// worker 线程体：入参恒为 (id, device, ctrl, store, notify)；deep 的额外状态（runs）由闭包携带。
+type WorkerFn = Box<dyn FnOnce(u64, Arc<dyn BlockDevice>, Arc<Ctrl>, Arc<Store>, NotifyFn) + Send>;
+
+/// 空闲区间枚举分派（两引擎错误一律收敛为 UnallocatedUnavailable——上层只回 -32005，
+/// 错误细节只进日志）。空 Vec 是合法结果（无空闲 = 空扫），不得与 Err 混同。
+fn unallocated_runs_of(dev: &dyn BlockDevice, fs: FsKind) -> Result<Vec<Range<u64>>, ScanError> {
+    // 两引擎错误类型不同（FatError/ExfatError）：此处抹成 () 收敛（细节进日志，不回客户端）
+    let r = match fs {
+        FsKind::Fat => xd_fs_fat::freespace::unallocated_runs(dev).map_err(|e| {
+            eprintln!("warn: fat freespace unavailable: {e:?}");
+        }),
+        FsKind::Exfat => xd_fs_exfat::freespace::unallocated_runs(dev).map_err(|e| {
+            eprintln!("warn: exfat freespace unavailable: {e:?}");
+        }),
+    };
+    r.map_err(|()| ScanError::UnallocatedUnavailable)
 }
 
 pub struct ScanStarted {
@@ -158,8 +180,8 @@ impl ScanManager {
         let total = device.size_bytes();
         let id = self
             .store
-            .create_task(&device.info().id, fs.as_str(), total)?;
-        self.spawn(id, device);
+            .create_task(&device.info().id, fs.as_str(), "quick", total)?;
+        self.spawn(id, device, Box::new(crate::scan_worker::run_worker));
         Ok(ScanStarted {
             task_id: id,
             fs,
@@ -167,7 +189,31 @@ impl ScanManager {
         })
     }
 
-    fn spawn(&self, id: u64, device: Arc<dyn BlockDevice>) {
+    /// 深扫启动（mode:"deep"）：**先解未分配区间**（失败 → 拒绝，绝不入册空跑），
+    /// `total_bytes` = Σ空闲区间长（进度百分比口径）。区间在启动时解一次并随 worker 闭包固定
+    /// ——扫描期内不再重解（分配表可能变化，重解会与已落库偏移脱节）。
+    pub fn start_deep(&self, device: Arc<dyn BlockDevice>) -> Result<ScanStarted, ScanError> {
+        let fs = probe(&*device).map_err(|_| ScanError::UnsupportedFs)?;
+        let runs = unallocated_runs_of(&*device, fs)?;
+        let total: u64 = runs.iter().map(|r| r.end - r.start).sum();
+        let id = self
+            .store
+            .create_task(&device.info().id, fs.as_str(), "deep", total)?;
+        self.spawn(
+            id,
+            device,
+            Box::new(move |id, dev, ctrl, store, notify| {
+                crate::scan_worker::run_carve_worker(id, dev, runs, ctrl, store, notify)
+            }),
+        );
+        Ok(ScanStarted {
+            task_id: id,
+            fs,
+            total_bytes: total,
+        })
+    }
+
+    fn spawn(&self, id: u64, device: Arc<dyn BlockDevice>, work: WorkerFn) {
         let ctrl = Arc::new(Ctrl::default());
         let running = Arc::new(AtomicBool::new(true));
         self.tasks.lock().unwrap().insert(
@@ -183,7 +229,7 @@ impl ScanManager {
         std::thread::Builder::new()
             .name(format!("scan-{id}"))
             .spawn(move || {
-                crate::scan_worker::run_worker(id, device, ctrl, store, notify);
+                work(id, device, ctrl, store, notify);
                 running.store(false, Ordering::SeqCst);
             })
             .expect("spawn scan worker");
@@ -264,7 +310,10 @@ impl ScanManager {
         probe(&*device).map_err(|_| ScanError::UnsupportedFs)?;
         self.store.clear_entries(id)?;
         self.store.set_state(id, ScanState::Scanning)?;
-        self.spawn(id, device);
+        // 注：restart 恒走快扫线程体——deep 的重启分派（按 row.scan_mode）归 T7
+        //（断点续跑要带 checkpoint 起点，届时一并改）；T6 的 deep 任务重启后跑到
+        // quick worker 属已知缺口，见 T6 报告移交项。
+        self.spawn(id, device, Box::new(crate::scan_worker::run_worker));
         Ok(())
     }
 
@@ -346,6 +395,87 @@ mod tests {
         assert!(!e.is_dir);
         assert_eq!(e.quality, "complete");
         assert_eq!(e.idx, 0);
+    }
+
+    /// exfat 夹具 + 在最大空闲区间的绝对偏移处埋 mini_jpeg（深扫可见件），
+    /// 返回 (镜像, 埋件, 区间起点)。
+    fn deep_fixture() -> (Vec<u8>, Vec<u8>, u64) {
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "LIVE_A.TXT", b"aaaa")
+            .add_file("/", "DEL_ME.JPG", &[7u8; 9000])
+            .delete("/", "DEL_ME.JPG")
+            .build();
+        let (_f0, dev0) = crate::testutil::dev_from_bytes(&image);
+        let runs = xd_fs_exfat::freespace::unallocated_runs(&*dev0).unwrap();
+        let run = runs
+            .iter()
+            .max_by_key(|r| r.end - r.start)
+            .expect("夹具必有空闲区间")
+            .clone();
+        let j = xd_fixtures::mini_jpeg(20000);
+        xd_fixtures::plant_in_run(&mut image, run.start, &j);
+        (image, j, run.start)
+    }
+
+    #[test]
+    fn deep_scan_completes_and_lands_carved_entries() {
+        let (image, j, off) = deep_fixture();
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        let m = mgr();
+        let s = m.start_deep(dev).unwrap();
+        assert_eq!(s.fs, FsKind::Exfat);
+        let row = wait_for_state(&m, s.task_id, ScanState::Completed, Duration::from_secs(20));
+        assert_eq!(row.found_count, 1);
+        assert_eq!(
+            row.read_bytes, s.total_bytes,
+            "进度收尾 100%（口径=Σ空闲区间）"
+        );
+        assert_eq!(
+            m.status(s.task_id).unwrap().scan_mode,
+            "deep",
+            "入册即记 mode"
+        );
+        let (total, page) = m.results(s.task_id, 0, 10, false).unwrap();
+        assert_eq!((total, page.len()), (1, 1));
+        assert_eq!(page[0].quality, "carved");
+        assert_eq!(page[0].byte_offset, Some(off));
+        assert_eq!(page[0].size_bytes, j.len() as u64);
+        assert_eq!(page[0].ext, "jpg");
+    }
+
+    #[test]
+    fn deep_cancel_stops_via_callback_not_unwind() {
+        // 深扫取消 = 回调返回 false（雕刻循环自家代码）→ 终态 canceled，**不得**落 failed
+        //（failed 说明走了 panic 通道，即机制错位）。
+        let (image, _, _) = deep_fixture();
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let m = ScanManager::new(
+            Store::open_memory().unwrap(),
+            Arc::new(move |v| ev.lock().unwrap().push(v)),
+        );
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        let slow = crate::testutil::SlowDev::wrap(dev, Duration::from_millis(30));
+        let s = m.start_deep(slow).unwrap();
+        m.cancel(s.task_id).unwrap();
+        wait_for_state(&m, s.task_id, ScanState::Canceled, Duration::from_secs(10));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = loop {
+            if let Some(v) = events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|v| v["method"] == "scan.finished")
+            {
+                break v.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "carve worker 未发出 scan.finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(done["params"]["state"], "canceled", "{done}");
     }
 
     #[test]
@@ -518,8 +648,8 @@ mod tests {
         let path = dir.path().join("tasks.db");
         let (scanning_id, paused_id) = {
             let s = Store::open(&path).unwrap();
-            let a = s.create_task("image:a.img", "exfat", 1).unwrap();
-            let b = s.create_task("image:b.img", "exfat", 1).unwrap();
+            let a = s.create_task("image:a.img", "exfat", "quick", 1).unwrap();
+            let b = s.create_task("image:b.img", "exfat", "quick", 1).unwrap();
             s.set_state(b, ScanState::Paused).unwrap();
             (a, b)
         };

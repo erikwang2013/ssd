@@ -1,7 +1,7 @@
 # 小盾 IPC 契约 v1
 
 v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`scan.progress`/`scan.finished`
-通知、`ScanEntry`/`ScanProgress` 结果类型、`-32001`/`-32002`/`-32003`/`-32004`/`-32603`
+通知、`ScanEntry`/`ScanProgress` 结果类型、`-32001`/`-32002`/`-32003`/`-32004`/`-32005`/`-32603`
 错误码，以及 `DeviceInfo.transport` 可选字段。**v0 封存**：`proto/v0/**` 不再改动，
 仅作历史快照（v0 golden 里 `protocol` 仍为 0）；唯一例外：
 `error_method_not_found.response.json` 的示例方法名随 `scan.start` 转正修正（M1b T5），其余不动。
@@ -21,15 +21,16 @@ v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`s
 |---|---|---|
 | `ping` | null | `{"pong": true, "version": "<VERSION>", "protocol": 1}` |
 | `device.list` | null | `{"devices": [DeviceInfo]}` |
-| `scan.start` | `{"device": "<id>", "mode"?: "quick"}` | `{"taskId": <u64>, "fs": "fat"\|"exfat", "totalBytes": <u64>}` |
+| `scan.start` | `{"device": "<id>", "mode"?: "quick"\|"deep"}` | `{"taskId": <u64>, "fs": "fat"\|"exfat", "totalBytes": <u64>}` |
 | `scan.status` | `{"taskId": <u64>}` | `{"taskId", "state", "readBytes", "foundCount", "elapsedMs"}` |
 | `scan.results` | `{"taskId", "offset", "limit", "deletedOnly"?}` | `{"total": <u64>, "entries": [ScanEntry]}` |
 | `scan.pause` | `{"taskId"}` | `{"taskId", "state": "paused"}` |
 | `scan.resume` | `{"taskId"}` | `{"taskId", "state": "scanning"}` |
 | `scan.cancel` | `{"taskId"}` | `{"taskId", "state": "canceled"}` |
 
-- `scan.start`：`mode` 缺省 `"quick"`（M1b 仅 quick）。设备无权限（EACCES）→ `-32001`；
-  未知或不支持的文件系统 → `-32002`。
+- `scan.start`：`mode` 缺省 `"quick"`；`"deep"` 自 M1c 起有效（未分配空间雕刻）。
+  设备无权限（EACCES）→ `-32001`；未知或不支持的文件系统 → `-32002`；其它 `mode` 值
+  → `-32602`（未知模式不得静默降级）；`"deep"` 前置的空闲空间枚举失败 → `-32005`。
 - `scan.status`：`readBytes` 为已扫描字节、`foundCount` 为已发现条目数、`elapsedMs`
   为任务开始至此刻的墙钟（含暂停时间）；净扫描时长 M1c 再议。
 - `scan.results`：`offset`/`limit` 分页；`deletedOnly` 缺省 false，为 true 时只看删除项；
@@ -95,6 +96,7 @@ v0 字段不变，**新增 `transport`**：
 | -32002 | 不支持的文件系统（`Unsupported file system`） |
 | -32003 | 任务不存在（`Task not found: <taskId>`） |
 | -32004 | 任务状态不允许该操作（`Task not active: <taskId>`） |
+| -32005 | 空闲空间不可判定（`Cannot determine free space`；`mode:"deep"` 前置：exfat 位图 / FAT 表不可读——「无空闲」是合法空扫，不得与此混同） |
 | -32603 | 内部错误（`Internal error`） |
 
 错误 `message` 文案属契约一部分，两侧测试逐字断言。特例：`-32602` 的 `message` 形如
@@ -104,7 +106,8 @@ v0 字段不变，**新增 `transport`**：
 ## v1.1 增量（M1c 文件雕刻）
 
 **纯增量，读旧客户端不受影响**（不递增 `protocol`）：`byteOffset` 序列化时省略 `null`
-键，`quality` 既有取值不变，既有 21 个 golden 一字不动；本版新增 golden 1 个（雕刻结果页）。
+键，`quality` 既有取值不变，既有 21 个 golden 一字不动；本版新增 golden 2 个（雕刻结果页、
+`-32005` 错误页）。
 
 - `scan.start.mode` 值域 `"quick"（缺省） | "deep"`：`deep` 自 M1c 起有效（未分配空间雕刻）；
   其它值仍 `-32602`。
@@ -115,7 +118,7 @@ v0 字段不变，**新增 `transport`**：
 - `ScanEntry.byteOffset`：u64，**缺省 = null**（序列化省略）。FS 条目恒缺；雕刻条目为
   未分配空间内的起始字节坐标（`firstCluster` 对雕刻件恒 0——无簇概念）。
 
-## golden 文件（22）
+## golden 文件（23）
 
 examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.request.json`、
 `device_list.response.json`、`scan_start.request.json`、`scan_start.response.json`、
@@ -124,7 +127,8 @@ examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.reques
 `scan_resume.request.json`、`scan_resume.response.json`、`scan_cancel.request.json`、
 `scan_cancel.response.json`、`scan_progress.notification.json`、`scan_finished.notification.json`、
 `error_device_permission.response.json`、`error_unsupported_fs.response.json`、
-`error_task_not_active.response.json`、`scan_results_carved.response.json`。
+`error_task_not_active.response.json`、`scan_results_carved.response.json`、
+`error_unallocated_unavailable.response.json`。
 
 Rust 侧断言：`crates/xd-core/tests/contract_v1.rs`；Dart 侧：`ui/test/protocol_v1_test.dart`。
 

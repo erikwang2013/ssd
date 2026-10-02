@@ -108,6 +108,7 @@ fn scan_err(req: &Request, e: ScanError) -> Response {
         ScanError::TaskNotFound(id) => err(req, RpcError::task_not_found(id)),
         ScanError::TaskNotActive(id) => err(req, RpcError::task_not_active(id)),
         ScanError::UnsupportedFs => err(req, RpcError::unsupported_fs()),
+        ScanError::UnallocatedUnavailable => err(req, RpcError::unallocated_unavailable()),
         _ => err(req, RpcError::internal()),
     }
 }
@@ -117,16 +118,21 @@ fn scan_start(ctx: &CoreCtx, req: &Request) -> Response {
         Ok(p) => p,
         Err(r) => return r,
     };
-    if let Some(m) = &p.mode
-        && m != "quick"
-    {
+    // v1.1：mode ∈ {None→quick, "quick", "deep"}；其它值 -32602（未知模式不得静默降级）
+    let mode = p.mode.as_deref().unwrap_or("quick");
+    if mode != "quick" && mode != "deep" {
         return err(req, RpcError::invalid_params("unsupported mode"));
     }
     let dev = match ctx.resolve_device(&p.device) {
         Ok(d) => d,
         Err(e) => return err(req, e),
     };
-    match ctx.scans.start(dev) {
+    let started = if mode == "deep" {
+        ctx.scans.start_deep(dev)
+    } else {
+        ctx.scans.start(dev)
+    };
+    match started {
         Ok(s) => ok(
             req,
             serde_json::json!({
@@ -561,10 +567,122 @@ mod tests {
     }
 
     #[test]
-    fn scan_start_rejects_unsupported_mode() {
-        // M1b 仅支持 quick；"deep" 在 M1c 转正后本断言由 M1c 计划改为合法路径。
+    fn unknown_mode_rejected() {
+        // "deep" 自 M1c 起合法（见 deep_scan_streams_carved_entries）；未知模式（"full"）
+        // 必须 -32602，不得静默降级为 quick。
         let (_f, ctx) = ctx_with_fixture();
         let dev_id = ctx.devices[0].info().id.clone();
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                3,
+                "scan.start",
+                serde_json::json!({"device": dev_id, "mode": "full"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
+        assert_eq!(e.error.message, "Invalid params: unsupported mode");
+    }
+
+    /// 轮询到终态（handler 级）。
+    fn wait_state(ctx: &CoreCtx, id: u64, want: &str) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let Response::Ok(o) = handle_request(
+                ctx,
+                &req_with(99, "scan.status", serde_json::json!({"taskId": id})),
+            ) else {
+                panic!()
+            };
+            if o.result["state"] == want {
+                return o.result.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "state stuck at {} (wanted {want}): {o:?}",
+                o.result["state"]
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn deep_scan_streams_carved_entries() {
+        // 全链：exfat 夹具算出空闲区间 → 在最大区间的绝对偏移处埋 mini_jpeg → mode:"deep"
+        // → completed → scan.results 出 quality=="carved" 条目，byteOffset/size 精确。
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "LIVE_A.TXT", b"aaaa")
+            .add_file("/", "DEL_ME.JPG", &[7u8; 9000])
+            .delete("/", "DEL_ME.JPG")
+            .build();
+        let (_f0, dev0) = crate::testutil::dev_from_bytes(&image);
+        let runs = xd_fs_exfat::freespace::unallocated_runs(&*dev0).unwrap();
+        let run = runs
+            .iter()
+            .max_by_key(|r| r.end - r.start)
+            .expect("夹具必有空闲区间")
+            .clone();
+        let total: u64 = runs.iter().map(|r| r.end - r.start).sum();
+        let j = xd_fixtures::mini_jpeg(20000);
+        assert!(j.len() as u64 <= run.end - run.start, "区间须容得下埋件");
+        xd_fixtures::plant_in_run(&mut image, run.start, &j);
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        let dev_id = dev.info().id.clone();
+        let ctx = CoreCtx::new(vec![dev]);
+
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                3,
+                "scan.start",
+                serde_json::json!({"device": dev_id, "mode": "deep"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(o.result["fs"], "exfat");
+        assert_eq!(
+            o.result["totalBytes"], total,
+            "深扫 totalBytes = Σ空闲区间长（进度分母）"
+        );
+        let id = o.result["taskId"].as_u64().unwrap();
+        let status = wait_state(&ctx, id, "completed");
+        assert_eq!(status["foundCount"], 1);
+        assert_eq!(status["readBytes"], total, "进度收尾 == 100%");
+        let Response::Ok(r) = handle_request(
+            &ctx,
+            &req_with(
+                4,
+                "scan.results",
+                serde_json::json!({"taskId": id, "offset": 0, "limit": 10}),
+            ),
+        ) else {
+            panic!()
+        };
+        let entries = r.result["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["quality"], "carved");
+        assert_eq!(entries[0]["ext"], "jpg");
+        assert_eq!(entries[0]["byteOffset"], run.start, "雕刻偏移逐字节精确");
+        assert_eq!(entries[0]["sizeBytes"], j.len() as u64, "完整重组长");
+        assert_eq!(entries[0]["deleted"], true);
+    }
+
+    #[test]
+    fn deep_without_free_space_info_fails_32005() {
+        // 夹具布局：簇堆 32 扇区起、簇 5 = 根目录；根槽 1（0x81 位图项）FirstCluster@20
+        // 改为越界 9999 → 位图不可读 → 深扫拒绝 -32005（绝不空跑）；快扫不受影响（对照）。
+        const ROOT_OFF: usize = 32 * 512 + 3 * 4096;
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "LIVE_A.TXT", b"aaaa")
+            .build();
+        assert_eq!(image[ROOT_OFF + 32], 0x81, "前提：根槽 1 是位图项");
+        image[ROOT_OFF + 32 + 20..ROOT_OFF + 32 + 24].copy_from_slice(&9999u32.to_le_bytes());
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        let dev_id = dev.info().id.clone();
+        let ctx = CoreCtx::new(vec![dev]);
         let Response::Err(e) = handle_request(
             &ctx,
             &req_with(
@@ -575,8 +693,21 @@ mod tests {
         ) else {
             panic!()
         };
-        assert_eq!(e.error.code, -32602);
-        assert_eq!(e.error.message, "Invalid params: unsupported mode");
+        assert_eq!(e.error.code, -32005);
+        assert_eq!(e.error.message, "Cannot determine free space");
+        // 对照：同设备快扫仍可成功（位图只堵深扫前置；目录链照读）
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(4, "scan.start", serde_json::json!({"device": dev_id})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(o.result["fs"], "exfat");
+        assert_eq!(
+            o.result["totalBytes"],
+            ctx.devices[0].info().size_bytes,
+            "快扫 totalBytes 仍是整卷大小（深扫才改口径）"
+        );
     }
 
     #[test]
@@ -679,7 +810,9 @@ mod tests {
         use crate::api::ScanState;
         use crate::store::Store;
         let store = Store::open_memory().unwrap();
-        let id = store.create_task("image:x.img", "exfat", 1).unwrap();
+        let id = store
+            .create_task("image:x.img", "exfat", "quick", 1)
+            .unwrap();
         store.set_state(id, ScanState::Completed).unwrap();
         let ctx = CoreCtx::new(vec![]).with_scan(
             Arc::new(ScanManager::new(store, Arc::new(|_| {}))),
@@ -701,7 +834,7 @@ mod tests {
         use crate::store::Store;
         let store = Store::open_memory().unwrap();
         let id = store
-            .create_task("unix:/dev/sdb", "exfat", 3907029168)
+            .create_task("unix:/dev/sdb", "exfat", "quick", 3907029168)
             .unwrap();
         assert_eq!(id, 1);
         store.set_progress(id, 123456, 42, 1500).unwrap();
@@ -776,7 +909,9 @@ mod tests {
         let entries: Vec<crate::api::ScanEntry> =
             serde_json::from_value(carved["result"]["entries"].clone()).unwrap();
         let store = Store::open_memory().unwrap();
-        let id = store.create_task("unix:/dev/sdb", "exfat", 1).unwrap();
+        let id = store
+            .create_task("unix:/dev/sdb", "exfat", "quick", 1)
+            .unwrap();
         assert_eq!(id, 1);
         store.insert_entries(id, &entries).unwrap();
         let ctx = CoreCtx::new(vec![]).with_scan(

@@ -156,6 +156,14 @@ impl RpcError {
         }
     }
 
+    /// -32005：空闲空间不可判定（深扫前置：位图/FAT 表不可读）——不得伪装成「无空闲」。
+    pub fn unallocated_unavailable() -> Self {
+        Self {
+            code: -32005,
+            message: "Cannot determine free space".into(),
+        }
+    }
+
     pub fn cannot_open(id: &str) -> Self {
         Self {
             code: -32602,

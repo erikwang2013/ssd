@@ -8,11 +8,13 @@
 //! 说明：设计 §4.3 的"多线程并行块扫描"延后（雕刻 I/O 受限，顺序读已达 §4.6 底线；
 //! 并行收益须实测后按需加，届时并行的是"多个 run 的读"而非签名匹配）。
 
+mod carver;
 pub mod crc32;
 mod jpeg;
 mod png;
 pub mod signatures;
 
+pub use carver::{CHUNK_BYTES, CarveEvent, CarveStats, CarvedEntry, MAX_FILE_BYTES, carve_runs};
 pub use jpeg::carve_jpeg;
 pub use png::carve_png;
 pub use signatures::{Carved, Cursor};

@@ -15,9 +15,10 @@ fn golden(name: &str) -> serde_json::Value {
     serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("parse {name}: {e}"))
 }
 
-/// golden 集合收口：新增/删除契约文件必须同步改测试（22 个 = v1 冻结 21 + M1c 雕刻页 1）。
+/// golden 集合收口：新增/删除契约文件必须同步改测试（23 个 = v1 冻结 21 + M1c 雕刻页 1
+/// + M1c -32005 错误页 1）。
 #[test]
-fn golden_set_is_exactly_the_22_contract_files() {
+fn golden_set_is_exactly_the_23_contract_files() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto/v1/examples");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
@@ -29,6 +30,7 @@ fn golden_set_is_exactly_the_22_contract_files() {
         "device_list.response.json",
         "error_device_permission.response.json",
         "error_task_not_active.response.json",
+        "error_unallocated_unavailable.response.json",
         "error_unsupported_fs.response.json",
         "ping.request.json",
         "ping.response.json",
@@ -303,6 +305,11 @@ fn error_responses_match_golden() {
             "error_task_not_active.response.json",
             9,
             RpcError::task_not_active(1),
+        ),
+        (
+            "error_unallocated_unavailable.response.json",
+            12,
+            RpcError::unallocated_unavailable(),
         ),
     ] {
         let v = golden(name);

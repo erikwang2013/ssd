@@ -3,12 +3,9 @@
 //! 字节区间。**FAT 删除即清链 → 删除文件的数据簇恰好落在此处（雕刻主战场）**。
 //! 返回已排序、互不相交、簇边界对齐的 `[start,end)`，全部落于数据簇堆内
 //! （FAT12/16 的固定根目录区永不入选）。BPB/FAT 解析失败 → Err；
-//! `is_free` Err（表项读失败）视为已分配（保守：宁可漏扫不可误扫）；空闲区间数上限
-//! MAX_RUNS **如实截断**（只丢尾不虚报，见常量 doc）。
-//! 与 exfat 侧的不对称（**T6 显式决策点**）：本引擎在 FAT 全表不可读时退化为 `Ok(空)`
-//! （与"全盘已分配"不可区分——保守方向已由专测钉死）；exfat 位图不可读 → `Err`。
-//! 深扫若要区分"无空闲"与"空闲不可知"，由 T6 在 ScanError 层显式决策（-32005），
-//! 本层不引入新错误类型。
+//! `is_free` Err（表项读失败）→ **Err**（T6 裁定：空闲不可知不得静默退化为「无空闲」，
+//! 与 exfat 位图不可读对称——旧行为「视为已分配 → Ok(空)」已废弃，深扫侧映射 -32005）；
+//! 空闲区间数上限 MAX_RUNS **如实截断**（只丢尾不虚报，见常量 doc）。
 //! ponytail: 逐簇一次 read_at（沿用 fat.rs 的取舍）；1M 簇盘实测慢再引入扇区缓存/预读。
 
 use std::ops::Range;
@@ -25,19 +22,20 @@ pub const MAX_RUNS: usize = 100_000;
 pub fn unallocated_runs(dev: &dyn BlockDevice) -> Result<Vec<Range<u64>>, FatError> {
     let bpb = bpb::parse(dev)?;
     let fat = Fat::new(dev, &bpb);
-    Ok(runs_from_fat(&bpb, &fat, MAX_RUNS))
+    runs_from_fat(&bpb, &fat, MAX_RUNS)
 }
 
-/// 空闲簇 2..=count+1 线性合并。`is_free` Err 视为已分配（保守：宁可漏扫不可误扫）；
+/// 空闲簇 2..=count+1 线性合并。**任一表项读失败（`is_free` Err）→ 整体 Err**
+/// （空闲不可知必须显式失败，绝不静默当成「全盘已分配」）；
 /// `max_runs` 到顶截断（调用方以 Σ区间长 为进度目标，不虚报未枚举区间）。参数化只为
 /// 可测截断语义（公开入口恒传 `MAX_RUNS`）。
-fn runs_from_fat(bpb: &Bpb, fat: &Fat<'_>, max_runs: usize) -> Vec<Range<u64>> {
+fn runs_from_fat(bpb: &Bpb, fat: &Fat<'_>, max_runs: usize) -> Result<Vec<Range<u64>>, FatError> {
     let max_cluster = bpb.data_cluster_count() as u64 + 1;
     let cb = bpb.cluster_bytes() as u64;
     let mut out: Vec<Range<u64>> = Vec::new();
     let mut run_start: Option<u64> = None;
     for c in 2..=max_cluster {
-        let free = matches!(fat.is_free(c as u32), Ok(true));
+        let free = fat.is_free(c as u32)?;
         match (free, run_start) {
             (true, None) => run_start = Some(c),
             (false, Some(s)) => {
@@ -56,7 +54,7 @@ fn runs_from_fat(bpb: &Bpb, fat: &Fat<'_>, max_runs: usize) -> Vec<Range<u64>> {
         // 末段右界 = 末簇起点 + 簇宽（cluster_to_byte 的契约上界是 count+1，不外推）
         out.push(bpb.cluster_to_byte(s as u32)..bpb.cluster_to_byte(max_cluster as u32) + cb);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -140,7 +138,7 @@ mod tests {
         let fat = Fat::new(&dev, &bpb);
         let full = unallocated_runs(&dev).unwrap();
         assert_eq!(full.len(), 5, "前提：无限制确为 5 区间 {full:?}");
-        let capped = runs_from_fat(&bpb, &fat, 2);
+        let capped = runs_from_fat(&bpb, &fat, 2).unwrap();
         assert_eq!(capped.len(), 2, "到顶只丢尾，不得多报: {capped:?}");
         assert_eq!(capped[0], full[0], "前 2 个逐字段等于无限制结果");
         assert_eq!(capped[1], full[1]);
@@ -157,7 +155,7 @@ mod tests {
         let bpb = bpb::parse(&dev).unwrap();
         let fat = Fat::new(&dev, &bpb);
         let full = unallocated_runs(&dev).unwrap();
-        let capped = runs_from_fat(&bpb, &fat, 3);
+        let capped = runs_from_fat(&bpb, &fat, 3).unwrap();
         assert_eq!(capped.len(), 3, "恰 3 个（第 4 个起丢尾）: {capped:?}");
         for (i, r) in capped.iter().enumerate() {
             assert_eq!(*r, full[i], "第 {i} 个区间逐字段等于无限制结果");
@@ -195,8 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn fat_read_errors_are_treated_as_allocated() {
-        // FAT 区读失败 → 表项视为已分配（宁可漏扫不可误扫）：空 runs、不 panic、不虚报
+    fn fat_read_errors_yield_err() {
+        // T6 裁定：FAT 区读失败 → 空闲不可知 → **Err**（与 exfat 位图不可读对称）。
+        // 旧行为「视为已分配 → Ok(空)」与「全盘已分配」不可区分，深扫会静默空跑，已废弃。
         struct NoFatReads<'a> {
             inner: &'a dyn BlockDevice,
         }
@@ -217,8 +216,11 @@ mod tests {
             .add_file("/", "A.BIN", &[0u8; 600])
             .build();
         let (_f, dev) = dev_for(&image);
-        let runs = unallocated_runs(&NoFatReads { inner: &dev }).unwrap();
-        assert!(runs.is_empty(), "FAT 不可读时不得声称任何簇空闲: {runs:?}");
+        let err = unallocated_runs(&NoFatReads { inner: &dev }).unwrap_err();
+        assert!(
+            matches!(err, FatError::Device(_)),
+            "读失败须如实上抛: {err:?}"
+        );
         // 对照：同一镜像在可读设备上确实能枚举出空闲区间
         assert!(!unallocated_runs(&dev).unwrap().is_empty());
     }
@@ -258,7 +260,7 @@ mod tests {
         // max_runs = 0：区间数上限为 0 时一个区间都不得上报（钉死 final-flush 的
         // `out.len() < max_runs` 守卫；无守卫会把 pending 的簇 2 区间推成整堆）
         assert!(
-            runs_from_fat(&bpb, &fat, 0).is_empty(),
+            runs_from_fat(&bpb, &fat, 0).unwrap().is_empty(),
             "max_runs=0 不得上报任何区间"
         );
     }
