@@ -170,7 +170,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
                     first_cluster: s.first_cluster,
                     size: s.size,
                     deleted: s.deleted,
-                    is_dir: s.attr & ATTR_DIRECTORY != 0 && !s.deleted,
+                    is_dir: s.attr & ATTR_DIRECTORY != 0,
                     has_lfn,
                 });
             }
@@ -388,5 +388,19 @@ mod tests {
         assert_eq!(parsed2.len(), 1);
         assert_eq!(parsed2[0].name, "old_gone_0");
         assert!(parsed2[0].deleted);
+    }
+
+    #[test]
+    fn deleted_subdir_entry_keeps_is_dir() {
+        // 已删目录不得伪装成文件（M1d 会当 0 字节文件"恢复"）：is_dir 忠实 attr
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(b"\xE5LDDIR     ");
+        raw[11] = ATTR_DIRECTORY;
+        raw[26..28].copy_from_slice(&5u16.to_le_bytes());
+        let parsed = parse_directory_bytes(&raw);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].deleted);
+        assert!(parsed[0].is_dir, "已删目录的 is_dir 必须忠实 attr");
+        assert_eq!(parsed[0].name, "?LDDIR");
     }
 }
