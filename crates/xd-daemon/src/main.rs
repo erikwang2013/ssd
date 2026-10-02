@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 
 use xd_core::api::{PROTOCOL_VERSION, Request, Response, RpcErr, RpcError};
 use xd_core::handlers::{CoreCtx, handle_request};
-use xd_core::scan_task::{DeviceOpener, NotifyFn, OpenError, ScanCanceled, ScanManager};
+#[cfg(target_os = "linux")]
+use xd_core::scan_task::OpenError;
+use xd_core::scan_task::{DeviceOpener, NotifyFn, ScanCanceled, ScanManager};
 use xd_core::store::Store;
 use xd_device::BlockDevice;
 use xd_device::image::ImageFileDevice;
