@@ -77,6 +77,7 @@ fn upcase_ascii(c: u16) -> u16 {
 }
 
 /// 解析目录字节（`cluster_bytes` 用于拒绝跨簇项集）。`data` 为该目录所有簇按链序拼接。
+/// 前置条件：`cluster_bytes > 0`（来自已验证几何，`boot::parse` 保证 ≥512）。
 pub fn parse_directory_bytes(data: &[u8], cluster_bytes: usize) -> Directory {
     let mut out = Directory::default();
     let mut i = 0usize;
@@ -439,5 +440,51 @@ mod tests {
         root[SET_OFF + 32 + 24..SET_OFF + 32 + 32].copy_from_slice(&0u64.to_le_bytes());
         let d = parse_directory_bytes(&root, CB);
         assert!(!d.entries.iter().any(|e| e.name == "A.TXT"));
+    }
+
+    #[test]
+    fn name_slot_type_check_is_load_bearing() {
+        // live 集名字槽类型字节置 0x00：此时 0xC1 检查是唯一拒绝者（结构其余仍自洽）
+        let mut root = fixture_root();
+        root[SET_OFF + 2 * 32] = 0x00; // A.TXT 名字槽（槽 5 = SET_OFF+2*32）类型字节
+        let d = parse_directory_bytes(&root, CB);
+        assert!(!d.entries.iter().any(|e| e.name == "A.TXT"));
+    }
+
+    #[test]
+    fn vendor_slot_tolerated_but_unknown_extra_slot_rejected() {
+        // 追加 0xE0 vendor 槽（SecondaryCount+1、重算 SetChecksum）→ 接受；追加 0x00 → 拒绝
+        let img = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "A.TXT", b"x")
+            .build();
+        let root = root_of(&img);
+        let mut set: Vec<u8> = root[SET_OFF..SET_OFF + 3 * 32].to_vec();
+        set[1] = 3; // SecondaryCount 2 → 3
+        let mut vendor = [0u8; 32];
+        vendor[0] = 0xE0;
+        set.extend_from_slice(&vendor);
+        let cs = entry_set_checksum16(&set); // 与实现同跳规则（跳过 2/3）
+        set[2..4].copy_from_slice(&cs.to_le_bytes());
+        let mut data = vec![0x01u8; CB];
+        data[..set.len()].copy_from_slice(&set);
+        let d = parse_directory_bytes(&data, CB);
+        assert!(
+            d.entries.iter().any(|e| e.name == "A.TXT"),
+            "0xE0 vendor 槽须被容忍"
+        );
+        // 反例：extend 槽改 0x00 → 拒绝
+        let mut set2: Vec<u8> = root[SET_OFF..SET_OFF + 3 * 32].to_vec();
+        set2[1] = 3;
+        let bad = [0u8; 32]; // 类型 0x00
+        set2.extend_from_slice(&bad);
+        let cs2 = entry_set_checksum16(&set2);
+        set2[2..4].copy_from_slice(&cs2.to_le_bytes());
+        let mut data2 = vec![0x01u8; CB];
+        data2[..set2.len()].copy_from_slice(&set2);
+        let d2 = parse_directory_bytes(&data2, CB);
+        assert!(
+            !d2.entries.iter().any(|e| e.name == "A.TXT"),
+            "非 vendor 多余槽须拒绝"
+        );
     }
 }
