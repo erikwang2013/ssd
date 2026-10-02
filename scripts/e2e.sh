@@ -8,7 +8,7 @@ bash fixtures/gen_image.sh /tmp/xiaodun-m0-test.img 65536 >/dev/null
 out=$(printf '%s\n%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' \
   '{"jsonrpc":"2.0","id":2,"method":"device.list","params":null}' \
-  | cargo run -q -p xd-daemon -- --image /tmp/xiaodun-m0-test.img)
+  | cargo run -q --locked -p xd-daemon -- --image /tmp/xiaodun-m0-test.img)
 
 echo "$out"
 echo "$out" | grep -q '"pong":true'  || { echo "FAIL: ping"; exit 1; }

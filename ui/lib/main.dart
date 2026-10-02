@@ -1,4 +1,4 @@
-import 'dart:io' show ProcessException;
+import 'dart:io' show Platform, ProcessException;
 
 import 'package:flutter/material.dart';
 
@@ -10,9 +10,15 @@ import 'home_page.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // M0：真实 daemon 通过 XD_DAEMON_BIN 指定；未配置或启动失败时 UI 显示错误态。
+  // XD_IMAGE 可选：把镜像文件注册为设备（演示/测试路径，见 README 快速上手）。
+  final extraArgs = <String>[];
+  final image = Platform.environment['XD_IMAGE'];
+  if (image != null) {
+    extraArgs.addAll(['--image', image]);
+  }
   CoreClient client;
   try {
-    client = await IpcCoreClient.start();
+    client = await IpcCoreClient.start(extraArgs: extraArgs);
   } on StateError catch (e) {
     client = _MissingDaemonClient('$e');
   } on ProcessException catch (e) {

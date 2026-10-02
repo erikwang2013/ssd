@@ -89,6 +89,8 @@ fn malformed_line_does_not_kill_stream() {
     let mut d = Daemon::start(&[]);
     let resp = d.call("not json at all");
     assert_eq!(resp["error"]["code"], -32700);
+    assert_eq!(resp["error"]["message"], "Parse error");
+    assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], serde_json::Value::Null);
     // 流仍然存活
     let resp = d.call(r#"{"jsonrpc":"2.0","id":11,"method":"ping","params":null}"#);
