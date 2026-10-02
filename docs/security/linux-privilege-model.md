@@ -1,0 +1,92 @@
+# 小盾 Linux 提权模型（M1e 决策落点）
+
+© 2026 erik · erik@erik.xyz · https://erik.xyz
+
+范围：M1 Linux 预览版如何让普通用户对物理磁盘做**只读**访问。落地件：
+`packaging/udev/71-xiaodun-uaccess.rules`、`packaging/polkit/com.erik.xiaodun.policy`、
+`crates/xd-daemon/src/privcheck.rs`（+ `main.rs` 接入）。
+
+> **真机生效状态：未验证（需真机 root）**。udev 规则与 polkit 策略均为声明式文件，
+> CI（无 session D-Bus、无 udevd、无 tty）无法覆盖其真实生效路径。M1 出口手测清单：
+> 装包（`dpkg -i`）→ 插 U 盘 → 免密扫描成功（详见文末"未验证清单"）。
+
+## 1. 三方案取舍
+
+| 方案 | 内容 | 决策 |
+|------|------|------|
+| **A. udev uaccess（主）** | 规则对 USB 存储/SD 卡打 `TAG+="uaccess"`，systemd-logind 给**活动会话**用户加 ACL | **采用**——零代码改动、零提示、无 root 进程 |
+| **C. pkexec 白名单（兜底）** | polkit action 限定 exec.path，通过 pkexec 以 root 拉起 `xd-daemon`；root 模式对参数做纵深校验 | **采用**（兜底：ACL 未命中/无活动会话时；注意 SSH/无会话场景因 `allow_any=no` 可能**硬拒且无提示**，不可用即不可用） |
+| **D. AppImage 自带提权** | 打包 AppImage 并让其中二进制提权 | **不做**——结构性冲突：AppImage 走 FUSE 挂载，默认 `nosuid`，且无法安装 udev/polkit 系统文件 |
+
+产品形态因此是 **deb + uaccess 主 / pkexec 兜底 / AppImage 不做**。
+
+## 2. 为什么 uaccess 是 rw，而"只读"仍然成立
+
+内核/udev 层面**没有"只读 ACL"**：`TAG+="uaccess"` 授予的是 rw ACL（`uaccess` 由
+logind 翻译为 `g:user:rw`）。因此只读铁律**不在权限层**，而在两个别处：
+
+1. **类型系统**：`xd_device::BlockDevice` 只有 `read_at`，无任何写方法，`xd-device`
+   不导出写路径——恢复工具不可写盘是编译期保证。
+2. **打开方式**：设备/镜像一律 `O_RDONLY`（`ImageFileDevice::open` 与
+   `LinuxBlockDevice::open` 均无写打开分支）。
+
+即：ACL 给的是"可达"，"不可写"由代码结构与 open flag 保证。审查时这两点必须同时成立。
+
+## 3. 为什么 polkit 必须 `auth_admin`（不 keep）且 root 侧还要校验参数
+
+**pkexec 不校验传给目标的参数**（polkit 只授权"运行这个可执行文件"，参数原样透传）。
+于是存在两条攻击面：
+
+1. **`auth_admin_keep` 或 `yes` = 本地任意文件读取**：授权被缓存后，任意以会话用户身份
+   运行的代码（含被诱导执行的脚本）都能 `pkexec /usr/libexec/xiaodun/xd-daemon --image /etc/shadow`
+   拿到 root 可读文件的字节，且**不再弹认证框**。`allow_any=no` + `allow_active/auth_admin`
+   非 keep 把"每次调用"都钉回真人认证，这是策略层的**第一道**。
+   （策略文件里的注释是**勿改警告**，不是建议。）
+2. **参数纵深防御（第二道）**：`privcheck::check_image_arg` 在 euid==0 时要求
+   `--image` 指向**普通文件**且**属主 == `PKEXEC_UID`**（无 `PKEXEC_UID` 拒绝）。
+   即：即便策略被误改为 keep/yes，调用者也**读不到不属于自己的文件**（`/etc/shadow` 属主 root
+   ≠ 调用者 → 拒绝，exit 2）。打开用 `O_NOFOLLOW`（`0o400000`），拒符号链接换靶。
+   失败关闭的代价（已知边界）：无 `/proc` 可读的环境（`root_mode(None)=true`）下，非 root
+   调用者也会被要求 `PKEXEC_UID`——没有该变量的普通 `--image` 调用将被拒（exit 2）。这是
+   保守换安全的取舍：/proc 缺席本身是异常环境，宁可拒服务也不静默跳过校验。
+
+`--device` 分支**不需要** euid 校验：`LinuxBlockDevice::open` 内含 `NotAFile` 拒绝，
+非块设备节点（含普通文件、符号链接指向的普通文件）在打开后即被拦下。
+
+**残留缺口（已知，未修）**：`ImageFileDevice::open` 内部按**路径**二次打开（跟随符号链接），
+与上面的 `O_NOFOLLOW` 检查之间存在 TOCTOU 窗口：理论上可在检查通过后把路径换成指向他人文件的
+符号链接。实际可达性受第一道约束：须诱导真人完成一次认证（`auth_admin` 给的是**每次调用的一次性
+授权**，既非缓存授权，也不等于攻击者拿到 admin 口令）。**诚实边界**：残窗对已认证的执意调用者
+理论可赢（在自有目录内 rename 轮换符号链接）；第二道主要防 keep 误配与非竞速攻击者，闭合归 M4
+的 `from_file`（需动 `xd-device`）。
+
+**已考虑并排除的同类面**：硬链接（`link()` 需对目标有写权限或 `Protected_hardlinks` 放行，
+他人文件到不了手）；bind mount（同理性，且挂载需 CAP_SYS_ADMIN——此时攻击者已是 root）；
+user namespace（userns 内的 root 无宿主 CAP_DAC_OVERRIDE，读不了宿主他人文件）。三者结论：
+不构成绕过第二道的路径。
+
+## 4. 中期硬化方向（M4 提权设计时执行）
+
+- **root 只做最小动作**：root 进程只负责 `open()`，随即降权回调用者身份再跑解析——root 窗口
+  缩到一次 open；顺带自然闭合第 3 节的 TOCTOU（后续读取都在 fd 上）。降权顺序：
+  `setgroups(0)` → `setresgid` → `setresuid`（gid/uid 取 pkexec 提供的 `PKEXEC_UID` 与同源 GID，
+  真机核 pkexec 是否给 GID），配上 `PR_SET_NO_NEW_PRIVS`，
+  且**必须在建任何线程之前**（多线程进程降权不彻底；daemon 现为单线程入口，改动时勿破坏）。
+  成本句：**降权后无法再 open** 新的设备节点（ACL 不再适用/无权限），故所有 `open` 必须前置到
+  降权之前一次做完，后续解析只走已打开的 fd。
+- **fd 化构造**：`ImageFileDevice` 增 `from_file(File, name)`，`privcheck` 打开的 `O_NOFOLLOW`
+  fd 直接下沉，不再按路径二次打开。
+- 依赖已就位：`rustix` / `libc` 已在 `Cargo.lock`（无需新增依赖即可做 setuid/openat2）。
+
+## 5. 未验证清单（平台专有，交付标注"未验证"；M1 出口真机手测）
+
+- [ ] udev uaccess 真机生效（两场景都要打）：①U 盘/易驱线/移动 SSD（`SUBSYSTEMS=="usb"`，
+      **含 RMB=0 的硬盘盒**）②SD 卡（`mmcblk[0-9]*` + `removable==1`）；普通用户免密扫描
+      （对照 `getfacl /dev/sdX1` 应见当前会话用户 `rw` ACL）。
+- [ ] 内置 eMMC（`mmcblk0`，removable=0）与 `mmcblk0boot0/rpmb` **未获** uaccess（收窄逻辑
+      待真机 SD 读卡器 + eMMC 双场景验证）。
+- [ ] polkit 真实认证路径：本机非活动会话（`allow_inactive=auth_admin`）弹认证框；**认证一次后
+      再次调用仍弹框**（证明非 keep）；SSH/无本地会话 → `allow_any=no` 硬拒（不弹框）。
+- [ ] `euid==0` 参数防御：`pkexec /usr/libexec/xiaodun/xd-daemon --image <他人文件>` → exit 2
+      且打印属主不符；`--image <符号链接>` → 打开失败；`--image <fifo>` → 不挂死。
+- [ ] 真 U 盘删除照片全链路恢复（对真实介质，非环回）。

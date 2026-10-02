@@ -1,0 +1,11 @@
+# 小盾数据恢复：活动会话用户对 USB 存储与 SD 卡免密只读访问。
+# 71- 晚于 60-persistent-storage.rules（该文件调 usb_id/ata_id/scsi_id 填 ENV{ID_BUS}），
+# 但 USB 硬盘盒/易驱线（RMB=0）先被 ata_id 定成 ID_BUS=ata，usb_id 不再改写 —— 故不能按
+# ENV{ID_BUS} 判 USB；改判 SUBSYSTEMS=="usb"（沿设备链上溯，桥接/盒子场景也命中）。
+# mmc 侧只认 removable==1（SD 卡）；eMMC 及其 boot0/rpmb（removable=0）不在此列。
+# 用 ATTRS 而非 ATTR：分区节点（mmcblk0p1）自身无 removable 属性（在整盘上），
+# ATTRS 含自身 + 父链 —— 整盘照中、分区随盘中，与 USB 侧行为对齐。
+# 注意：uaccess 授予的是 **rw**（内核层面没有"只读 ACL"）；只读铁律由
+# 小盾类型系统（BlockDevice 无写方法）+ O_RDONLY 保证，见 docs/security/linux-privilege-model.md。
+ACTION=="add|change", SUBSYSTEM=="block", SUBSYSTEMS=="usb", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="mmcblk[0-9]*", ATTRS{removable}=="1", TAG+="uaccess"

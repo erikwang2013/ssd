@@ -9,15 +9,31 @@ struct Daemon {
     stdout: BufReader<ChildStdout>,
 }
 
+/// root 宿主上 daemon 的 `--image` 会走 PKEXEC_UID 校验（privcheck，失败关闭）；以测试进程自身
+/// euid 注入，让 root 环境也覆盖**同一生产校验路径**（非 root 时该分支走不到，注入无害）。
+fn inject_pkexec_uid(cmd: &mut Command) {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return; // 非 Linux
+    };
+    let Some(euid) = status
+        .lines()
+        .find(|l| l.starts_with("Uid:"))
+        .and_then(|l| l.split_whitespace().nth(2))
+    else {
+        return;
+    };
+    cmd.env("PKEXEC_UID", euid);
+}
+
 impl Daemon {
     fn start(args: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
-            .args(args)
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_xd-daemon"));
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        inject_pkexec_uid(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let child = Arc::new(Mutex::new(child));
@@ -72,9 +88,13 @@ fn device_list_with_image() {
     let mut d = Daemon::start(&["--image", &path]);
     let resp = d.call(r#"{"jsonrpc":"2.0","id":2,"method":"device.list","params":null}"#);
     let devices = resp["result"]["devices"].as_array().unwrap();
-    assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0]["kind"], "image");
-    assert_eq!(devices[0]["sizeBytes"], 4096);
+    // M1e 起 Linux 启动时枚举物理盘，总数依宿主而异；断言收敛为「镜像设备在列且正确」
+    let imgs: Vec<_> = devices
+        .iter()
+        .filter(|d| d["kind"] == serde_json::json!("image"))
+        .collect();
+    assert_eq!(imgs.len(), 1);
+    assert_eq!(imgs[0]["sizeBytes"], 4096);
 }
 
 #[test]

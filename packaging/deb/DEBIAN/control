@@ -1,0 +1,9 @@
+Package: xiaodun
+Version: @VERSION@
+Architecture: amd64
+Maintainer: erik <erik@erik.xyz>
+Depends: libc6 (>= 2.34), libgtk-3-0 | libgtk-3-0t64
+Section: utils
+Priority: optional
+Description: 小盾数据恢复工具
+ 跨平台数据恢复（M1 Linux 预览版）：FAT/exFAT 扫描与删除文件恢复。

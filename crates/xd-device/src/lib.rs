@@ -2,6 +2,8 @@
 //! 块设备抽象：M0 仅实现只读镜像文件后端。
 
 pub mod image;
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 use serde::{Deserialize, Serialize};
 
