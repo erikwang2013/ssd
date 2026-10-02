@@ -1355,4 +1355,15 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 
 ---
 
+## 执行记录
+
+### T1（契约 v1.1 + store v2）—— impl-m1c-t1。提交沿革：`9dacc65`（主）→ `11440ce`（qual 缺口补测）。DONE → spec **PASS** → qual ISSUES → 补丁有牙（T1 关闭，295/0）
+
+- **偏差 3 条（最小处置）**：rusqlite 0.40.2 下迁移片段零适配（`.exists([])` 直通）；计划漏两处 `ScanEntry` 字面量波及（scan_worker ×2、handlers filler ×1——全仓 9 个构造点清点无第五处）；**Dart `protocol_v1_test.dart` 的 golden 集合测试必须同步 21→22（计划漏项）**。
+- **spec 四类库探针**：全新库 user_version==2、列集精确（含 byte_offset、无 scan_mode/carved_offset）；手造含数据 v1 库迁移后旧行一字不差 + NULL→None；二次 open 幂等；畸形/只读库如实记录（只读 v1 库现无法 open——迁移需写；生产无只读打开路径，M1d `open_read_only` 场景为已迁移库 ✓ 记录备查）。
+- **qual 变异 8 条**：5 强杀（键省略/无探测 ALTER/读写翻转/limit/golden 全等）；2 等价/冗余（闸门整体删除、None→无键断言为 golden 全等所覆盖）；**2 真缺口当场补测**：①版本标记前进 `assert_eq!(ver, 2)`（T6/T7 迁移将依赖；删 `PRAGMA user_version=2` 变异 red `1/2`）②**迁移前旧行必须 NULL**（`ALTER … DEFAULT 0` 会把未知伪造成"偏移=0"；变异 red `Some(0)/None`）；+ 三态语义 doc 一行（NULL=未知；0 是合法偏移）。
+- **里程碑级排序现实（记录）**：README 声明「deep 自 M1c 起有效」而 handlers 仍拒 deep（-32602）——T6 接线后转正，测试注释已明示。
+
+---
+
 © 2026 erik · https://erik.xyz · erik@erik.xyz
