@@ -230,7 +230,9 @@ fn read_subdir_bytes(
     Ok(data)
 }
 
-/// 删除项分级：`resolve_clusters` 定位（contiguous 规范保证 / 链优先）→ 位图全空 → Complete。
+/// 删除项分级（(a) 裁定版）：**非连续 → 只信 stale 链**——链覆盖不了 need（含链断裂/被清）
+/// 即证据不足（MaybeDamaged），绝不按连续假设评级；连续（NoFatChain 规范保证）→ 起点/可达
+/// 界卫 + 逐簇位图全空才算 Complete。位图是分配权威（FAT 对删除项已 stale）。
 fn grade_deleted(
     boot: &ExfatBoot,
     fat: &Fat32,
@@ -248,28 +250,34 @@ fn grade_deleted(
     }
     let need = e.data_length.div_ceil(boot.cluster_bytes());
     let all_free = |c: u32| matches!(bitmap.is_free(c), Ok(true));
-    match resolve_clusters(boot, fat, e.first_cluster, need, e.contiguous) {
-        // 起点非法 / need 超出可达簇数（I1 界卫）：物理不可能 Complete
-        None => RecoverQuality::MaybeDamaged,
-        Some(Resolved::Chain(chain)) => {
-            // chain 已是 need 前缀（qual-t6 Minor 4）
-            if chain.iter().all(|c| all_free(*c)) {
-                RecoverQuality::Complete
-            } else {
-                RecoverQuality::MaybeDamaged
-            }
+    if !e.contiguous {
+        // (a)：链只走不猜——链不足 need（含解析失败）→ 交付必短，证据不足
+        let Ok(chain) = fat.chain(e.first_cluster) else {
+            return RecoverQuality::MaybeDamaged;
+        };
+        if (chain.len() as u64) < need {
+            return RecoverQuality::MaybeDamaged;
         }
-        // 连续回退：流式判定，不物化（qual-t5 I1：need 可被污染放大，Vec 会爆内存）；
-        // 区间界由 resolve_clusters 保证
-        Some(Resolved::Contiguous { first, n }) => {
-            for i in 0..n {
-                if !all_free((first as u64 + i) as u32) {
-                    return RecoverQuality::MaybeDamaged;
-                }
-            }
+        return if chain[..need as usize].iter().all(|c| all_free(*c)) {
             RecoverQuality::Complete
+        } else {
+            RecoverQuality::MaybeDamaged
+        };
+    }
+    // 连续（NoFatChain 规范保证）：起点/可达界卫 + 逐簇空闲
+    let max_cluster = boot.cluster_count as u64 + 1;
+    if !(2..=max_cluster).contains(&(e.first_cluster as u64)) {
+        return RecoverQuality::MaybeDamaged;
+    }
+    if need > max_cluster - e.first_cluster as u64 + 1 {
+        return RecoverQuality::MaybeDamaged;
+    }
+    for i in 0..need {
+        if !all_free((e.first_cluster as u64 + i) as u32) {
+            return RecoverQuality::MaybeDamaged;
         }
     }
+    RecoverQuality::Complete
 }
 
 #[cfg(test)]
@@ -796,6 +804,25 @@ mod tests {
             e.quality,
             RecoverQuality::Complete,
             "只按 need 前缀判空闲，链尾被占不牵连"
+        );
+    }
+
+    #[test]
+    fn deleted_short_stale_chain_never_complete() {
+        // (a)：碎片化删除项 stale 链被清（FAT[6]=0）→ 链只剩首簇 < need → MaybeDamaged；
+        // 旧式会对连续区间 [6,7,8] 全空闲错误给出 Complete（探针 B 的分级半壁）。
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 9000], &[6, 9, 7], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        patched[24 * 512 + 6 * 4..24 * 512 + 6 * 4 + 4].copy_from_slice(&0u32.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev).unwrap().into_iter().find(|e| e.deleted).unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "链不足 need 不得按连续评级"
         );
     }
 

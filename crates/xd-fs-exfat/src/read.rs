@@ -1,10 +1,10 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
-//! 文件读取：按分配拓扑（NoFatChain 连续 / FAT 链 / 删除项 stale 链回退）重建字节流。
+//! 文件读取：按分配拓扑（NoFatChain 连续 / FAT 链 / 删除项 stale 链）重建字节流。
 //! 交付长度 = min(VDL,DL)（T4 保证 VDL ≤ DL ⇒ 即 `size_bytes`）——`[VDL,DL)` 是未初始化区，
 //! **绝不交付**；设备边界/坏读 → 诚实短前缀。
-//! 删除项的分配权威是**位图**（FAT 已 stale）；stale 链**仅在前缀全空闲时可信**；链被证伪后
-//! 退连续**＝放弃链证据的猜读**，交付可能错位（M1b 决策项：deleted+!contiguous 是否改为只沿链
-//! 走到首个非空闲/断链簇）。
+//! 删除项的分配权威是**位图**（FAT 已 stale）。**M1b (a) 裁定**：deleted+NoFatChain=0 → 只沿
+//! stale 链走到首个被占用/断裂簇（诚实短前缀），绝不连续猜读；deleted+NoFatChain=1 → 连续为
+//! 规范保证。碎裂删除场景的正解是 M1c 雕刻。
 
 use crate::ExfatError;
 use crate::bitmap::Bitmap;
@@ -83,8 +83,8 @@ pub(crate) fn resolve_clusters(
 }
 
 /// 读取文件内容（交付 min(VDL,DL) = size_bytes 字节；设备边界/坏读早停 → 诚实短前缀）。
-/// 注意：返回值只有字节，拓扑不可由返回推断——deleted ⇒ 拓扑不可知（可能 stale 链、可能连续
-/// 猜读），M1d 文案不得称其为连续假设；live+contiguous 才是真连续。
+/// 拓扑可由 `entry.contiguous` 表述（deleted+contiguous=规范保证连续；deleted+!contiguous=按删除链；
+/// live+!contiguous=只信 FAT 链——M1d 文案据此，不得再称"可能连续猜读"）。
 pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, ExfatError> {
     if entry.size_bytes == 0 || entry.first_cluster < 2 {
         return Ok(Vec::new());
@@ -106,6 +106,24 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
     let cap = (size as u64).min(dev.size_bytes()).min(64 * 1024 * 1024) as usize;
     let mut out = Vec::with_capacity(cap);
     let mut buf = vec![0u8; cb as usize];
+    // (a) 裁定（M1b）：删除项 + 非连续 → **只沿 stale 链**（删除留下的指纹；首个被占用/坏读簇
+    // 即止 → 诚实短前缀），绝不回退连续猜读——旧式"链被证伪后退连续"会交付错位数据而无从发现。
+    // contiguous=true 的删除项是 NoFatChain 规范保证，不走此分支。
+    if entry.deleted && !entry.contiguous {
+        let chain = fat.chain(entry.first_cluster).unwrap_or_default();
+        let n = (need as usize).min(chain.len());
+        read_prefix(
+            dev,
+            &boot,
+            chain[..n].iter().copied(),
+            bitmap.as_ref(),
+            size,
+            &mut out,
+            &mut buf,
+        );
+        out.truncate(size);
+        return Ok(out);
+    }
     if !entry.deleted && !entry.contiguous {
         // live 链式：只信链（链短/坏 → 诚实短前缀）——绝不连续猜读：坏 FAT 上猜读会交付
         // 他人数据且无从发现（M1a qual-t7 I1 对等）
@@ -128,25 +146,6 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
     else {
         // 起点非法 / need 超可达簇数 → 确定性为空（野生 first_cluster 同界截断，M1a I4 对等）
         return Ok(Vec::new());
-    };
-    // 删除项：stale 链（已是 need 前缀）全空闲（位图为准）才可用，否则连续回退
-    //（I2：只查前缀——查整链会在链尾被占时丢一半可恢复数据）；位图不可读 → 无从证伪，用链
-    let resolved = match resolved {
-        Resolved::Chain(chain) if entry.deleted => {
-            let usable = match &bitmap {
-                Some(b) => chain.iter().all(|c| matches!(b.is_free(*c), Ok(true))),
-                None => true,
-            };
-            if usable {
-                Resolved::Chain(chain)
-            } else {
-                Resolved::Contiguous {
-                    first: entry.first_cluster,
-                    n: need,
-                }
-            }
-        }
-        r => r,
     };
     match resolved {
         Resolved::Chain(chain) => read_prefix(
@@ -353,6 +352,50 @@ mod tests {
         let bytes = read_file(&dev, &e).unwrap();
         assert_eq!(bytes.len(), 8192, "链尾被占不得回退连续（会只交付 4096）");
         assert_eq!(bytes, data[..8192], "按链序 6→9 拼接");
+    }
+
+    #[test]
+    fn deleted_wiped_stale_chain_delivers_honest_prefix() {
+        // (a) 探针 B：碎片化删除项（链序 [6,9,7] ≠ 物理序），删除后 stale 链被清（FAT[6]=0，
+        // 如部分工具删除时清链）→ 只沿链走到链断：仅簇 6 可交付（4096B）。旧式"链证伪退连续"
+        // 会交付连续 [6,7,8] 的 12288B——其中 [7][8] 是他人/空闲数据，错位交付且无从发现。
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 223) as u8).collect();
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &data, &[6, 9, 7], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        patched[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&0u32.to_le_bytes()); // 清链首跳
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev).unwrap().into_iter().find(|e| e.deleted).unwrap();
+        assert_eq!(e.quality, RecoverQuality::MaybeDamaged, "链证不足 → 封顶");
+        let bytes = read_file(&dev, &e).unwrap();
+        assert_eq!(
+            bytes,
+            data[..4096],
+            "只交付链上确证的第一个簇，绝不连续猜读"
+        );
+    }
+
+    #[test]
+    fn deleted_occupied_chain_cluster_stops_even_if_contiguous_free() {
+        // (a) 探针 C：链 [6,9,7]，簇 9 被 NEW.BIN 复用（位图置位、FAT[9]=EOC）→ 链从 6 走到 9
+        // 即止、且簇 9 被占用 → 只交付簇 6（4096B）；连续区间 [6,7,8] 全空闲也不得猜读。
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 211) as u8).collect();
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &data, &[6, 9, 7], false)
+            .delete("/", "OLD.BIN")
+            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4000], &[9], true)
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert_eq!(e.quality, RecoverQuality::MaybeDamaged, "链 [6,9] < need=3");
+        let bytes = read_file(&dev, &e).unwrap();
+        assert_eq!(bytes, data[..4096], "被占用簇即止；连续区间空闲≠可猜");
     }
 
     #[test]
