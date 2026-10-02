@@ -1448,6 +1448,15 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 - **-7 回退裁定被否证并撤回（流程亮点）**：lead 裁定「续跑点回退 7 字节」补反方向漏点；实施者以可执行探针否证——`at ≥ buf_end−7` 恒成立（重叠已在窗口推进）、自 at 续扫对每个真 Scanned 事件**逐点无损无重**、回退会重报已雕容器尾部嵌入签名（幻影 extra=[4195331]，spec 独立几何复现逐位相同）→ **采纳反证，裁定撤回**；零重叠变异（`advance_to = buf_end`）k=1..7 静默丢失被协议测杀红（pin 住重叠边界）。
 - **残留（非阻断，已裁定/记录）**：(a) 库错路径（配对写/insert 的 `let _ =`）→ 维持「库错不中断」+ README 限定「库错时可能缺行」；备选「库错置 Failed」待 Store trait 化复议。(b) `wal_normal_crash_semantics_declared` 后半段 `mem::forget` 形状零判别力（已改「形态演示」措辞）；`scan.status` 不暴露 carvedOffset → M1d 排障项（已入 M1d 第 9 条）。
 
+### T8（恢复率门禁 e2e，§8.2 v1 基线）—— impl-m1c-t8。提交沿革：`fd82f2c`（主）→ `537e0a6`（qual 收紧）。DONE → spec **PASS** → qual **APPROVED** → 收紧落地（T8 关闭，376/0）
+
+- **§8.2 门禁落成**：`carve_e2e.rs` 三枚——exfat 恢复率门禁（100%/0 假阳性，真件埋于**删除释放簇区**内=雕刻可见性）、跨 run 诚实截断门禁（贴界 ±8 三档 size 随动 992/1000/1008）、fat 臂加分（同构 100%/0）。**decoy 空壳形约束被门禁实抓**（换 stub 形两臂各多 1 条 4B → 必红）。`gen_fat_image.rs` 埋件（26112 簇 3，非元数据区）+ `e2e-loop.sh` deep 三段（附带 totalBytes=Σruns 钉）。
+- **spec 独立核验（强度标杆）**：自写 exFAT 位图/FAT 表解析器复刻几何（runs/埋点/尺寸全等）；**全镜像逐位签名清点**（run 内除埋点零命中）；decoy 变异反向实证；镜像 daemon 实跑 JSON 逐字；`cargo tree` 证引擎仅 dev-dep。
+- **qual 变异 8 条**：4 KILL（decoy 两形/埋点偏一〔机制为"签名落 run 外"〕/MAX_FILE_BYTES 缩小 3/4 e2e）；**2 条 NO-KILL 判非缺口**（退化过滤/坏读计数——门禁无对应注入面，单测各自钉死）；2 条语义审视（跨 run 前提句/`runs[0]` 唯一性）→ 三条收紧落地：fat 臂 `runs[1]` 尾段精确 + `scanned==Σruns` 对齐、脚本 grep 定界（`26112,`/`2045}`/`2136576}`——防子串误命中）、文件头门禁角色分类。
+- **观察①归档（两处）**：exFAT up-case 资产含 `FF D8 FF`@5755（其后即 `FF D9`，空壳形；引擎探针 0 命中、非假阳性源）——`exfat.rs` UPCASE_TABLE 处归档行 + 本节记录；**M2 全卷扫描设计者必读**。
+- **待 CI**：环回 deep 段真设备路径（本机无免密 sudo，已两级替代验证：镜像 daemon 实跑 + grep 逐字重放 `DEEP BLOCK REPLAY OK`）；CI ubuntu-latest 首跑即真环回。
+- 记录不修：三份 JPEG 空壳拷贝（装饰）；`"id":20` 前缀匹配（单扫描串行自洽，并行日再改）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
