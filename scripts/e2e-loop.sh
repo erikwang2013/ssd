@@ -16,6 +16,7 @@ cargo build -q --locked -p xd-daemon
 before=$(sha256sum "$img" | cut -d' ' -f1)
 
 loop=$(sudo losetup -r -f --show "$img")   # -r：内核强制只读
+command -v udevadm >/dev/null && sudo udevadm settle || true   # 等 change 事件处理完再改权限，否则会被 udevd 拉回 660
 sudo chmod 666 "$loop"   # CI 一次性 VM 解 EACCES；内核 -r 只读兜底，权限面不超过生产 uaccess(rw)
 echo "loop=$loop (sysfs ro=$(cat "/sys/block/$(basename "$loop")/ro"))"
 
