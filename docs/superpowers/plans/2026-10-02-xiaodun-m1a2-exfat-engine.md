@@ -110,10 +110,11 @@ mod tests {
         // 手算：循环右移 1 位累加
         assert_eq!(boot_checksum(&[0x01]), 1);
         assert_eq!(boot_checksum(&[0x80, 0x01]), 0x41);
-        assert_eq!(boot_checksum(&[0x03]), 0x8000_0004); // 奇数触发回绕分支
+        // 回绕看的是**进位前**的 sum → 需要两字节才触发：[0x03,0x03] → 0x8000_0004
+        assert_eq!(boot_checksum(&[0x03, 0x03]), 0x8000_0004);
         assert_eq!(entry_set_checksum(&[0x01]), 1);
         assert_eq!(entry_set_checksum(&[0x80, 0x01]), 0x41);
-        assert_eq!(entry_set_checksum(&[0x03]), 0x8004);
+        assert_eq!(entry_set_checksum(&[0x03, 0x03]), 0x8004);
     }
 
     #[test]
@@ -246,7 +247,7 @@ mod tests {
         let c = |n: usize| 32 * 512 + (n - 2) * 4096;
         assert_eq!(&img[c(7)..c(7) + 4096], &data[..4096]);
         assert_eq!(&img[c(6)..c(6) + 4096], &data[4096..8192]);
-        assert_eq!(&img[c(8)..c(8) + 904], &data[8192..9000]);
+        assert_eq!(&img[c(8)..c(8) + 808], &data[8192..9000]);
         // 位图三簇均置位
         let bm = &img[32 * 512..32 * 512 + 32];
         for cl in [7u32, 6, 8] {
@@ -407,7 +408,7 @@ pub fn fold16(bytes: &[u8], skip: &[usize]) -> u16 {
     let mut sum: u16 = 0;
     for (i, b) in bytes.iter().enumerate() {
         if skip.contains(&i) { continue; }
-        sum = (if sum & 1 != 0 { 0x8000 } else { 0 })
+        sum = (if sum & 1 != 0 { 0x8000u16 } else { 0u16 })
             .wrapping_add(sum >> 1)
             .wrapping_add(*b as u16);
     }
@@ -810,7 +811,7 @@ fn build_entry_set(name: &str, attr: u16, first_cluster: u32, dl: u64, no_fat_ch
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fixtures`
-Expected: 16 passed（13 `#[test]` + 3 `#[should_panic]`）；既有 FAT builder 测试不回归。
+Expected: **25 passed（15 `#[test]` + 10 `#[should_panic]`）**——基础 16 之上含修复轮新增 6：`upcase_hashes_accented_names_via_real_table`、`empty_file_is_valid`、`panics_when_explicit_clusters_too_few`、`panics_on_allocation_conflict`、`panics_on_vdl_exceeding_data`、`panics_on_subdir_slot_overflow`（见修订轮）+ 存量硬化 3：`panics_when_contiguous_flag_violates_physical_order`、`panics_on_duplicate_clusters_in_list`、`panics_on_extra_clusters`；既有 FAT builder 12 测试不回归。
 
 - [ ] **Step 5: Commit**
 
@@ -818,6 +819,47 @@ Expected: 16 passed（13 `#[test]` + 3 `#[should_panic]`）；既有 FAT builder
 git add crates/xd-fixtures
 git commit -m "feat(fixtures): exFAT 合成镜像 builder（几何/checksum/项集/位图/删除语义）"
 ```
+
+**修订轮（执行侧，2026-10-02）**：实施提交 `1e74b91`（分支 m1a2-exfat）。计划字面代码有 5 处被执行侧修正，
+经 spec 审查逐一判定**接受**（均有独立验证）：
+
+- **① 编译性**：fold 字面量类型标注；`paths: Vec<&String>`（借用冲突）→ `Vec<String>`。语义零变化（字符级 diff 穷举）。
+- **② 计划测试硬伤**：`boot_checksum(&[0x03])`/`entry_set_checksum(&[0x03])` 期望值是 `[0x03,0x03]` 的折叠值
+  （单字节恒为 3——回绕分支看进位前的 sum）→ 输入改两字节；`c(8)+904` → `+808`（9000−8192）。本文件已就地修正。
+- **③ ★语义性（必需）**：新增 **`push_dir_unit`**——目录项集**簇对齐**放置，剩余槽以 **0x01**（unused 标记）补齐。
+  原计划的流式拼接会让第 42 个文件的项集跨根目录簇边界：**违反规范"项集不得跨簇"，且该计划的 T4 解析器
+  自己会拒绝它、`root_grows` 测试也与之矛盾**（流式布局下第二根簇首槽为 0xC1 而非 0x85）。独立解析器验证：
+  补齐版 45/45 还原、流式版 44/45（恰好丢 F0041.TXT）。
+  **napkin 记录**：`fsck.exfat` **不强制**"项集不跨簇"（流式镜像 fsck 仍判 clean）——该规则的 oracle 是本计划
+  的解析器规则（`i / cb != (end-1) / cb → 拒绝`），不是 fsck。0x01 补齐的合法性已由 fsck 实证（45 文件全数枚举）。
+- **④ 卫生**：`UPCASE_TABLE_CHECKSUM` 直写 0x82 + `debug_assert_eq!(table_checksum(UPCASE_TABLE), …)`；
+  `decode_upcase` 仅测试使用 → `#[cfg(test)]`。
+- **⑤ rustfmt** 展开。
+
+**下游常量（T4-T7 依赖）**：根目录多簇时项集簇对齐 + 0x01 填充；root_grows 场景文件占簇 6..50、第二根簇 51、
+首集为 `F0041.TXT`。
+
+**修复轮（qual-t1，2026-10-02）**：质量审查 With fixes（3 Important 均计划文本问题，实现忠实照抄），
+修复提交 **`cf4e7e7`**（"fix(fixtures): NameHash 走规范表上转型、显式簇数守卫与补齐/断言补测（qual-t1）"）：
+
+- **I1**：NameHash 上转型改为**规范表驱动**（`OnceLock` + `decode_upcase(UPCASE_TABLE)`，decode_un-gate 进生产路径）——
+  é→É、α→Α 等非 ASCII 映射不可漏（实证 `Café.TXT` 旧值 0x7C06 ≠ 表值 **0x6C06**，fsck 判 name hash wrong）；
+  新测试钉 0x6C06。ASCII 结果不变 → 下游零影响。
+- **I2**：`add_file_in_clusters` 加"簇数容得下数据"断言（**计划 T6 配方自己踩中**：`&[7]` 装 4500B 静默丢尾、
+  fsck 判损）→ 断言 + 计划 T6 配方改 `&[7, 8]`（qual 验证断言结果不变）。
+- **I3(a)**：root_grows 补 0x01 补齐断言（槽 126/127）——防回归成 0x00 导致解析器半途终止；
+  **I3(b)**：T5 新增 `scans_multi_cluster_root_completely`（45 文件多簇根 → 45 条全出）。
+- **M1-M4**：push_dir_unit debug_assert（落地为 `is_multiple_of` 形式，rust 1.97 clippy 门禁所迫）；
+  4 个 should_panic + 空文件测试；删 `_pad` 死参；删 `upcase_ascii`（其测试自洽校验改用 `upcase_table()`）。
+- **M5（拆分，不阻塞）**：exfat.rs 916 行 → M1b 欠账（缝：纯 checksum/upcase 函数约 90 行 → exfat_checksum.rs）。
+
+**存量硬化（`734459b`，qual-t1 复审发现）**：`add_file_in_clusters` 三闸——① 簇数**精确**等于
+`ceil(len/CBS)`（同封"不足/空数据配簇/多余簇"三洞，后者两例修前可产出 fsck 判损镜像）；② `contiguous=true`
+要求簇号连续递增（NoFatChain 读侧按 `FirstCluster..+n` 解释，乱序 + true 会 fsck 报 "cluster is marked as free"）；
+③ 列表去重（`[6,6]` 会写自环）。三例对抗回归：修前产出损坏镜像 → 现在 builder 调用即 panic，不可复现。
+合法调用点（T1 frag 9000/[7,6,8]、T5 4500/[6,7]、T6 4500/[7,8]）fsck 复跑 clean 不变。
+
+计数：xd-fixtures **37**（25 exfat + 12 FAT）、workspace **113**。
 
 ---
 
@@ -979,16 +1021,17 @@ mod tests {
 ```toml
 [package]
 name = "xd-fs-exfat"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 xd-device = { path = "../xd-device" }
 
 [dev-dependencies]
 xd-fixtures = { path = "../xd-fixtures" }
-tempfile = "3"
+tempfile = { workspace = true }
 ```
+（与 `xd-fs-fat/Cargo.toml` 的 workspace 继承写法逐字一致——避免 2021/2024 edition 混用。）
 
 `crates/xd-fs-exfat/src/lib.rs`：
 ```rust
@@ -1200,9 +1243,37 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<ExfatBoot, ExfatError> {
 }
 ```
 
-- [ ] **Step 4: 运行 `cargo test -p xd-fs-exfat`** → 预期 **9 passed**；workspace 其余不回归。
+- [ ] **Step 4: 运行 `cargo test -p xd-fs-exfat`** → 预期 **9 passed**；workspace 其余不回归。（T2 无测试计数变化于 T1 修复轮。）
 
 - [ ] **Step 5: Commit** `feat(fs-exfat): 引导区解析（几何校验/checksum/Backup 回退）`
+
+**修订轮（执行侧，2026-10-02）**：实施提交 `ea1c04a`（workspace 113→122）。偏离 6 条均为最小修正：
+① Cargo.toml 改 workspace 继承（与 xd-fs-fat 逐字一致，本文件已就地更正）；②③ 类型后缀与 `as u64` 括号消歧（E0689/泛型解析）；
+④ `!(1..=0xFFFF_FFF6).contains(...)`（clippy 门禁）；⑤ 三个新文件补 © 头行；⑥ rustfmt 展开。
+**计划外实证**：`boot::parse` 已对真实 `mkfs.exfat` 8MB 镜像跑通（Main stored==calc==912DFBC6、
+fat_offset=2048/fat_length=15/heap=4096/count=1536/root=5、无 Backup 回退）——首次非合成镜像验证。
+
+**修复轮（qual-t2，2026-10-02）**：质量审查 **1 Critical + 1 Important**（均计划文本问题，实现忠实照抄），
+修复提交 `c00e897`：
+
+- **C1（Critical）**：`1u64 << head[108]` 对**未校验字节**移位——"EXFAT 签名合法 + 第 108 字节损坏"（恢复工具的
+  典型输入）→ debug 移位溢出 panic；release 掩码后切片越界/容量溢出 panic。修：签名后、移位前校验 `9..=12`。
+  **geometry 同名守卫保留**——备区路径承重（mutation 实证：删掉会 `Ok{bps_shift:13}` 接受损坏备区）。
+- **I2（Important）**：`rejects_bad_geometry` 断言消息化（逐案子串）+ 回归案 `rejects_bad_bps_shift_without_panic`(108=64)
+  + `backup_geometry_bps_guard_load_bearing`。三层守卫（parse 早期/geometry/6 案断言）均经 mutant 双 profile 实证有判别性；
+  19 个非法 bps 值 × debug/release 全部干净 Err 无 panic。
+- **M3-M6**：上界 `0xFFFF_FFF5`（= 2^32−11，排除 BAD_CLUSTER 0xFFFFFFF7 入合法簇域）；六处错误消息带违例值；
+  `ExfatBoot #[non_exhaustive]`；huge_volume 补 volume_length 断言。
+- **遗留（注释级）**：boot.rs:317 注释把 108=64 的 release 表现写作"容量溢出"，实为掩码后切片越界
+  （63/127/255 之类才是容量溢出）——任意后续提交顺手更正。
+- **T3/T4 提醒**：`active_fat_offset()` 是**扇区单位**，entry_bytes 用 `as u64 * sector_bytes() + cluster as u64 * 4`。
+  （**qual-t3 复核后作废**：T4-T8 无任何测试引用 xd-fixtures 的 checksum 助手，无需 re-export；跨实现一致性由
+  `checksum_ok/name_verified` 断言强制。）
+
+**测试矩阵注记（qual-t2）**：C1 属 **debug/release 行为分歧型**缺陷——CI 现仅跑 debug；M1a2 收尾时把
+`cargo test --workspace --release` 纳入矩阵（至少 xd-fs-exfat 与 xd-fs-fat），并记录于 CI 计划。
+
+计数：xd-fs-exfat **11**、workspace **124**。
 
 ---
 
@@ -1568,9 +1639,36 @@ impl Bitmap {
 }
 ```
 
-- [ ] **Step 4: 运行** → fattab 6 + bitmap 7 = **13 passed**（累计 crate **22**）
+- [ ] **Step 4: 运行** → fattab 6 + bitmap 7 = **13 passed**（累计 crate **25**：T2 修复轮后基线 11 + 保留值回归 1 + 本任务 13）
 
 - [ ] **Step 5: Commit** `feat(fs-exfat): 32 位 FAT 链与分配位图（ActiveFat/保留位纪律/连续回退）`
+
+**执行记录（2026-10-02）**：实施提交 `b4f7ecc`（24/137；偏离 4 条：缺 import/clippy let-chain/rustfmt/testutil 复用）。
+**修复轮（qual-t3，2026-10-02）**：质量审查 **1 Critical + 3 Important**，修复提交 **`ff49d56`**
+（"fix(fs-exfat): chain 拒绝保留值 1（防回绕错读）与三处测试判别力补强（qual-t3）"）。计数：25/138（双档）。
+**I3 落地偏离**：计划修法的 `dl=8192` 只需 2 簇（[7,6]，均在截断点之前）走不到"读不满"分支——实施者先跑红实证，
+改 **`dl=12288`**（3 簇使簇 8 参与）后命中；变异检查（截断点回退）判别性成立。
+
+**增量确认（qual-t3 复审）**：**Yes**——五组反向变异（`v<2`→`v==0`；删链分支；起点上界 `count+1`→`count`；
+吞"读不满"；截断点后移）各自只挂对应用例、无存活；C1 修复后 release 不再回绕（`read_allocation` 返回确定性
+正确区域而非"真簇+FAT 字节"混合）。N1（I2 注释与 `dl` 不一致）注释级终修；N2（Minor 7 文档化）接受现状。
+**流程注**：变异测试前必须 `cargo clean -p xd-fs-exfat`——审查侧曾因 mtime 回退被 cargo 判 fresh、编进变异体
+造成假失败。T3 关闭。
+
+- **C1（Critical）**：`chain` 未拒保留值 **1**（M1a `fat.rs` 有同款护栏，本 crate 漏）——坏 FAT 卷上 debug 在
+  `cluster_to_byte(1)` 减法溢出 panic；release 回绕到 fat_offset 扇区**把 FAT 字节当数据交付、零错误信号**
+  （T5/T6 全链路承重）。修：`if v < 2 || is_eoc(v) || v == BAD_CLUSTER || (v as u64) > max_cluster`。
+- **I2**：`read_allocation` 回退判别测试重写（原双臂都读物理连续簇、零判别力）——改用非物理序链 7→6→8，
+  `assert_ne!(链读, 连续读)` 锁判别力。
+- **I3**："partial device" 测试重写为**真截断**（切在物理簇 8 中段）命中"读不满"分支（原案被堆界先拦、分支零覆盖）。
+- **I4**：补 `chain(253)==[253]`（count+1 合法端点）与 `chain(254).is_err()`（off-by-one 变异曾存活）。
+- **Minor 6（非承重，注释备案）**：`is_eoc/BAD_CLUSTER` 项在合法几何下被上界覆盖（变异实证），保留但注明。
+- **Minor 7（doc）**：`read_allocation(dl==0)` 早返回先于起点校验（调用点均无害），加 doc 一句。
+- **Minor 5 备案**：`is_free` 的"数据不足"分支**可证不可达**（附鸽笼论证 + 全枚举探针），保留为廉价防御。
+- **策略佐证（qual 上游核实）**：内核 `exfat_allocate_bitmap` 即"链定位 + 纯连续扇区读"；**64MiB 位图上限**
+  的降级路径（>2TiB@4KB 簇的卷）由 T5 `load_bitmap().ok()` 接住 → 删除项封顶 `MaybeDamaged`，scan 仍 Ok。
+- **测试方法注**：变异测试（MA-MF 六组 + P1-P5 探针）对本模块有效；注意先 `cargo clean -p xd-fs-exfat`
+  强制重编，防指纹同秒假存活。
 
 ---
 
@@ -1673,9 +1771,9 @@ mod tests {
     #[test]
     fn bad_secondary_count_rejected_no_panic() {
         let mut root = fixture_root();
-        root[SET_OFF + 3 * 32 + 1] = 0xFF; // A.TXT 的 SecondaryCount 改爆
+        root[SET_OFF + 1] = 0xFF; // A.TXT（集起于槽 3 = SET_OFF）的 SecondaryCount 改爆
         let _ = parse_directory_bytes(&root, CB); // 不 panic
-        root[SET_OFF + 3 * 32 + 1] = 0x00; // =0 也不合法
+        root[SET_OFF + 1] = 0x00; // =0 也不合法
         let d = parse_directory_bytes(&root, CB);
         assert!(!d.entries.iter().any(|e| e.name == "A.TXT"));
     }
@@ -1757,7 +1855,7 @@ mod tests {
 //! （类型位 |=0x80 后重算 SetChecksum == 磁盘值——删除只清 bit7 不重算，此校验为最强自洽判据）。
 //! 0x01..0x7F 皆可为"unused 槽"——绝不允许"见 <0x80 即跳过"（会静默丢失全部删除文件）。
 
-use crate::ExfatError;
+// (T4 勘误：此处原 `use crate::ExfatError;` 零引用，`-D warnings` 下必须删)
 
 /// 根目录特殊项：bitmap 可多处（texFAT First/Second），upcase/卷标各至多一处。
 #[derive(Debug, Default, Clone)]
@@ -1802,14 +1900,24 @@ fn entry_set_checksum16(set: &[u8]) -> u16 {
     let mut sum: u16 = 0;
     for (i, b) in set.iter().enumerate() {
         if i == 2 || i == 3 { continue; }
-        sum = (if sum & 1 != 0 { 0x8000 } else { 0 })
+        sum = (if sum & 1 != 0 { 0x8000u16 } else { 0u16 })
             .wrapping_add(sum >> 1)
             .wrapping_add(*b as u16);
     }
     sum
 }
 
-fn name_hash16(upcased_le: &[u8]) -> u16 { entry_set_checksum16(upcased_le) }
+/// NameHash（§7.2.5）：16 位折叠，**不跳过任何字节**——与 SetChecksum 的跳 2/3 是不同变体（T4 勘误：
+/// 不得复用 entry_set_checksum16；三 checksum 变体勿混是简报的头号坑）。
+fn name_hash16(upcased_le: &[u8]) -> u16 {
+    let mut sum: u16 = 0;
+    for b in upcased_le {
+        sum = (if sum & 1 != 0 { 0x8000u16 } else { 0u16 })
+            .wrapping_add(sum >> 1)
+            .wrapping_add(*b as u16);
+    }
+    sum
+}
 
 fn upcase_ascii(c: u16) -> u16 {
     if (0x61..=0x7A).contains(&c) { c - 0x20 } else { c }
@@ -1903,7 +2011,7 @@ fn try_assemble_set(data: &[u8], i: usize, cb: usize, deleted: bool) -> Option<(
     }
     let mut units: Vec<u16> = Vec::with_capacity(name_len);
     for k in 0..name_entries {
-        let base = (1 + k) * 32;
+        let base = (2 + k) * 32; // 名字项自槽 2 起（槽 0=0x85、槽 1=0xC0；T4 勘误）
         if restored[base] != 0xC1 {
             return None;
         }
@@ -1961,8 +2069,31 @@ fn try_assemble_set(data: &[u8], i: usize, cb: usize, deleted: bool) -> Option<(
 }
 ```
 
-- [ ] **Step 4: 运行** → **13 passed**（累计 crate 35）
+- [ ] **Step 4: 运行** → **13 passed**（累计 crate **42**：T4 本体 38 + 修复轮 4）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 目录项集解析（还原校验/多名字项/特殊项/跨簇拒绝）`
+
+**执行记录（2026-10-02）**：实施提交 `b346692`（38/151；**修正计划自带 2 功能 bug + 1 测试 bug**，spec 审查四路独立印证）：
+
+- **功能 bug ①（计划）**：名字项槽基址 `(1+k)*32` → `(2+k)*32`（槽 0=0x85、槽 1=0xC0、名字自槽 2 起；
+  原式把校验打在 0xC0 槽上、全部项集被拒——计划三重自相矛盾）。本文件已就地更正。
+- **功能 bug ②（计划）**：`name_hash16` 原复用 `entry_set_checksum16`（跳 2/3）——**NameHash 不得跳过任何字节**；
+  fsck oracle 决定性（跳过变体 + 重算 SetChecksum → "the name hash of a file is wrong"）。本文件已就地更正。
+- **测试 bug（计划）**：`bad_secondary_count` 偏移 `SET_OFF+3*32+1` → `SET_OFF+1`（原打在 G.BIN 集上却断言 A.TXT）。
+- 编译级：删零引用 `use crate::ExfatError;`、u16 字面量标注、rustfmt。
+
+**修复轮（qual-t4，2026-10-02）**：质量审查 2 Important（均**测试判别力缺口**，行为经探针证实正确）+
+若干 Minor，修复提交 `9f65ff5` + `be30323` + `99296f1`：
+
+- I1 跨簇测试恒真（0x00 填充 + 偏移未槽对齐）→ 0x01 填充 + `at=CB-64`；I2"live 不设门槛"零覆盖 → 新测试；
+  M1 小写上转型零覆盖 → 新测试 + `!name_verified`；M2 注释/偏移对齐（真打名字码元）；
+  M4 名字槽 0xC1 检查与 vendor 容忍补测；M5 前置条件 doc；终修补"恰在簇尾结束"边界臂（钉 `(end-1)` 语义）。
+- **变异台账（实施者 + qual 独立复跑，全部 KILLED）**：A 删跨簇守卫 / B 无条件门槛 / C upcase 恒等 /
+  F 删名字槽检查 / G vendor 严格相等 / `(end-1)→end`。
+- **M3 裁定（方案 a）**：T5 的 live 非目录项 `!checksum_ok → MaybeDamaged` 封顶（已写入 T5 实现与测试）；
+  字段名映射 `attr_dir → is_dir` **在 T5 侧做**，勿反向改 T4 字段名。
+- **措辞口径**：提交件 `let mut bad` 必需（`copy_from_slice` 走 IndexMut）；"去 mut"仅指计划文档片段。
+
+计数：crate **42**、workspace **155**（T4 关闭时）。
 
 ---
 
@@ -2130,6 +2261,34 @@ mod tests {
         assert!(dcim.deleted && dcim.is_dir, "is_dir 忠实属性");
         assert!(!entries.iter().any(|e| e.name == "IMG.JPG"), "不递归已删目录");
     }
+
+    #[test]
+    fn live_broken_checksum_caps_quality() {
+        // qual-t4 M3 裁定 a：live 项集校验和不符（结构完好）→ 保守降级 MaybeDamaged
+        let image = xd_fixtures::ExfatImageBuilder::new().add_file("/", "A.TXT", b"x").build();
+        let mut patched = image.clone();
+        patched[SET + 8] ^= 0xFF; // A.TXT 主项时间戳字节：结构完好、校验和坏
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev).unwrap().into_iter().find(|e| e.name == "A.TXT").unwrap();
+        assert_eq!(e.quality, RecoverQuality::MaybeDamaged);
+    }
+
+    #[test]
+    fn scans_multi_cluster_root_completely() {
+        // 45 文件把根撑到 2 簇（含 0x01 补齐）：扫描必须读满整链、45 条全出——
+        // 防"补齐回归成 0x00 导致解析器半途终止、静默丢后半根目录"（qual-t1 I3）
+        let mut b = xd_fixtures::ExfatImageBuilder::new();
+        for i in 0..45u32 {
+            b.add_file("/", &format!("F{i:04}.TXT"), b"x");
+        }
+        let image = b.build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let files: Vec<&str> = entries.iter().filter(|e| !e.is_dir).map(|e| e.name.as_str()).collect();
+        assert_eq!(files.len(), 45, "多簇根不得丢条目：{files:?}");
+        assert!(files.contains(&"F0041.TXT"), "第二根簇的条目必须在列");
+        assert!(files.contains(&"F0044.TXT"));
+    }
 }
 ```
 
@@ -2243,12 +2402,15 @@ fn scan_parsed(
             return Ok(());
         }
         let ext = e.name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
-        let quality = if e.is_dir {
+        let quality = if e.attr_dir {
             RecoverQuality::Complete
         } else if e.deleted {
             grade_deleted(boot, fat, bitmap, e)
-        } else {
+        } else if e.checksum_ok {
             RecoverQuality::Complete
+        } else {
+            // live 但项集校验和不符：保守降级封顶（qual-t4 M3 裁定 a；值域已由下游界兜住）
+            RecoverQuality::MaybeDamaged
         };
         out.push(ExfatEntry {
             name: e.name.clone(),
@@ -2257,13 +2419,13 @@ fn scan_parsed(
             data_length: e.data_length,
             first_cluster: e.first_cluster,
             deleted: e.deleted,
-            is_dir: e.is_dir,
+            is_dir: e.attr_dir, // ParsedEntry 字段名是 attr_dir（T4）；映射在本层，勿反向改 T4
             contiguous: e.contiguous,
             quality,
             ext,
         });
         let pushed = out.len() - 1;
-        if e.is_dir && !e.deleted && e.first_cluster >= 2 {
+        if e.attr_dir && !e.deleted && e.first_cluster >= 2 {
             let child_path = if path == "/" { format!("/{}", e.name) } else { format!("{path}/{}", e.name) };
             let child = read_subdir_bytes(dev, boot, fat, e);
             match child {
@@ -2374,12 +2536,34 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 }
 ```
 
-- [ ] **Step 4: 运行** → **11 passed**（累计 crate 46）
+- [ ] **Step 4: 运行** → **13 passed**（累计 crate **55**；本任务 12 + live 校验和降级 1）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 扫描与质量分级（位图权威/texFAT 选表/根失败即 Err）`
+
+**执行记录（2026-10-02）**：实施提交 `1363d7f`（55/168；偏离 3 条：let-chain×2、删未用 `FAT_B`、fmt——**T6 需重引入 `FAT_B`**）。
+
+**修复轮（qual-t5，2026-10-02）**：质量审查 2 Important + 6 Minor + 补发 R1/R2/R3，修复提交 `9a7c3b1` + 终修 `d82b5bd`：
+
+- **I1（分配放大）**：`grade_deleted` 连续回退仅受 count（≤4.29e9）与 u64 dl 约束、无闸（`read_subdir_bytes` 有 64MiB 帽而它没有）——
+  污染 dl 可放大到 GB 级分配（实测 2e7 簇→80MB/2.6s，外推 17GB）。修：**起点界卫 + `need > reachable` 界卫 + 流式 is_free
+  （不物化簇表）**；微基准 100M 簇旧 400MB/329ms → 新 42ns 零分配。**实施者补的起点界卫**（fc>count+1 时原式
+  减法 debug 下溢）经测试第二臂钉住。差分探针 15/15 证明新旧语义等价。
+- **I2（T5/T6 判据分歧）**：T6 计划 `chain_free` 查**整条链**而 T5 只判 `chain[..need]`——分歧行（链尾占用）T5 说
+  Complete、T6 却回退连续丢一半数据。**T6 计划文本已修（见 Task 6 修订注）**；T5 侧链切片语义由终修测试钉住。
+- **M1 根双读**：`load_bitmap_from_specials`（scan 复用根快照）+ `load_bitmap` wrapper 留 T6；记账设备测试证明根各读 1 次。
+- **M3（live 目录坏校验和）**：裁定**保持 Complete**（子项枚举成功已独立验证流扩展；时间戳/名字损坏不影响可恢复性）+ 注释 + 测试钉住。
+- **M5**：+8 测试（MAX_DEPTH/ENTRIES 直调语义、40 层深嵌套 e2e、bitmap dl 双向越界、read_subdir 双闸、I1 构型、M1 记账、M3、终修两件）。
+- **M6**：两处不可达注释（fc<2 臂、入口 MAX_ENTRIES）。
+- **转注（M1b/M2/M1d）**：多簇子目录链回退覆盖边界（builder 恒 1 簇）；隐藏文件 ext 惯例（`.gitignore→"gitignore"`，与 M1a 注 5 同源）；
+  `RecoverQuality/ExfatEntry` 文档补全两引擎同批（M1b）；fixtures 未来可 re-export `entry_set_checksum` 去重测试折叠器。
+- **决策（qual R1.6）**：**不给 `ExfatEntry` 加 `name_verified` 字段**——该信号混淆"跳过校验"与"校验失配"两态，
+  M1b 若需 UI 角标先拆两态再设计。T6 字段消费：`size_bytes/data_length/first_cluster/contiguous/deleted`。
+- **T6 必办**：移除 `load_bitmap` 的 `#[allow(dead_code)]`（暂置因 -D warnings）。
+
+计数：crate **65**、workspace **178**（T5 关闭时）。
 
 ---
 
-### Task 6: xd-fs-exfat —— 文件读取（read_file，追加到 scan.rs）
+### Task 6: xd-fs-exfat —— 文件读取（read.rs 拆分版）
 
 **策略（对齐 M1a 判例 + brief §4.2）**：
 - `size = ValidDataLength`（交付长度；`[VDL,DL)` **绝不交付**——那是未初始化区）；`need` 由 `DataLength` 定拓扑。
@@ -2388,7 +2572,79 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 - 删除链式 → 链可用且簇空闲（位图为准）→ 用 stale 链；否则连续；再按位图**截断到首个被占用簇之前**（保守前缀）。
 - 读循环：Err/0 → break；短读只收前缀；`truncate(size)`；`with_capacity(size.min(簇数×cb))`。
 
-- [ ] **Step 1: 测试（追加到 scan.rs 测试模块）**
+**修订注（qual-t5 后，派发前必读）**——下方 Step 1/3 代码块为 T6 初稿，按下列修订落地：
+
+1. **拆分（qual-t5 M2/R3）**：新建 `crates/xd-fs-exfat/src/read.rs` = `read_file` + 其 9 测试 + `resolve_clusters`（见下）
+   + 从 scan.rs **迁入** `pick_bitmap` / `load_bitmap_from_specials` / `load_bitmap`（含其测试）；scan.rs 加
+   `pub use crate::read::read_file;`（**`xd_fs_exfat::scan::read_file` 路径不变，T7 计划零改动**）。
+   迁后 scan.rs ≈470 行、read.rs ≈330 行（两文件均 <500，M1a 注 11 同款 recipe）。
+2. **I2 修正（必改）**：删除项链可用性只查**前缀** `chain[..need]`——查整链会在"链尾被占"时回退连续、丢一半
+   可恢复数据（qual-t5 探针：T5 判 Complete 而 T6-as-planned 只交付 4096/8192）。
+3. **I1 对齐（必改）**：簇定位抽 `resolve_clusters`（三处共用；放 read.rs）：
+```rust
+/// 簇定位（read_subdir_bytes / grade_deleted / read_file 三处共用）。
+/// contiguous ⇒ 连续（NoFatChain 规范保证）；否则链覆盖 need 才用链，短/坏链退连续。
+/// None ⇔ 起点非法或 need 超出可达簇数 → 调用方各自降级。只定位、不物化连续段（qual-t5 I1）。
+pub(crate) enum Resolved {
+    Chain(Vec<u32>),
+    Contiguous { first: u32, n: u64 },
+}
+
+pub(crate) fn resolve_clusters(
+    boot: &ExfatBoot,
+    fat: &Fat32,
+    first_cluster: u32,
+    need: u64,
+    contiguous: bool,
+) -> Option<Resolved> {
+    let max_cluster = boot.cluster_count as u64 + 1;
+    if !(2..=max_cluster).contains(&(first_cluster as u64)) {
+        return None;
+    }
+    let reachable = max_cluster - first_cluster as u64 + 1;
+    if need == 0 || need > reachable {
+        return None;
+    }
+    if !contiguous
+        && let Ok(chain) = fat.chain(first_cluster)
+        && chain.len() as u64 >= need
+    {
+        return Some(Resolved::Chain(chain));
+    }
+    Some(Resolved::Contiguous { first: first_cluster, n: need })
+}
+```
+   `read_file` 消费：`None → Ok(空)`；`Chain → 逐簇读 chain[..need]`；`Contiguous → 逐簇 first+i`（**不物化**）；
+   删除项位图截断改**流式 break**（替代先物化再 truncate）。scan.rs 的 `read_subdir_bytes`/`grade_deleted` 可同批
+   改用该 helper——行为必须与现 9a7c3b1 逐例一致（差分探针 15 例即回归网）。
+4. **T6 测试适配**：`FAT_B` 在 read.rs 测试模块**重新定义**（= 24*512）；`wild_first_cluster_bounded_not_panic`
+   的 10 字段手构不变；其余测试若遇 T4/T5 新增门槛（如 vdl≤dl）按同义修正并报告。
+5. **移除** `load_bitmap` 上的 `#[allow(dead_code)]`（迁入后即有调用者）。
+6. 计数：crate 65 → **74**（+9）、workspace 178 → **187**。
+
+**执行记录（2026-10-02）**：实施提交 `0d74bfa`（crate 75/workspace 188；多 1 个承重测试 `deleted_chain_tail_occupied_prefix_free_delivers_full`——read 层 I2 唯此钉住）。迁入 read.rs 的三位图函数 + 同批迁移 `read_subdir_bytes`/`grade_deleted` 到 `resolve_clusters`（差分探针 5 构型一致；两处收紧均保守：fc<2、need>reachable+链覆盖→Err，后者为 spec 独立发现的第 2 差异、判定可接受）。
+**CI 工具链修正**：`029d6c9`（cherry-pick 自 main：`chunks_exact`→`as_chunks`，CI 1.99 新 lint）。
+
+**修复轮（qual-t6，2026-10-02）**：质量审查 **1 Critical + 1 Important** + 7 Minor，修复提交 `a2c8ca1` + 终修 `4dbd130`：
+
+- **C1（Critical）**：流式重构把无界 `need` 带进分配帽 `size.min(need*cb)`（resolve 之前）——debug 乘法溢出 panic /
+  release 巨分配 abort（**进程级**，不可捕获）/ capacity overflow / 越 DL 交付，公共 scan 路径四态可达。修：**三重钳位**
+  `(size as u64).min(dev.size_bytes()).min(64MiB)`（cap 仅提示、交付由 size 统治）；四态探针落成常驻测试
+  `polluted_lengths_read_file_stays_bounded_without_panic`（双 profile；旧码四态逐一复现：debug panic / release SIGABRT）。
+- **Important 2（M1b 决策）**：删除链被证伪后的连续回退可交付错位数据（probe B：quality Complete + 4904/9000 错字节）。
+  方案 (a)（deleted+!contiguous 只沿链走到首个非空闲/断链簇、不做拓扑切换）**立为 M1b 读+分级同步决策项**，
+  须先出 spec 裁定再改（probe B/C 构型测试与 (a) 同批）。本轮已把 read.rs 误导性文档改准。
+- **Minor 3/4/5/7**：read.rs:4 与 M1d 契约注释改准；`Resolved::Chain(chain[..need].to_vec())` 切点内移 + 文档归位；
+  两钉（位图不可读→用链（终修改碎片化构型后 M4 变异被抓）、VDL=0）；`min(VDL,DL)` 防御行（采纳）。
+- **M1b 有序清单（qual-t6 建议）**：① 测试基础设施（`#[path="scan_tests.rs"]` 内移测试——**勿用 tests/ 外迁**
+  （testutil 是 cfg(test) pub(crate)）+ 助手上收 fixtures）；② 缺口测试（live fc>count+1、VDL=0 已补）；
+  ③ 读分级同步决策 (a)；④ Resolved 切点内移已尽（(a) 后更自然）；⑤ 位图缓存变体（保 T7 签名）；
+  ⑥ read reason 枚举（M1d 文案动工前）；⑦ FAT 链批读（M1d 实测热点后）。
+- **T6 观察转注**：read_file 对 deleted+need>reachable 交付空（release 语义；修复后 debug 亦同）——M1b (a) 一并覆盖。
+
+计数：crate **78**、workspace **191**（T6 关闭时）。
+
+- [ ] **Step 1: 测试（`read.rs` 测试模块）**
 
 ```rust
     #[test]
@@ -2437,12 +2693,12 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 
     #[test]
     fn deleted_chained_occupied_middle_cluster_truncates_prefix() {
-        // OLD.BIN 链式 3 簇（6,7,8）删除后，簇 7 被 NEW.BIN 复用 → 只交付簇 6 的前缀
+        // OLD.BIN 链式 3 簇（6,7,8）删除后，簇 7/8 被 NEW.BIN 复用 → 只交付簇 6 的前缀
         let data: Vec<u8> = (0..9000u32).map(|i| (i % 239) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
             .add_file_chained("/", "OLD.BIN", &data)
             .delete("/", "OLD.BIN")
-            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4500], &[7], false)
+            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4500], &[7, 8], false)
             .build();
         let (_f, dev) = dev_for(&image);
         let old = scan(&dev).unwrap().into_iter().find(|e| e.name == "OLD.BIN").unwrap();
@@ -2595,7 +2851,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
 }
 ```
 
-- [ ] **Step 4: 运行** → **9 passed**（累计 crate 55；workspace 相应 +9）
+- [ ] **Step 4: 运行** → **9 passed**（累计 crate **74**；workspace 相应 +9 → 187）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 文件读取（连续/链/stale 链 + 位图截断前缀、VDL 交付）`
 
 ---
@@ -2671,7 +2927,7 @@ fn deleted_chained_photo_recovered_byte_exact() {
 }
 ```
 
-- [ ] **Step 2: 运行** → crate **57 passed**（55 + 2）
+- [ ] **Step 2: 运行** → crate **80 passed**（78 + 2）
 
 - [ ] **Step 3: 生成示例**
 
@@ -2698,11 +2954,31 @@ Expected: `wrote /tmp/xd-exfat.img (1048576 bytes)`
 
 - [ ] **Step 5: Commit** `test(fs-exfat): 端到端字节级 + 全名找回 + 镜像生成示例`
 
+**执行记录（2026-10-02）**：实施提交 `c0e39ef`（80/193；偏离 1 条纯格式）+ 终修 `9c16792`（qual-t7 三条出口强化：
+Complete 语义断言 / 第二用例碎片化 `[6,9,7]` 锁链序端到端 / 靶名钉扎）。
+**独立验证**：spec 探针（公开 API + 翻转字节判别力 + sha256 只读）；`fsck.exfat -n` clean（exfatprogs 1.2.8）；
+示例产物 1,048,576 字节。**变异**（实现层绕过链序分支）：碎片用例 FAILED 于 index=4096 纯簇序错位——
+判别力正中靶心；连续用例不受影响（两用例职责正交）。计数：crate **80**、workspace **193**。
+
 ---
 
 ### Task 8: M1a2 出口验收
 
 - [ ] `cargo test --workspace --locked` 全绿（预期 +57 crate 测试）；clippy `-D warnings` 零告警；fmt 干净
+
+> **T8 执行记录（2026-10-02，进行中）**：前向 `git merge main` 整合 M1e（冲突面恰 `dirent.rs` 且 029d6c9≡80b30c0
+> → 干净）→ 合并树 **217 passed / 0 failed**（debug + release 双档）；clippy(1.99)/fmt 净；示例 1,048,576 字节 +
+> `fsck.exfat -n` clean；版权幂等（0 盖 / 54 跳）；`e2e-loop.sh` 本机 skip exit 0（真跑在 CI）。
+> **CI 矩阵增补**：`cargo test --workspace --release --locked`（Linux 档）已并入 ci.yml（profile 分歧型缺陷常驻网，
+> qual-t2 注记兑现）。分支 CI run `36986857691`（推送 m1a2-exfat 后手动触发）——**全 5 job success**（rust×3 含
+> release 档与 LOOP E2E、flutter、package-deb）。**T8 出口验收通过，M1a2 关闭。**
+
+- [x] `cargo test --workspace --locked` 全绿（**217**）；clippy `-D warnings` 零告警；fmt 干净
+- [x] e2e 两案通过（删除 JPG 全名 + 字节级 + Complete 语义；链式碎片删除逐字节，链序变异判别力实证）
+- [x] 示例产物 1,048,576 字节；`fsck.exfat -n` clean（本地验证；CI 不依赖该工具）
+- [x] `bash scripts/apply-copyright.sh` 幂等（0 盖 / 54 跳）；`provenance.sha256` 重生成——**待发布时执行**
+- [x] CI（手动触发）全绿——**未验证清单（真机 udev/polkit/认证/真 U 盘全链路）承接 M1e 手测清单**
+- [x] 交付收尾：merge `--no-ff` 至 main + 推送（含 M1e 前向整合）
 - [ ] e2e 两案通过（删除 JPG 全名 + 字节级；链式删除逐字节）
 - [ ] `cargo run -p xd-fixtures --example gen_exfat_image` 产物 = 1,048,576 字节；`fsck.exfat -n` 判 clean（本地验证）
 - [ ] `bash scripts/apply-copyright.sh` 幂等（新 .rs 文件获版权头；`exfat_upcase.bin` 为资产不加头）

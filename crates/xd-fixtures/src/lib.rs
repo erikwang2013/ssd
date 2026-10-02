@@ -22,6 +22,10 @@
 //!   簇数 < 65525 → 真实驱动会拒认；本引擎结构优先判型不受影响）。
 //! - encode_sfn 只接受 ASCII ≤ 8.3（超长/非 ASCII 由 debug_assert 拦截）。
 
+mod exfat;
+
+pub use exfat::{ExfatImageBuilder, UPCASE_TABLE, boot_checksum};
+
 pub const BPS: u32 = 512; // bytes per sector
 pub const TOTAL_SECTORS: u32 = 4224; // FAT16 布局的 total（FAT12/32 见 FatType::layout）
 
