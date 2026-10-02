@@ -1279,6 +1279,32 @@ mod tests {
     }
 
     #[test]
+    fn chain_detects_cycle_within_legal_bound() {
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "A.BIN", &[0u8; 1024]).build();
+        let mut patched = image.clone();
+        // FAT16 entry(2) @ 516、entry(3) @ 518：造 2→3→2 环
+        patched[516..518].copy_from_slice(&3u16.to_le_bytes());
+        patched[518..520].copy_from_slice(&2u16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let chain = fat.chain(2).unwrap();
+        assert!(chain.len() as u32 > bpb.data_cluster_count(), "环应表现为超长链（> count）");
+        assert!(chain.len() as u32 <= bpb.data_cluster_count() + 2, "且有界");
+    }
+
+    #[test]
+    fn chain_rejects_out_of_range_start() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        for start in [0u32, 1, u32::MAX] {
+            assert!(matches!(fat.chain(start), Err(FatError::InvalidBpb(_))));
+        }
+    }
+
+    #[test]
     fn is_free_reports_freed_clusters() {
         let image = xd_fixtures::FatImageBuilder::fat16()
             .add_file("/", "GONE.BIN", &[0u8; 1024])
@@ -1335,32 +1361,32 @@ impl<'d> Fat<'d> {
         match self.bpb.fat_type {
             FatType::Fat32 => {
                 let mut b = [0u8; 4];
-                let n = self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
-                if n < 4 {
-                    return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
-                }
+                self.read_entry(self.bpb.fat_entry_byte(cluster), &mut b, cluster)?;
                 Ok(u32::from_le_bytes(b) & 0x0FFF_FFFF)
             }
             FatType::Fat16 => {
                 let mut b = [0u8; 2];
-                let n = self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
-                if n < 2 {
-                    return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
-                }
+                self.read_entry(self.bpb.fat_entry_byte(cluster), &mut b, cluster)?;
                 Ok(u16::from_le_bytes(b) as u32)
             }
             FatType::Fat12 => {
                 let off = self.bpb.fat_start_sector as u64 * self.bpb.bytes_per_sector as u64
                     + cluster as u64 + cluster as u64 / 2;
                 let mut b = [0u8; 2];
-                let n = self.dev.read_at(off, &mut b)?;
-                if n < 2 {
-                    return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
-                }
+                self.read_entry(off, &mut b, cluster)?;
                 let pair = u16::from_le_bytes(b) as u32;
                 Ok(if cluster.is_multiple_of(2) { pair & 0x0FFF } else { pair >> 4 })
             }
         }
+    }
+
+    /// 读满 buf，否则报"表项越界"（EOF 短读不得静默成 0=空闲）。
+    fn read_entry(&self, off: u64, buf: &mut [u8], cluster: u32) -> Result<(), FatError> {
+        let n = self.dev.read_at(off, buf)?;
+        if n < buf.len() {
+            return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
+        }
+        Ok(())
     }
 
     pub fn is_free(&self, cluster: u32) -> Result<bool, FatError> {
@@ -1375,25 +1401,29 @@ impl<'d> Fat<'d> {
         }
     }
 
-    /// `entry` 指向链尾（含 EOC/**保留值/坏簇**——都视为不可继续）。
+    /// `entry` 指向链尾（EOC 或保留值 1）——两者都视为不可继续。
     pub fn is_eoc_reachable(&self, cluster: u32) -> Result<bool, FatError> {
         let v = self.entry(cluster)?;
-        Ok(self.is_eoc(v) || v == 1) // 1 = 保留值（坏簇标记亦按链尾处理）
+        Ok(self.is_eoc(v) || v == 1) // 1 = 保留值（不可继续）
     }
 
-    /// 从 start 顺链读取簇号序列（含 start）。守卫：环/超长链（≤ 全盘簇数 + 2）。
+    /// 从 start 顺链读取簇号序列（含 start）。
+    /// 合法簇号上界为 `data_cluster_count() + 1`；链长超过 `data_cluster_count()` 必含环
+    /// （鸽笼：合法簇数量有限）——T7 可用 `chain.len() > bpb.data_cluster_count()` 判环。
     pub fn chain(&self, start: u32) -> Result<Vec<u32>, FatError> {
+        let max_cluster = self.bpb.data_cluster_count() + 1;
+        if !(2..=max_cluster).contains(&start) {
+            return Err(FatError::InvalidBpb(format!("chain start {start} out of range")));
+        }
         let mut out = vec![start];
         let mut cur = start;
-        // M2：越界守卫 count+2 有一格宽（合法簇上界为 count+1）；面对真实损坏盘时收紧或显式记录破损链。
-        let limit = self.bpb.data_cluster_count() + 2;
-        while out.len() as u32 <= limit {
+        while out.len() as u32 <= max_cluster {
             let v = self.entry(cur)?;
-            if v == 0 || self.is_eoc(v) || v == 1 {
+            if v == 0 || v == 1 || self.is_eoc(v) {
                 break;
             }
-            if v < 2 || v > limit {
-                break; // 越界值按断链处理
+            if v > max_cluster {
+                break; // 顺带接住坏簇标记（0xFF7/0xFFF7/0x0FFF_FFF7 均 > max_cluster）
             }
             out.push(v);
             cur = v;
@@ -1406,7 +1436,7 @@ impl<'d> Fat<'d> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 19 passed（13 + 6）。
+Expected: 21 passed（13 + 8）。
 
 - [ ] **Step 5: Commit**
 
@@ -1679,7 +1709,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 25 passed（19 + 6）。
+Expected: 27 passed（21 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -1839,8 +1869,8 @@ fn scan_fixed_root(dev: &dyn BlockDevice, bpb: &Bpb, fat: &Fat, out: &mut Vec<Fa
     let root_bytes = ((bpb.root_entry_count as u32) * 32) as usize;
     let mut buf = vec![0u8; root_bytes];
     let start = bpb.root_start_sector as u64 * bpb.bytes_per_sector as u64;
-    dev.read_at(start, &mut buf)?;
-    let parsed = dirent::parse_directory_bytes(&buf);
+    let n = dev.read_at(start, &mut buf)?;
+    let parsed = dirent::parse_directory_bytes(&buf[..n]); // 短读 → 只解析已读部分（不得零填充当 End）
     append_parsed(dev, bpb, fat, parsed, "/", 0, out)
 }
 
@@ -1859,8 +1889,15 @@ fn scan_cluster_dir(
     }
     let mut data = Vec::new();
     let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
-    for c in fat.chain(start_cluster)? {
-        let n = dev.read_at(bpb.cluster_to_byte(c), &mut buf)?;
+    let chain = match fat.chain(start_cluster) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // 坏目录链：跳过该目录，其余继续（保守降级，绝不中止全盘）
+    };
+    for c in chain {
+        let n = match dev.read_at(bpb.cluster_to_byte(c), &mut buf) {
+            Ok(n) => n,
+            Err(_) => break, // 读失败：解析已收集部分
+        };
         if n < buf.len() {
             break;
         }
@@ -1868,7 +1905,6 @@ fn scan_cluster_dir(
         if data.len() > 64 * 1024 * 1024 {
             break; // 防御：目录不可能这么大
         }
-        // 提前终止：已含 End 槽则不再读后续簇（性能优化可选，M1a 保留全读）
     }
     let parsed = dirent::parse_directory_bytes(&data);
     append_parsed(dev, bpb, fat, parsed, path, depth, out)
@@ -1926,8 +1962,9 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
         if c > max_cluster {
             return Ok(RecoverQuality::MaybeDamaged); // 越界：表项不可信
         }
-        if !fat.is_free(c)? {
-            return Ok(RecoverQuality::MaybeDamaged);
+        match fat.is_free(c) {
+            Ok(true) => {}                                // 确证空闲
+            _ => return Ok(RecoverQuality::MaybeDamaged), // Err 与 Ok(false) 同路降级：宁可漏报不可错报
         }
     }
     Ok(RecoverQuality::Complete)
@@ -1937,7 +1974,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 30 passed（25 + 5）。
+Expected: 32 passed（27 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1982,6 +2019,25 @@ git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
     }
 
     #[test]
+    fn deleted_entry_ignores_reused_chain_reads_original() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &data)
+            .delete("/", "GONE.BIN")
+            .build();
+        let mut patched = image.clone();
+        // 模拟非连续复用：entry(2)=7、entry(7)=8、entry(8)=EOC（旧文件数据仍在簇 2,3）
+        patched[516..518].copy_from_slice(&7u16.to_le_bytes());
+        patched[526..528].copy_from_slice(&8u16.to_le_bytes());
+        patched[528..530].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.deleted).unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes, data); // 判据修正：删除项走连续回退而非他人链
+    }
+
+    #[test]
     fn reads_exact_size_not_full_cluster() {
         let data = b"short".to_vec(); // 5 字节 < 1 簇
         let image = xd_fixtures::FatImageBuilder::fat32().add_file("/", "S.TXT", &data).build();
@@ -2010,11 +2066,13 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
     let fat = Fat::new(dev, &bpb);
     let size = entry.size_bytes as usize;
     let need = (size as u32).div_ceil(bpb.cluster_bytes()) as usize;
-    let chain = fat.chain(entry.first_cluster)?;
-    let clusters: Vec<u32> = if chain.len() >= need {
+    let chain = fat.chain(entry.first_cluster).unwrap_or_default(); // 坏链 → 空 → 走连续回退
+    let looped = chain.len() as u32 > bpb.data_cluster_count(); // 合法簇仅 count 个：> count ⟺ 必含环
+    let clusters: Vec<u32> = if !entry.deleted && !looped && chain.len() >= need {
         chain[..need].to_vec()
     } else {
-        (0..need as u32).map(|i| entry.first_cluster + i).collect() // 连续假设
+        // 删除项（M1a 语义下其链必属他人——删除即清 FAT）或环：按连续假设读
+        (0..need as u32).map(|i| entry.first_cluster + i).collect()
     };
     let mut out = Vec::with_capacity(size);
     let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
@@ -2036,7 +2094,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 33 passed（30 + 3）。
+Expected: 36 passed（32 + 4）。
 
 - [ ] **Step 5: Commit**
 
@@ -2098,7 +2156,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 34 passed（33 + 1，含新 e2e）。
+Expected: 37 passed（36 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
