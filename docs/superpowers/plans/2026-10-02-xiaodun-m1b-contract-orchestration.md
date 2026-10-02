@@ -26,7 +26,7 @@ proto/
 └── v1/                              # 新增：README.md + examples/*.json（golden）
 crates/
 ├── xd-core/
-│   ├── src/api.rs                   # PROTOCOL_VERSION=1；v1 类型（ScanStartParams/ScanState/ScanEntry…）
+│   ├── src/api.rs                   # PROTOCOL_VERSION=1；v1 类型（ScanState/ScanEntry/ScanProgress + 六个错误构造器；params 结构体归 T5）
 │   ├── src/notify.rs                # 新增：通知信封（无 id 的 JSON-RPC）
 │   ├── src/store.rs                 # 新增：SQLite（tasks/entries 两表；分页查询）
 │   ├── src/scan_task.rs             # 新增：状态机 + worker + 进度回调 + catch_unwind
@@ -986,20 +986,9 @@ pub struct ScanResultsParams {
     pub deleted_only: bool,
 }
 ```
-（`use serde::Deserialize;` 若未在 api.rs 中 import，按现状补。）`RpcError` 追加：
+（`use serde::Deserialize;` 若未在 api.rs 中 import，按现状补。）
 
-```rust
-    pub fn task_not_active(id: u64) -> Self {
-        Self { code: -32004, message: format!("Task not active: {id}") }
-    }
-    pub fn cannot_open(id: &str) -> Self {
-        Self { code: -32602, message: format!("Cannot open device: {id}") }
-    }
-    pub fn internal() -> Self {
-        Self { code: -32603, message: "Internal error".into() }
-    }
-```
-（构造器字段名以 api.rs 现状为准——`code`/`message`。）
+> **T1 执行后同步（见文末执行记录 ③）**：错误构造器六个**已全部在 T1 就位**（含 `task_not_active`/`cannot_open`/`internal`），T5 不得重复定义——本节此处的原始三枚构造器块已删除。
 
 - [ ] **Step 2: scan_task.rs（全代码；首行水印头）**
 
@@ -2085,12 +2074,13 @@ imports 更新：`use std::sync::Arc; use crate::api::{..., ScanStartParams, Tas
 
 - [ ] **Step 7: 协议号波及面收尾（先 grep 再改，改完全量复跑）**
 
+> **T1 执行后同步（见文末执行记录 ①②）**：Rust 部分已完成——`crates/xd-daemon/tests/ipc.rs:79` 已改 1；`crates/xd-core/tests/contract.rs:47`（v0 ping 期望值用活常量，grep 曾漏）已改为封存字面量 0 并留注释。**T5 仅剩 Dart 侧**（下述 grep 去掉 `crates/` 路径）。
+
 ```bash
-grep -rn "protocol" ui/lib ui/test crates/xd-daemon/tests | grep -v "\.json"
+grep -rn "protocol" ui/lib ui/test | grep -v "\.json"
 ```
 - `ui/lib/core_client/protocol.dart`：协议常量/期望值 0 → 1（含 mismatch 判定逻辑的常量）
 - `ui/test/protocol_test.dart` / `ipc_integration_test.dart` / `home_page_test.dart`：断言与 fake 的 protocol 0 → 1（v0 golden 解码测试除外——v0 文件里 protocol 仍是 0，若某测试直接读 v0 golden 解码则保持 0）
-- `crates/xd-daemon/tests/ipc.rs:79`：`assert_eq!(resp["result"]["protocol"], 0)` → `1`
 
 - [ ] **Step 8: 门禁与提交**
 ```bash
@@ -2556,6 +2546,22 @@ bash scripts/e2e.sh
 5. (a) 裁定落码且探针 B/C 钉死；`read_file`/`grade_deleted` 同源语义。
 6. 懒打开唯一出口 + `image:` 拒绝（提权安全）；EACCES → -32001 契约码。
 7. 全量门禁（debug+release+clippy+fmt+flutter+e2e.sh+e2e-loop.sh 含扫描）绿。
+
+---
+
+## 执行记录
+
+### T1（契约 v1）—— impl-m1b-t1，提交 `d67a858`，DONE_WITH_CONCERNS
+
+门禁：229 passed（+12）/ clippy clean / fmt clean / flutter +18~1（新 9，skip=无 XD_DAEMON_BIN 的既有 ipc_integration）/ analyze clean / release 档 exit 0。golden 21 个用 awk 从计划提取后 `diff -r` 逐字节比对（0 差异）。
+
+实施者发现 5 条（含 2 条计划自身缺陷），lead 裁定：
+
+1. **`xd-daemon/tests/ipc.rs:79` protocol 0→1**（计划排在 T5，与 T1 全绿门禁冲突）——**批准 T1 内改**；机械波及同 Step 5.5。T5 Step 7 Rust 部分就此完成。
+2. **`xd-core/tests/contract.rs:47`**（v0 ping 用例用活常量构造期望值；Step 5.5 与 T5 Step 7 的 grep 都漏）——**批准**：期望值改封存字面量 0 + 注释（v0 是历史快照；活契约往返由 contract_v1.rs/handlers v1 用例承担），保住「当前类型仍能 decode/re-encode v0 文件」的兼容路径。
+3. **T5 Step 1 重复定义三个错误构造器**（计划文本自冲突）——已删 T5 处代码块（六个全在 T1）。
+4. **文件结构注误把 ScanStartParams 归 T1**——已改注（params 归 T5，T1 未提前添加，正确）。
+5. **`linux.rs::open_with_sysfs` 是第 2 个 DeviceInfo 构造点**（计划计数错；`--device` 打开行 `transport: None`）——接受的后果：先开行在 device.list first-wins 去重时遮蔽枚举行的 transport。**裁定：升级路径（canonicalize sysfs → classify_transport，~3 行）延后到 M1d**（UI 真正显示 transport 时才有一致性诉求），记入 M1d 前置清单。
 
 ---
 
