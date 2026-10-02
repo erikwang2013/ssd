@@ -2622,6 +2622,28 @@ pub(crate) fn resolve_clusters(
 5. **移除** `load_bitmap` 上的 `#[allow(dead_code)]`（迁入后即有调用者）。
 6. 计数：crate 65 → **74**（+9）、workspace 178 → **187**。
 
+**执行记录（2026-10-02）**：实施提交 `0d74bfa`（crate 75/workspace 188；多 1 个承重测试 `deleted_chain_tail_occupied_prefix_free_delivers_full`——read 层 I2 唯此钉住）。迁入 read.rs 的三位图函数 + 同批迁移 `read_subdir_bytes`/`grade_deleted` 到 `resolve_clusters`（差分探针 5 构型一致；两处收紧均保守：fc<2、need>reachable+链覆盖→Err，后者为 spec 独立发现的第 2 差异、判定可接受）。
+**CI 工具链修正**：`029d6c9`（cherry-pick 自 main：`chunks_exact`→`as_chunks`，CI 1.99 新 lint）。
+
+**修复轮（qual-t6，2026-10-02）**：质量审查 **1 Critical + 1 Important** + 7 Minor，修复提交 `a2c8ca1` + 终修 `4dbd130`：
+
+- **C1（Critical）**：流式重构把无界 `need` 带进分配帽 `size.min(need*cb)`（resolve 之前）——debug 乘法溢出 panic /
+  release 巨分配 abort（**进程级**，不可捕获）/ capacity overflow / 越 DL 交付，公共 scan 路径四态可达。修：**三重钳位**
+  `(size as u64).min(dev.size_bytes()).min(64MiB)`（cap 仅提示、交付由 size 统治）；四态探针落成常驻测试
+  `polluted_lengths_read_file_stays_bounded_without_panic`（双 profile；旧码四态逐一复现：debug panic / release SIGABRT）。
+- **Important 2（M1b 决策）**：删除链被证伪后的连续回退可交付错位数据（probe B：quality Complete + 4904/9000 错字节）。
+  方案 (a)（deleted+!contiguous 只沿链走到首个非空闲/断链簇、不做拓扑切换）**立为 M1b 读+分级同步决策项**，
+  须先出 spec 裁定再改（probe B/C 构型测试与 (a) 同批）。本轮已把 read.rs 误导性文档改准。
+- **Minor 3/4/5/7**：read.rs:4 与 M1d 契约注释改准；`Resolved::Chain(chain[..need].to_vec())` 切点内移 + 文档归位；
+  两钉（位图不可读→用链（终修改碎片化构型后 M4 变异被抓）、VDL=0）；`min(VDL,DL)` 防御行（采纳）。
+- **M1b 有序清单（qual-t6 建议）**：① 测试基础设施（`#[path="scan_tests.rs"]` 内移测试——**勿用 tests/ 外迁**
+  （testutil 是 cfg(test) pub(crate)）+ 助手上收 fixtures）；② 缺口测试（live fc>count+1、VDL=0 已补）；
+  ③ 读分级同步决策 (a)；④ Resolved 切点内移已尽（(a) 后更自然）；⑤ 位图缓存变体（保 T7 签名）；
+  ⑥ read reason 枚举（M1d 文案动工前）；⑦ FAT 链批读（M1d 实测热点后）。
+- **T6 观察转注**：read_file 对 deleted+need>reachable 交付空（release 语义；修复后 debug 亦同）——M1b (a) 一并覆盖。
+
+计数：crate **78**、workspace **191**（T6 关闭时）。
+
 - [ ] **Step 1: 测试（`read.rs` 测试模块）**
 
 ```rust
@@ -2905,7 +2927,7 @@ fn deleted_chained_photo_recovered_byte_exact() {
 }
 ```
 
-- [ ] **Step 2: 运行** → crate **76 passed**（74 + 2）
+- [ ] **Step 2: 运行** → crate **80 passed**（78 + 2）
 
 - [ ] **Step 3: 生成示例**
 
