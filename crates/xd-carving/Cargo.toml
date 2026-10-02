@@ -9,4 +9,6 @@ xd-device = { path = "../xd-device" }
 
 [dev-dependencies]
 xd-fixtures = { path = "../xd-fixtures" }
+xd-fs-exfat = { path = "../xd-fs-exfat" }
+xd-fs-fat = { path = "../xd-fs-fat" }
 tempfile = { workspace = true }
