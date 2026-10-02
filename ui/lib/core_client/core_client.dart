@@ -6,6 +6,33 @@ abstract class CoreClient {
   Future<PingResult> ping();
   Future<List<DeviceInfo>> listDevices();
 
+  Future<ScanStartResult> scanStart(String device, {String mode = 'quick'});
+  Future<ScanStatusResult> scanStatus(int taskId);
+  Future<ScanResultsPage> scanResults(
+    int taskId, {
+    int offset = 0,
+    int limit = 200,
+    bool deletedOnly = false,
+  });
+  Future<void> scanPause(int taskId);
+  Future<void> scanResume(int taskId);
+  Future<void> scanCancel(int taskId);
+  Future<FsReadResult> fsRead(
+    int taskId,
+    int idx, {
+    int offset = 0,
+    int length = 1048576,
+  });
+  Future<ExportStartResult> exportStart(
+    int taskId,
+    List<int> idxs,
+    String targetDir,
+  );
+  Future<void> exportCancel(int exportId);
+
+  /// 服务端通知（无 id 行）：scan.progress/scan.finished/export.progress/export.finished。
+  Stream<Map<String, dynamic>> get notifications;
+
   /// 释放底层资源（桌面实现：关闭 daemon 进程；测试 fake：空实现）。
   Future<void> close();
 }

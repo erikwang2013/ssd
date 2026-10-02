@@ -51,11 +51,60 @@ class _MissingDaemonClient implements CoreClient {
 
   final String reason;
 
-  @override
-  Future<PingResult> ping() async => throw StateError(reason);
+  Never _missing() => throw StateError(reason);
 
   @override
-  Future<List<DeviceInfo>> listDevices() async => throw StateError(reason);
+  Future<PingResult> ping() async => _missing();
+
+  @override
+  Future<List<DeviceInfo>> listDevices() async => _missing();
+
+  @override
+  Future<ScanStartResult> scanStart(
+    String device, {
+    String mode = 'quick',
+  }) async => _missing();
+
+  @override
+  Future<ScanStatusResult> scanStatus(int taskId) async => _missing();
+
+  @override
+  Future<ScanResultsPage> scanResults(
+    int taskId, {
+    int offset = 0,
+    int limit = 200,
+    bool deletedOnly = false,
+  }) async => _missing();
+
+  @override
+  Future<void> scanPause(int taskId) async => _missing();
+
+  @override
+  Future<void> scanResume(int taskId) async => _missing();
+
+  @override
+  Future<void> scanCancel(int taskId) async => _missing();
+
+  @override
+  Future<FsReadResult> fsRead(
+    int taskId,
+    int idx, {
+    int offset = 0,
+    int length = 1048576,
+  }) async => _missing();
+
+  @override
+  Future<ExportStartResult> exportStart(
+    int taskId,
+    List<int> idxs,
+    String targetDir,
+  ) async => _missing();
+
+  @override
+  Future<void> exportCancel(int exportId) async => _missing();
+
+  @override
+  Stream<Map<String, dynamic>> get notifications => const Stream.empty();
 
   @override
   Future<void> close() async {}
