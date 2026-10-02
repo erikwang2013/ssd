@@ -17,6 +17,30 @@ const Color kQualityCarvedColor = Color(0xFF546E7A);
       _ => (label: '可能损坏', color: kQualityDamagedColor),
     };
 
+/// 质量徽标（结果页 trailing / 预览页信息卡共用同一视觉）。
+class QualityBadge extends StatelessWidget {
+  const QualityBadge({super.key, required this.quality});
+
+  final String quality;
+
+  @override
+  Widget build(BuildContext context) {
+    final badge = qualityBadgeFor(quality);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: badge.color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: badge.color),
+      ),
+      child: Text(
+        badge.label,
+        style: TextStyle(fontSize: 12, color: badge.color),
+      ),
+    );
+  }
+}
+
 /// 条目质量文案（铁律 1-5 + 拓扑未知兜底，见 results_page.dart 头注）。
 /// 返回 null = 不加任何警示（live + complete）。
 ({String text, Color color})? entryQualityNote(ScanEntry e) {
@@ -66,7 +90,6 @@ class EntryTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final badge = qualityBadgeFor(entry.quality);
     final note = entryQualityNote(entry);
     // 雕刻件 path 恒空：subtitle 只显示大小（计划 Step 1）
     final subtitle = [
@@ -91,18 +114,7 @@ class EntryTile extends StatelessWidget {
             Text(note.text, style: TextStyle(fontSize: 12, color: note.color)),
         ],
       ),
-      trailing: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-        decoration: BoxDecoration(
-          color: badge.color.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: badge.color),
-        ),
-        child: Text(
-          badge.label,
-          style: TextStyle(fontSize: 12, color: badge.color),
-        ),
-      ),
+      trailing: QualityBadge(quality: entry.quality),
       selected: selected,
       onTap: onTap,
       onLongPress: onLongPress,

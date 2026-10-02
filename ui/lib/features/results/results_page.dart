@@ -70,7 +70,11 @@ class _ResultsPageState extends State<ResultsPage> {
   void _openPreview(ScanEntry entry) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => PreviewPage(taskId: widget.taskId, entry: entry),
+        builder: (_) => PreviewPage(
+          client: widget.client,
+          taskId: widget.taskId,
+          entry: entry,
+        ),
       ),
     );
   }
