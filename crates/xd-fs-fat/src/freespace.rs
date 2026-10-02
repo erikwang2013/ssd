@@ -3,7 +3,12 @@
 //! 字节区间。**FAT 删除即清链 → 删除文件的数据簇恰好落在此处（雕刻主战场）**。
 //! 返回已排序、互不相交、簇边界对齐的 `[start,end)`，全部落于数据簇堆内
 //! （FAT12/16 的固定根目录区永不入选）。BPB/FAT 解析失败 → Err；
-//! `is_free` Err（表项读失败）视为已分配（保守：宁可漏扫不可误扫）。
+//! `is_free` Err（表项读失败）视为已分配（保守：宁可漏扫不可误扫）；空闲区间数上限
+//! MAX_RUNS **如实截断**（只丢尾不虚报，见常量 doc）。
+//! 与 exfat 侧的不对称（**T6 显式决策点**）：本引擎在 FAT 全表不可读时退化为 `Ok(空)`
+//! （与"全盘已分配"不可区分——保守方向已由专测钉死）；exfat 位图不可读 → `Err`。
+//! 深扫若要区分"无空闲"与"空闲不可知"，由 T6 在 ScanError 层显式决策（-32005），
+//! 本层不引入新错误类型。
 //! ponytail: 逐簇一次 read_at（沿用 fat.rs 的取舍）；1M 簇盘实测慢再引入扇区缓存/预读。
 
 use std::ops::Range;
@@ -13,6 +18,8 @@ use crate::bpb::{self, Bpb};
 use crate::fat::Fat;
 use xd_device::BlockDevice;
 
+/// 区间数上限：超出上限**返回前缀（只丢尾）**，不虚报未枚举区间；
+/// `len() == MAX_RUNS` 是**可能截断**的唯一信号。
 pub const MAX_RUNS: usize = 100_000;
 
 pub fn unallocated_runs(dev: &dyn BlockDevice) -> Result<Vec<Range<u64>>, FatError> {
@@ -214,5 +221,45 @@ mod tests {
         assert!(runs.is_empty(), "FAT 不可读时不得声称任何簇空闲: {runs:?}");
         // 对照：同一镜像在可读设备上确实能枚举出空闲区间
         assert!(!unallocated_runs(&dev).unwrap().is_empty());
+    }
+
+    #[test]
+    fn last_cluster_allocated_shrinks_tail_run() {
+        // 两遍式：先取几何，再把末簇（data_cluster_count+1）的 FAT 项置 EOC → 不得入选，
+        // 右界缩至末簇起点、Σ 仍 == 空闲簇数 × cb。钉死"末簇被循环上界漏访、再由
+        // final-flush 补成整堆"类变异（对 `2..=max`→`2..max` 必红）。
+        let mut patched = image_with_five_free_runs();
+        let (_f0, dev0) = dev_for(&patched);
+        let bpb0 = bpb::parse(&dev0).unwrap();
+        let last = bpb0.data_cluster_count() + 1; // 4175
+        let o = 512 + last as usize * 2; // fat_start_sector = 1，FAT16 表项宽 2 字节
+        patched[o..o + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let runs = unallocated_runs(&dev).unwrap();
+        let cb = bpb.cluster_bytes() as u64;
+        let free = (2..=last).filter(|c| fat.is_free(*c).unwrap()).count() as u64;
+        assert_eq!(free, 4169, "前提：末簇置 EOC 后 4169 空闲簇");
+        let run_bytes: u64 = runs.iter().map(|r| r.end - r.start).sum();
+        assert_eq!(run_bytes, free * cb, "Σ 与空闲簇数不符: {runs:?}");
+        let last_start = bpb.cluster_to_byte(last);
+        assert_eq!(
+            runs.last().unwrap().end,
+            last_start,
+            "右界须缩至末簇起点: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r.start < last_start + cb && last_start < r.end),
+            "已分配的末簇 {last} 不得入选: {runs:?}"
+        );
+        // max_runs = 0：区间数上限为 0 时一个区间都不得上报（钉死 final-flush 的
+        // `out.len() < max_runs` 守卫；无守卫会把 pending 的簇 2 区间推成整堆）
+        assert!(
+            runs_from_fat(&bpb, &fat, 0).is_empty(),
+            "max_runs=0 不得上报任何区间"
+        );
     }
 }

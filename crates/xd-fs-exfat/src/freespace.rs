@@ -2,7 +2,12 @@
 //! 未分配空间枚举（雕刻输入，§M1c）：**位图是分配权威**（删除后 FAT 已 stale），
 //! 空闲簇合并为字节区间。返回已排序、互不相交、簇边界对齐的 `[start,end)`，
 //! 全部落于数据簇堆内。位图不可读 → Err（雕刻拒绝在未知分配上猜）；
-//! `is_free` Err 视为已分配（保守：宁可漏扫不可误扫）；上限 MAX_RUNS 截断并如实计数。
+//! `is_free` Err 视为已分配（保守：宁可漏扫不可误扫）；上限 MAX_RUNS **如实截断**
+//! （只丢尾不虚报，见常量 doc）。
+//! 与 fat 侧的不对称（**T6 显式决策点**）：fat 在 FAT 全表不可读时退化为 `Ok(空)`
+//! （与"全盘已分配"不可区分——保守方向已由专测钉死）；exfat 位图不可读 → `Err`。
+//! 深扫若要区分"无空闲"与"空闲不可知"，由 T6 在 ScanError 层显式决策（-32005），
+//! 本层不引入新错误类型。
 
 use std::ops::Range;
 
@@ -14,6 +19,8 @@ use crate::fattab::Fat32;
 use crate::read::load_bitmap_from_specials;
 use xd_device::BlockDevice;
 
+/// 区间数上限：超出上限**返回前缀（只丢尾）**，不虚报未枚举区间；
+/// `len() == MAX_RUNS` 是**可能截断**的唯一信号。
 pub const MAX_RUNS: usize = 100_000;
 
 pub fn unallocated_runs(dev: &dyn BlockDevice) -> Result<Vec<Range<u64>>, ExfatError> {
@@ -199,5 +206,41 @@ mod tests {
             .count() as u64;
         let run_bytes: u64 = runs.iter().map(|r| r.end - r.start).sum();
         assert_eq!(run_bytes, free_clusters * cb);
+    }
+
+    #[test]
+    fn last_cluster_allocated_shrinks_tail_run() {
+        // 位图末簇（count+1 = 253）置已分配：Σ 仍 == 空闲簇数 × cb，且右界缩至末簇起点。
+        // 钉死"末簇被循环上界漏访、再由 final-flush 补成整堆"类变异（对 `2..=max`→`2..max` 必红）。
+        let image = image_with_files_at(&[7, 9, 11]);
+        let mut patched = image.clone();
+        let (_f0, dev0) = dev_for(&patched);
+        let boot0 = boot::parse(&dev0).unwrap();
+        let last = boot0.cluster_count + 1; // 253
+        let bit = (last - 2) as usize; // 位下标 = cluster - 2
+        let off = boot0.cluster_to_byte(2) as usize + bit / 8; // 位图占簇 2
+        patched[off] |= 1 << (bit % 8); // 1 = 已分配
+        let (_f, dev) = dev_for(&patched);
+        let (boot, bm) = boot_bitmap(&dev);
+        let runs = unallocated_runs(&dev).unwrap();
+        let cb = boot.cluster_bytes();
+        let free = (2..=boot.cluster_count as u64 + 1)
+            .filter(|c| matches!(bm.is_free(*c as u32), Ok(true)))
+            .count() as u64;
+        assert_eq!(free, 244, "前提：末簇置位后 244 空闲簇");
+        let run_bytes: u64 = runs.iter().map(|r| r.end - r.start).sum();
+        assert_eq!(run_bytes, free * cb, "Σ 与空闲簇数不符: {runs:?}");
+        let last_start = boot.cluster_to_byte(last);
+        assert_eq!(
+            runs.last().unwrap().end,
+            last_start,
+            "右界须缩至末簇起点: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r.start < last_start + cb && last_start < r.end),
+            "已分配的末簇 {last} 不得入选: {runs:?}"
+        );
     }
 }
