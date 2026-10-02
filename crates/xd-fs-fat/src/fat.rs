@@ -179,6 +179,18 @@ mod tests {
     }
 
     #[test]
+    fn chain_rejects_out_of_range_start() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        for start in [0, 1, u32::MAX] {
+            let err = fat.chain(start).unwrap_err();
+            assert!(matches!(err, FatError::InvalidBpb(m) if m.contains("out of range")));
+        }
+    }
+
+    #[test]
     fn wild_cluster_on_fat12_does_not_overflow() {
         // 极端簇号不得 panic：偏移 = 512(fat 起点) + 0xAAAA_AAAB + 0x5555_5555(=0x1_0000_0000)
         // 远超 512KB 夹具 → read_at 返回 0 → 短读 n<2 → 精确 Err（确定性，非碰运气）
