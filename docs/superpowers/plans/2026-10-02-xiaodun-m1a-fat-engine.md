@@ -1815,7 +1815,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
                     first_cluster: s.first_cluster,
                     size: s.size,
                     deleted: s.deleted,
-                    is_dir: s.attr & ATTR_DIRECTORY != 0 && !s.deleted,
+                    is_dir: s.attr & ATTR_DIRECTORY != 0, // 忠实 attr：已删目录不得伪装成文件（qual-t6 I3）
                     has_lfn,
                 });
             }
@@ -1828,7 +1828,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 31 passed（21 + 10）。
+Expected: 32 passed（21 + 10 + 修复轮 1：`deleted_subdir_entry_keeps_is_dir`）。
 
 - [ ] **Step 5: Commit**
 
@@ -1961,6 +1961,110 @@ mod tests {
         assert!(entries.iter().any(|e| e.name == "PHOTOS"), "坏目录项本身仍应列出");
         assert!(!entries.iter().any(|e| e.name == "IMG.JPG"), "不可读目录不得产出条目");
     }
+
+    #[test]
+    fn scan_errors_when_fat32_root_cluster_out_of_range() {
+        // I2：根不可枚举必须 Err（与空盘 Ok([]) 区分）
+        let image = xd_fixtures::FatImageBuilder::fat32()
+            .add_file("/", "A.TXT", b"x")
+            .build();
+        let mut patched = image.clone();
+        patched[44..48].copy_from_slice(&1_000_000u32.to_le_bytes()); // bpb 只验 ≥2
+        let (_f, dev) = dev_for(&patched);
+        assert!(matches!(scan(&dev), Err(FatError::InvalidBpb(m)) if m.contains("根目录不可读")));
+    }
+
+    #[test]
+    fn scan_errors_when_root_region_unreadable() {
+        // I2：截断到 boot+FAT 区内（root_start=9216 在设备外）→ 首读 0 字节 → Err
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "A.TXT", b"x")
+            .build();
+        let truncated = image[..5120].to_vec();
+        let (_f, dev) = dev_for(&truncated);
+        assert!(matches!(scan(&dev), Err(FatError::InvalidBpb(m)) if m.contains("根目录不可读")));
+    }
+
+    #[test]
+    fn unreadable_subdir_marks_entry_maybe_damaged() {
+        // Rec3：子目录不可枚举 → 已 push 的目录条目标记 MaybeDamaged，其余照常
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_subdir("/", "PHOTOS")
+            .add_file("/PHOTOS", "IMG.JPG", &[3u8; 100])
+            .add_file("/", "ROOT.TXT", b"root")
+            .build();
+        let mut patched = image.clone();
+        let base = 18 * 512;
+        let pos = patched[base..base + 32 * 8]
+            .chunks(32)
+            .position(|c| &c[..5] == b"PHOTO")
+            .unwrap();
+        patched[base + pos * 32 + 26..base + pos * 32 + 28].copy_from_slice(&5000u16.to_le_bytes()); // 5000 > data_cluster_count()+1
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let dir = entries.iter().find(|e| e.name == "PHOTOS").unwrap();
+        assert!(dir.is_dir);
+        assert_eq!(dir.quality, RecoverQuality::MaybeDamaged);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "ROOT.TXT" && e.quality == RecoverQuality::Complete)
+        );
+        assert!(!entries.iter().any(|e| e.name == "IMG.JPG"));
+    }
+
+    #[test]
+    fn deleted_entry_without_cluster_info_grades_maybe_damaged() {
+        // M3：first_cluster < 2（簇信息缺失）→ MaybeDamaged
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &[4u8; 512])
+            .delete("/", "GONE.BIN")
+            .build();
+        let mut patched = image.clone();
+        let de = patched
+            .windows(32)
+            .position(|w| w[0] == 0xE5 && &w[8..11] == b"BIN")
+            .unwrap();
+        patched[de + 26..de + 28].copy_from_slice(&0u16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let gone = entries.iter().find(|e| e.deleted).unwrap();
+        assert_eq!(gone.quality, RecoverQuality::MaybeDamaged);
+    }
+
+    #[test]
+    fn deleted_entry_with_out_of_range_cluster_grades_maybe_damaged() {
+        // M3：first_cluster 越界（> count+1）且 size > 0 → MaybeDamaged
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &[4u8; 512])
+            .delete("/", "GONE.BIN")
+            .build();
+        let mut patched = image.clone();
+        let de = patched
+            .windows(32)
+            .position(|w| w[0] == 0xE5 && &w[8..11] == b"BIN")
+            .unwrap();
+        patched[de + 26..de + 28].copy_from_slice(&5000u16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let gone = entries.iter().find(|e| e.deleted).unwrap();
+        assert_eq!(gone.quality, RecoverQuality::MaybeDamaged);
+    }
+
+    #[test]
+    fn ext_is_lowercase_suffix_or_empty() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "A.JPG", b"x")
+            .add_file("/", "NOEXT", b"y")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        assert_eq!(
+            entries.iter().find(|e| e.name == "A.JPG").unwrap().ext,
+            "jpg"
+        );
+        assert_eq!(entries.iter().find(|e| e.name == "NOEXT").unwrap().ext, "");
+    }
 }
 ```
 
@@ -1972,7 +2076,9 @@ Expected: 编译失败（`scan` 未定义）。
 - [ ] **Step 3: 实现 `crates/xd-fs-fat/src/scan.rs`**
 
 ```rust
-//! 快速扫描：目录遍历（根 + 子目录）+ 删除文件找回 + 质量分级 + 文件读取。
+//! 快速扫描：目录遍历（根 + 子目录）+ 删除文件找回 + 质量分级。
+//! 原则：保守降级——单个坏目录链/坏读不中止全盘（根目录无法开始枚举除外：返回 Err，
+//! 与「空盘 Ok([])」区分）；只有确证全空闲才评 Complete。
 
 use crate::bpb::{self, Bpb, FatType};
 use crate::dirent::{self, ParsedEntry};
@@ -2003,29 +2109,44 @@ pub struct FatEntry {
 const MAX_ENTRIES: usize = 200_000;
 const MAX_DEPTH: u32 = 32;
 
+/// 扫描整卷：根目录 + 递归子目录，返回全部条目（含删除文件）。
+/// 根目录无法开始枚举（根链解析失败或根区读不到内容）→ Err，与空盘 `Ok([])` 区分；
+/// 其余局部损坏按保守降级处理（跳过或标记 MaybeDamaged），不中止全盘。
 pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<FatEntry>, FatError> {
     let bpb = bpb::parse(dev)?;
     let fat = Fat::new(dev, &bpb);
     let mut out = Vec::new();
-    if bpb.fat_type == FatType::Fat32 {
-        scan_cluster_dir(dev, &bpb, &fat, bpb.root_cluster, "/", 0, &mut out)?;
+    let readable = if bpb.fat_type == FatType::Fat32 {
+        scan_cluster_dir(dev, &bpb, &fat, bpb.root_cluster, "/", 0, &mut out)?
     } else {
-        scan_fixed_root(dev, &bpb, &fat, &mut out)?;
+        scan_fixed_root(dev, &bpb, &fat, &mut out)?
+    };
+    if !readable {
+        return Err(FatError::InvalidBpb("根目录不可读".into()));
     }
     Ok(out)
 }
 
-/// FAT12/16 固定根目录。
-fn scan_fixed_root(dev: &dyn BlockDevice, bpb: &Bpb, fat: &Fat, out: &mut Vec<FatEntry>) -> Result<(), FatError> {
+/// FAT12/16 固定根目录。返回值：根区是否可枚举。
+fn scan_fixed_root(
+    dev: &dyn BlockDevice,
+    bpb: &Bpb,
+    fat: &Fat,
+    out: &mut Vec<FatEntry>,
+) -> Result<bool, FatError> {
     let root_bytes = ((bpb.root_entry_count as u32) * 32) as usize;
     let mut buf = vec![0u8; root_bytes];
     let start = bpb.root_start_sector as u64 * bpb.bytes_per_sector as u64;
     let n = dev.read_at(start, &mut buf)?;
+    if n == 0 {
+        return Ok(false); // 根区在设备外：无法开始枚举
+    }
     let parsed = dirent::parse_directory_bytes(&buf[..n]); // 短读 → 只解析已读部分（不得零填充当 End）
-    append_parsed(dev, bpb, fat, parsed, "/", 0, out)
+    append_parsed(dev, bpb, fat, parsed, "/", 0, out)?;
+    Ok(true)
 }
 
-/// 簇链目录（FAT32 根与所有子目录）。
+/// 簇链目录（FAT32 根与所有子目录）。返回值：该目录是否可枚举。
 fn scan_cluster_dir(
     dev: &dyn BlockDevice,
     bpb: &Bpb,
@@ -2034,31 +2155,40 @@ fn scan_cluster_dir(
     path: &str,
     depth: u32,
     out: &mut Vec<FatEntry>,
-) -> Result<(), FatError> {
+) -> Result<bool, FatError> {
     if depth > MAX_DEPTH || out.len() > MAX_ENTRIES {
-        return Ok(());
+        return Ok(true); // 命中深度/容量上限：内容已尽量取到，不算不可读
     }
     let mut data = Vec::new();
     let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
     let chain = match fat.chain(start_cluster) {
         Ok(c) => c,
-        Err(_) => return Ok(()), // 坏目录链：跳过该目录，其余继续（保守降级，绝不中止全盘）
+        Err(_) => return Ok(false), // 坏目录链：该目录无法开始枚举（调用方决定降级方式）
     };
+    let mut got_any = false;
     for c in chain {
         let n = match dev.read_at(bpb.cluster_to_byte(c), &mut buf) {
             Ok(n) => n,
             Err(_) => break, // 读失败：解析已收集部分
         };
+        if n == 0 {
+            break; // 该簇在设备外
+        }
+        got_any = true;
+        data.extend_from_slice(&buf[..n]); // 短读 → 只收已读部分（不得拿上一簇残字节当数据）
         if n < buf.len() {
             break;
         }
-        data.extend_from_slice(&buf);
         if data.len() > 64 * 1024 * 1024 {
             break; // 防御：目录不可能这么大
         }
     }
+    if !got_any {
+        return Ok(false); // 首簇即读不到：不可枚举
+    }
     let parsed = dirent::parse_directory_bytes(&data);
-    append_parsed(dev, bpb, fat, parsed, path, depth, out)
+    append_parsed(dev, bpb, fat, parsed, path, depth, out)?;
+    Ok(true)
 }
 
 fn append_parsed(
@@ -2071,6 +2201,9 @@ fn append_parsed(
     out: &mut Vec<FatEntry>,
 ) -> Result<(), FatError> {
     for e in parsed {
+        if out.len() >= MAX_ENTRIES {
+            return Ok(()); // 上限跨目录共享，入口检查之外的兜底（单巨型目录也不得越顶）
+        }
         if e.attr & 0x08 != 0 {
             continue; // 卷标（真实盘根目录必有一条）不是文件，与 dot 同理过滤
         }
@@ -2092,10 +2225,20 @@ fn append_parsed(
             quality,
             ext,
         });
+        let pushed = out.len() - 1;
         // 只递归存活目录（已删除目录的簇可能被再分配，M1a 不深入）
         if e.is_dir && !e.deleted && e.first_cluster >= 2 {
-            let child_path = if path == "/" { format!("/{}", e.name) } else { format!("{path}/{}", e.name) };
-            scan_cluster_dir(dev, bpb, fat, e.first_cluster, &child_path, depth + 1, out)?;
+            let child_path = if path == "/" {
+                format!("/{}", e.name)
+            } else {
+                format!("{path}/{}", e.name)
+            };
+            let readable =
+                scan_cluster_dir(dev, bpb, fat, e.first_cluster, &child_path, depth + 1, out)?;
+            if !readable {
+                // 目录项本身可读但内容不可枚举 → 该条目标记不完整（Rec3）
+                out[pushed].quality = RecoverQuality::MaybeDamaged;
+            }
         }
     }
     Ok(())
@@ -2128,7 +2271,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 38 passed（31 + 7）。
+Expected: 45 passed（32 + 7 + 修复轮 6：I2×2、Rec3、M3×3）。
 
 - [ ] **Step 5: Commit**
 
@@ -2136,6 +2279,22 @@ Expected: 38 passed（31 + 7）。
 git add crates/xd-fs-fat
 git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
 ```
+
+**修订轮（qual-t6，2026-10-02）**：质量审查发现 4 项 Important（无 Critical），修复提交 `aa296fa`
+（"fix(fs-fat): 根不可读→Err、is_dir 忠实 attr、MAX_ENTRIES 兜底与父目录降级标记（qual-t6）"）：
+
+- **I1**：`append_parsed` 入口检查之外加跨目录共享的 MAX_ENTRIES 兜底（单巨型目录曾可达 208000 条 / ~260MB）。
+- **I2**：**根不可读 → Err**（`FatError::InvalidBpb("根目录不可读")`）——FAT32 根链 Err、固定根首读 0 字节；
+  与空盘 `Ok([])` 区分。子目录维持保守降级。
+- **I3**：`dirent` 的 `is_dir` 忠实 attr（已删目录不得伪装成 0 字节文件供 M1d "恢复"）；递归守卫
+  `!e.deleted` 保证不深入已删目录。
+- **Rec3**：递归返回 `readable: bool`，子目录不可枚举 → 父目录已 push 的该条目标 `MaybeDamaged`。
+- **M3**：补测试 grade 的 `first_cluster<2`、越界簇（size>0）与 ext 断言。
+- **落地偏离（impl 报备，均接受）**：① 簇链目录短读改为"解析已读前缀"（与固定根同规则，截断卷可救前段）；
+  ② 深度/容量上限命中 → `readable = true`（策略截断非损坏）；③ M3 构造改用 `windows(32)` 按
+  `0xE5+扩展名` 定位（FAT16 根实际在 18×512=9216，非 512）；④ 模块头补记根不可读例外。
+- **遗留观察（转 M2/移交注）**：已删目录 quality 仍 Complete（is_dir 分支在先）；grade_deleted 无 FAT 缓存
+  的 CPU 面；`bpb` 接受 `root_entry_count==0` 的 12/16 几何而 scan 必 Err 的宽容度落差（已记 scan 头注释）。
 
 ---
 
@@ -2200,6 +2359,30 @@ git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
         let e = entries.iter().find(|e| e.name == "S.TXT").unwrap();
         assert_eq!(read_file(&dev, e).unwrap(), data);
     }
+
+    #[test]
+    fn wild_first_cluster_is_bounded_not_panic() {
+        // I4：u32 高位被污染的删除项（first_cluster≈0xFFFFFE00）→ 连续回退必须 u64 累积 +
+        // 同界截断，不得 u32 加法溢出 panic（旧 `(0..need).map(|i| first_cluster + i)` 在此 debug 溢出）
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "X.TXT", b"x").build();
+        let mut patched = image.clone();
+        // 扩大卷几何使 count+1 逼近 u32 上界（否则界本身先挡住溢出路径）
+        patched[19..21].copy_from_slice(&0u16.to_le_bytes()); // 16 位总数清零 → 走 32 位字段
+        patched[32..36].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let e = FatEntry {
+            name: "WILD.BIN".into(),
+            path: "/".into(),
+            size_bytes: 266_240, // need=520 ≥ u32::MAX - 0xFFFFFE00 + 1 = 513 → 旧实现必溢出
+            first_cluster: 0xFFFF_FE00,
+            deleted: true,
+            is_dir: false,
+            quality: RecoverQuality::MaybeDamaged,
+            ext: "bin".into(),
+        };
+        let bytes = read_file(&dev, &e).unwrap(); // 不得 panic
+        assert!(bytes.len() < 266_240, "界截断：不得越界读，也不得伪造");
+    }
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -2210,8 +2393,9 @@ Expected: 编译失败（`read_file` 未定义）。
 - [ ] **Step 3: 实现（追加到 `scan.rs`）**
 
 ```rust
-/// 读取文件内容（恰好 size 字节）。
-/// 策略：先顺 FAT 链读；链长不足（删除后 FAT 已清）→ 按连续簇回退。
+/// 读取文件内容（恰好 size 字节；设备边界/坏读早停 → 返回短于 size 的前缀，不伪造）。
+/// 策略：存活文件顺 FAT 链读；删除项（FAT 已清，链属他人）或环/坏链 → 按连续簇回退。
+/// 注意：返回值只有字节——"是否走了连续假设"由 `entry.deleted` 推断（M1d UI 文案据此）。
 pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, FatError> {
     if entry.size_bytes == 0 || entry.first_cluster < 2 {
         return Ok(Vec::new());
@@ -2225,18 +2409,29 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
     let clusters: Vec<u32> = if !entry.deleted && !looped && chain.len() >= need {
         chain[..need].to_vec()
     } else {
-        // 删除项（M1a 语义下其链必属他人——删除即清 FAT）或环：按连续假设读
-        (0..need as u32).map(|i| entry.first_cluster + i).collect()
+        // 删除项（M1a 语义下其链必属他人——删除即清 FAT）或环/坏链：按连续假设读。
+        // 界与 grade_deleted 同源（count+1）；u64 累积防野生 first_cluster 的 u32 加法溢出（qual-t6 I4）。
+        let max_cluster = bpb.data_cluster_count() as u64 + 1;
+        let mut v = Vec::new();
+        let mut c = entry.first_cluster as u64;
+        while v.len() < need && c <= max_cluster {
+            v.push(c as u32);
+            c += 1;
+        }
+        v
     };
     let mut out = Vec::with_capacity(size);
     let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
     for c in clusters {
-        let n = dev.read_at(bpb.cluster_to_byte(c), &mut buf)?;
-        if n < buf.len() {
-            break;
+        let n = match dev.read_at(bpb.cluster_to_byte(c), &mut buf) {
+            Ok(n) => n,
+            Err(_) => break, // 坏道/越界：保留已读前缀（与 scan 同规则，坏道跳过不中断）
+        };
+        if n == 0 {
+            break; // 该簇在设备外
         }
-        out.extend_from_slice(&buf);
-        if out.len() >= size {
+        out.extend_from_slice(&buf[..n]); // 短读 → 只收已读部分（不得拿上一簇残字节当数据）
+        if out.len() >= size || n < buf.len() {
             break;
         }
     }
@@ -2248,7 +2443,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 42 passed（38 + 4）。
+Expected: 50 passed（45 + 4 + 1：I4 野生簇回归）。
 
 - [ ] **Step 5: Commit**
 
@@ -2294,7 +2489,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
     let entries = xd_fs_fat::scan::scan(&dev).unwrap();
     let photo_entry = entries
         .iter()
-        .find(|e| e.deleted && e.ext == "jpg")
+        .find(|e| e.deleted && !e.is_dir && e.ext == "jpg") // is_dir 忠实 attr 后须排除已删目录（qual-t6 I3）
         .expect("deleted jpg not found");
     assert_eq!(photo_entry.size_bytes, 500);
 
@@ -2310,7 +2505,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 43 passed（42 + 1，含新 e2e）。
+Expected: 51 passed（50 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
@@ -2361,6 +2556,22 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
 - **M1c**：`xd-carving`（JPEG/PNG 签名雕刻 v1）
 - **M1d**：UI 三页（扫描控制/结果浏览/预览）+ 恢复导出（异设备校验 + 报告）
 - **M1e**：物理设备枚举（Linux `/dev/sdX` 先行）+ 提权（Linux polkit）+ Linux 打包；Windows/macOS 平台层单独排期
+
+## M1a 移交注（qual-t6 / impl-t6，2026-10-02）
+
+1. **已删目录的呈现语义**：`is_dir` 忠实 attr 后，UI 过滤目录必须用 `is_dir`；已删目录 name 首字符丢失
+   （无 LFN 时不可重建）、内容不枚举（M1a 版图）、quality 仍 Complete（is_dir 分支在先）——**不得把
+   Complete 读成"目录内容可恢复"**。M1d 文案与过滤逻辑据此。
+2. **read_file 无"是否走连续回退"信号**：`entry.deleted` 即连续假设恢复；M1d UI 对删除项标注
+   连续假设恢复。返回值可能短于 `size_bytes`（设备边界/坏读早停），UI 以长度对比呈现完整度。
+3. **grade_deleted 的 CPU 面**：无 FAT 缓存，每删除条目最坏 `count` 次 `read_at`（敌意镜像 × 条目数
+   可达分钟级）。M1a 接受；M2 加预读缓存或全局读取预算（fat.rs 头已有 ponytail 升级路径注）。
+4. **grade_deleted `first_cluster + i` u32 加法**：溢出需 `is_free` 先在野生簇上成功（FAT 表项真实可读），
+   只有 ≥16GiB 一致构造镜像可达，M1a 不可达（i=0 为 +0；is_free 越界即 Err 提前退出）；M2 顺手改
+   u64/checked。T7 的连续回退不同——急切建表无设备读约束，已在 Task 7 规格用 u64 累积 + 同界截断修正（I4）。
+5. **ext 的点文件惯例**：`.DS_Store` → `ext == "store"`；UI 按 ext 过滤时注意（M2 或 UI 轮处理）。
+6. **bpb 与 scan 的宽容度落差**：bpb 接受 `root_entry_count == 0` 的 12/16 几何，而此类盘 `scan` 按 I2
+   契约必 Err（"无法开始枚举"）——语义自洽，已记入 scan 模块头注释。
 
 ---
 
