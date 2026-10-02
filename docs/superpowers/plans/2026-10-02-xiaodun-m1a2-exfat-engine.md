@@ -2976,7 +2976,13 @@ Complete 语义断言 / 第二用例碎片化 `[6,9,7]` 锁链序端到端 / 靶
 - [x] `cargo test --workspace --locked` 全绿（**217**）；clippy `-D warnings` 零告警；fmt 干净
 - [x] e2e 两案通过（删除 JPG 全名 + 字节级 + Complete 语义；链式碎片删除逐字节，链序变异判别力实证）
 - [x] 示例产物 1,048,576 字节；`fsck.exfat -n` clean（本地验证；CI 不依赖该工具）
-- [x] `bash scripts/apply-copyright.sh` 幂等（0 盖 / 54 跳）；`provenance.sha256` 重生成——**待发布时执行**
+- [x] `bash scripts/apply-copyright.sh` 幂等（0 盖 / 54 跳）；`provenance.sha256` 重生成——**v0.2.0 发布时已执行**
+      （143 文件快照 + SSH 签名验证通过）
+- [x] **发布 v0.2.0**：标签 `v0.2.0` @ `27f2e81`；GitHub Release「v0.2.0」附 `xiaodun_0.2.0_amd64.deb`；
+      发布提交 CI 全绿（run 36996369142）。发布中发现并修 **3 处版本地雷**：`ping.response.json` golden 与
+      `contract.rs` 断言、`xd-ffi` 硬编码 —— 全部改为 **`"<VERSION>"` 占位 + 运行期归一**（契约文件不再因发版
+      改动，约定已写入 `proto/v0/README.md`）。另更正一次 `git add -A` 误纳本地工具产物（`.claude-flow/`、
+      `AGENTS.md`、`CLAUDE.md` 已退索引并入 .gitignore）。
 - [x] CI（手动触发）全绿——**未验证清单（真机 udev/polkit/认证/真 U 盘全链路）承接 M1e 手测清单**
 - [x] 交付收尾：merge `--no-ff` 至 main + 推送（含 M1e 前向整合）
 - [ ] e2e 两案通过（删除 JPG 全名 + 字节级；链式删除逐字节）
