@@ -35,14 +35,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -qq
       - run: sudo apt-get install -y libxml2-utils
       - run: cargo build --locked --release -p xd-daemon
       - run: bash scripts/build-deb.sh
+      - run: docker info >/dev/null
       - run: bash scripts/e2e-deb.sh
       - uses: actions/upload-artifact@v4
         with:
           name: xiaodun-deb
           path: dist/*.deb
+          if-no-files-found: error
 
   flutter:
     runs-on: ubuntu-latest

@@ -3,6 +3,7 @@
 # 组装 deb：/usr/libexec/xiaodun/xd-daemon + polkit + udev + （Flutter bundle 到位后）opt/xiaodun。
 # 版本号从 workspace Cargo.toml 注入，避免两处手改。
 set -euo pipefail
+umask 022   # 目录模式不随构建者 umask 漂移（0002 会产出 775 root:root 的系统目录）
 cd "$(dirname "$0")/.."
 
 version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
