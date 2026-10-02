@@ -5,7 +5,23 @@
 pub mod bpb;
 pub mod dirent;
 pub mod fat;
+mod read;
 pub mod scan;
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use xd_device::image::ImageFileDevice;
+
+    /// 镜像字节 → 落盘临时文件 + 只读镜像设备（scan/read 测试共用；与 xd-fs-exfat 同名助手同构）。
+    pub(crate) fn dev_for(image: &[u8]) -> (tempfile::NamedTempFile, ImageFileDevice) {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(image).unwrap();
+        f.flush().unwrap();
+        let dev = ImageFileDevice::open(f.path()).unwrap();
+        (f, dev)
+    }
+}
 
 /// 引擎统一错误类型。
 #[derive(Debug)]

@@ -68,6 +68,19 @@ pub fn boot_checksum(region11: &[u8]) -> u32 {
 pub fn entry_set_checksum(set: &[u8]) -> u16 {
     fold16(set, &[2, 3])
 }
+
+/// 就地重算删除项集 SetChecksum（`set_off` 起 `slots` 槽）：先按删除还原语义对每槽
+/// 类型字节 `|=0x80` 再折叠（删除只清 bit7、不重算——这正是 T4 删除门槛的语义）。
+/// 构造"污染 VDL/DL 但还原校验仍自洽"的删除项时使用（否则门槛会直接丢弃该项）。
+pub fn refix_deleted_checksum(img: &mut [u8], set_off: usize, slots: usize) {
+    let mut restored = img[set_off..set_off + slots * 32].to_vec();
+    for k in 0..slots {
+        restored[k * 32] |= 0x80;
+    }
+    let cs = entry_set_checksum(&restored);
+    img[set_off + 2..set_off + 4].copy_from_slice(&cs.to_le_bytes());
+}
+
 pub fn table_checksum(table: &[u8]) -> u32 {
     fold32(table, &[])
 }
