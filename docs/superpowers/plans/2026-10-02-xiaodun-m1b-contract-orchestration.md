@@ -1909,6 +1909,21 @@ imports 更新：`use std::sync::Arc; use crate::api::{..., ScanStartParams, Tas
         assert_eq!(o.result["entries"][0]["name"], "DEL_ME.JPG");
         assert_eq!(o.result["entries"][0]["deleted"], true);
         assert_eq!(o.result["entries"][0]["quality"], "complete");
+        // qual-t3 纵深防御：observer 1:1 ⇒ idx 集合恰为 0..found_count（防回调重复致库内双行）
+        let Response::Ok(all) = handle_request(
+            &ctx,
+            &req_with(6, "scan.results", serde_json::json!({"taskId": 1, "offset": 0, "limit": 10})),
+        ) else {
+            panic!()
+        };
+        let mut idxs: Vec<u64> = all.result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["idx"].as_u64().unwrap())
+            .collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![0, 1, 2], "idx 集合 == 0..found_count");
     }
 
     #[test]
@@ -2596,6 +2611,14 @@ bash scripts/e2e.sh
 - **qual 变异表（11+3+4 条，收官口径）**：8 KILL；`ORDER BY idx` 删除 **≈等价变异体**（EXPLAIN：PK 索引天然 (task_id,idx) 序；保留作契约保证）；对称交换 `Canceled↔Completed` **预期 NO-KILL**（库内往返自洽；wire 值由 T5 pin）；`u64::MAX` 等极值 round-trip 逐位全等 ✅。真缺口 3 个（set_progress 零覆盖 / 未知态降级无测 / 跨任务隔离弱）→ 全部补测并以定向变异（`?1=?1`、列交换、`unwrap_or` 互换）四条独立复杀闭合。
 - **质量裁定**：`Mutex` 中毒保持 `unwrap`（fail-stop；无用户代码临界区）——注释措辞「监督重启」经 qual 指出无据后改为「任务态由 `mark_interrupted`/`recover_after_restart` 兜底」（`a597db4`）；SQL 注入面=0（`format!` 仅插值编译期常量 `filter`，其余全参数绑定）。
 - **前向残项（记录，不处理）**：`'pending'` 目前无 DB 生产路径（M1c 引入时随测试补）；DB 状态字面量无独立测试（wire 归 T5、字面量由 M1c 迁移测试覆盖——裁定确认无新增风险）。
+
+### T3（两引擎 `scan_with_observer`）—— impl-m1b-t3。提交沿革：`604ba92`（主）→ `c39f746`（卷标 1:1 强化）。DONE → spec **PASS** → qual **APPROVED**（T3 关闭，249/0）
+
+- **插入点（判别核心）**：exfat `scan.rs:184-185`、fat `scan.rs:202-203`——均位于目录递归 if 块之后、`out[pushed].quality` 降级写回之后、循环体末尾（后序 + 终值）。spec 独立探针：回调数==表长且多重集相等；三层 exfat 序列 `DEEP.TXT→B→MID.TXT→A→ROOT.TXT`；两引擎降级目录回调即 `MaybeDamaged`。
+- **偏差（全机械）**：fat 实际 API `fat16()/add_subdir`；8 参函数补 `#[allow(clippy::too_many_arguments)]`（-D warnings 必需，spec 已用合成函数复现 8/7 错误）；exfat 三个既有测试调用点补 `&mut |_| {}`。
+- **qual 变异表（8 条）**：前序化/透传断链/降级前回调 **双引擎全 KILL**；**重复回调 6a/6b KILL**（精确序列断言已覆盖"每条目恰一次"——T5 `found_count` 虚增风险在引擎层已守）；`scan()` 内联 = 等价变异（观察者 noop 不可观测）；fat 卷标项不进回调流 = 语义差但裁定可接受 → **已补 `observer_stream_matches_table_with_volume_label`**（1:1 计数，真实盘必走路径；质询者亲验双态：干净绿/变异红——该测为 qual 自验代码，落码后免复审增量，理由记录于此）。
+- **质量裁定**：`&mut dyn FnMut(&Entry)` 保留（收益=公共签名不泄类型参数；探问词"递归单态化"论据不成立，qual 纠正，源码无此措辞）；fat 8 参不抽 context struct（exfat 9 参先例；参数全为穿透借用）；头注"后序/终值"与实现逐条一致且对 T5 承重。
+- **T5 纵深防御（已入计划）**：集成测试断言 `results` 的 idx 集合 == `0..found_count`。
 
 ---
 
