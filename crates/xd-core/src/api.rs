@@ -40,6 +40,33 @@ pub struct ScanProgress {
     pub elapsed_ms: u64,
 }
 
+/// `scan.start` 参数（契约 v1）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanStartParams {
+    pub device: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+/// `scan.status`/`scan.pause`/`scan.resume`/`scan.cancel` 参数（契约 v1）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskIdParams {
+    pub task_id: u64,
+}
+
+/// `scan.results` 参数（契约 v1）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanResultsParams {
+    pub task_id: u64,
+    pub offset: u64,
+    pub limit: u64,
+    #[serde(default)]
+    pub deleted_only: bool,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub jsonrpc: String,

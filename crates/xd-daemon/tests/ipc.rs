@@ -101,7 +101,8 @@ fn device_list_with_image() {
 #[test]
 fn unknown_method_returns_error_with_same_id() {
     let mut d = Daemon::start(&[]);
-    let resp = d.call(r#"{"jsonrpc":"2.0","id":9,"method":"scan.start","params":null}"#);
+    // M1b：`scan.start` 已路由（无 params 走 -32602）——改钉真正不存在的方法名。
+    let resp = d.call(r#"{"jsonrpc":"2.0","id":9,"method":"no.such.method","params":null}"#);
     assert_eq!(resp["id"], 9);
     assert_eq!(resp["error"]["code"], -32601);
 }

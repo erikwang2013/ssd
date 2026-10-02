@@ -8,6 +8,7 @@ mod privcheck;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use xd_core::api::{PROTOCOL_VERSION, Request, Response, RpcErr, RpcError};
 use xd_core::handlers::{CoreCtx, handle_request};
@@ -15,7 +16,7 @@ use xd_device::BlockDevice;
 use xd_device::image::ImageFileDevice;
 
 fn main() {
-    let mut devices: Vec<Box<dyn BlockDevice>> = Vec::new();
+    let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
     // 提权兜底路径（pkexec 以 root 拉起）的准入判定，见 docs/security/linux-privilege-model.md。一次 /proc 读。
     #[cfg(target_os = "linux")]
     let euid = privcheck::effective_uid();
@@ -58,7 +59,7 @@ fn main() {
                     }
                 }
                 match ImageFileDevice::open(&PathBuf::from(&path)) {
-                    Ok(dev) => devices.push(Box::new(dev)),
+                    Ok(dev) => devices.push(Arc::new(dev)),
                     Err(e) => {
                         eprintln!("error: cannot open image {path}: {e}");
                         std::process::exit(2);
@@ -72,7 +73,7 @@ fn main() {
                 };
                 #[cfg(target_os = "linux")]
                 match xd_device::linux::LinuxBlockDevice::open(&PathBuf::from(&path)) {
-                    Ok(dev) => devices.push(Box::new(dev)),
+                    Ok(dev) => devices.push(Arc::new(dev)),
                     Err(e) => {
                         eprintln!("error: cannot open device {path}: {e}");
                         std::process::exit(2);

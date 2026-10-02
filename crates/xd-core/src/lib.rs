@@ -4,4 +4,11 @@
 pub mod api;
 pub mod handlers;
 pub mod notify;
+pub mod scan_task;
 pub mod store;
+
+/// 扫描 worker 内部（仅 `crate::scan_task` 使用，公开 API 走 `scan_task`）。
+mod scan_worker;
+
+#[cfg(test)]
+pub(crate) mod testutil;

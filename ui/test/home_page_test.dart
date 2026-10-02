@@ -11,7 +11,7 @@ class FakeCoreClient implements CoreClient {
 
   @override
   Future<PingResult> ping() async =>
-      const PingResult(pong: true, version: 'test', protocol: 0);
+      const PingResult(pong: true, version: 'test', protocol: 1);
 
   @override
   Future<List<DeviceInfo>> listDevices() async => devices;
@@ -39,7 +39,7 @@ class FlakyCoreClient implements CoreClient {
 
   @override
   Future<PingResult> ping() async =>
-      const PingResult(pong: true, version: 'test', protocol: 0);
+      const PingResult(pong: true, version: 'test', protocol: 1);
 
   @override
   Future<List<DeviceInfo>> listDevices() async {

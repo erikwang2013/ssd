@@ -425,6 +425,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "xd-device",
+ "xd-fixtures",
+ "xd-fs-exfat",
+ "xd-fs-fat",
 ]
 
 [[package]]

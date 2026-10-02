@@ -80,7 +80,8 @@ fn error_response_matches_golden() {
         Response::Err(RpcErr {
             jsonrpc: "2.0".into(),
             id: serde_json::json!(7),
-            error: RpcError::method_not_found("scan.start"),
+            // M1b：`scan.start` 已路由，v0 golden 的必要修正（message 逐字改）——本测试随 golden 同步
+            error: RpcError::method_not_found("no.such.method"),
         })
     );
     assert_eq!(serde_json::to_value(&parsed).unwrap(), v);

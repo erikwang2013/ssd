@@ -1,27 +1,59 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! RPC 处理器：daemon（stdio）与 M4 的 ffi 共用同一入口。
 
+use std::sync::Arc;
+
 use xd_device::{BlockDevice, DeviceInfo};
 
-use crate::api::{PROTOCOL_VERSION, Request, Response, RpcError, err, ok};
+use crate::api::{
+    PROTOCOL_VERSION, Request, Response, RpcError, ScanResultsParams, ScanStartParams,
+    TaskIdParams, err, ok,
+};
+use crate::scan_task::{DeviceOpener, NoopOpener, OpenError, Resume, ScanError, ScanManager};
 
 pub struct CoreCtx {
-    devices: Vec<Box<dyn BlockDevice>>,
+    devices: Vec<Arc<dyn BlockDevice>>,
     /// 枚举到但**未打开**的设备（device.list 用；零 open()——M1e 契约要求）。
     list_only: Vec<DeviceInfo>,
+    scans: Arc<ScanManager>,
+    opener: Arc<dyn DeviceOpener>,
 }
 
 impl CoreCtx {
-    pub fn new(devices: Vec<Box<dyn BlockDevice>>) -> Self {
+    pub fn new(devices: Vec<Arc<dyn BlockDevice>>) -> Self {
         Self {
             devices,
             list_only: Vec::new(),
+            scans: Arc::new(ScanManager::new(
+                crate::store::Store::open_memory().expect("sqlite in-memory"),
+                Arc::new(|_| {}),
+            )),
+            opener: Arc::new(NoopOpener),
         }
     }
 
     pub fn with_list_only(mut self, infos: Vec<DeviceInfo>) -> Self {
         self.list_only = infos;
         self
+    }
+
+    /// daemon 注入：真 store（文件/内存）+ stdout 通知通道 + 平台 opener。
+    pub fn with_scan(mut self, scans: Arc<ScanManager>, opener: Arc<dyn DeviceOpener>) -> Self {
+        self.scans = scans;
+        self.opener = opener;
+        self
+    }
+
+    /// 解析 scan.start/resume 的设备：已打开优先；否则懒打开（唯一 open 出口）。
+    fn resolve_device(&self, id: &str) -> Result<Arc<dyn BlockDevice>, RpcError> {
+        if let Some(d) = self.devices.iter().find(|d| d.info().id == id) {
+            return Ok(d.clone());
+        }
+        match self.opener.open(id) {
+            Ok(d) => Ok(d),
+            Err(OpenError::PermissionDenied) => Err(RpcError::device_permission(id)),
+            Err(OpenError::Other(_)) => Err(RpcError::cannot_open(id)),
+        }
     }
 
     /// 双向 first-wins 去重：打开项在前，同 id 只留首个（含打开项内部双开——
@@ -49,7 +81,151 @@ pub fn handle_request(ctx: &CoreCtx, req: &Request) -> Response {
             }),
         ),
         "device.list" => ok(req, serde_json::json!({ "devices": ctx.device_infos() })),
+        "scan.start" => scan_start(ctx, req),
+        "scan.status" => scan_status(ctx, req),
+        "scan.results" => scan_results(ctx, req),
+        "scan.pause" => scan_pause(ctx, req),
+        "scan.resume" => scan_resume(ctx, req),
+        "scan.cancel" => scan_cancel(ctx, req),
         other => err(req, RpcError::method_not_found(other)),
+    }
+}
+
+fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, Response> {
+    // 注意：`RpcError::invalid_params(&str)` 是 M0 既有签名（输出 "Invalid params: {message}" 前缀）
+    match req.params.clone() {
+        Some(v) if !v.is_null() => serde_json::from_value(v)
+            .map_err(|_| err(req, RpcError::invalid_params("missing or malformed params"))),
+        _ => Err(err(
+            req,
+            RpcError::invalid_params("missing or malformed params"),
+        )),
+    }
+}
+
+fn scan_err(req: &Request, e: ScanError) -> Response {
+    match e {
+        ScanError::TaskNotFound(id) => err(req, RpcError::task_not_found(id)),
+        ScanError::TaskNotActive(id) => err(req, RpcError::task_not_active(id)),
+        ScanError::UnsupportedFs => err(req, RpcError::unsupported_fs()),
+        _ => err(req, RpcError::internal()),
+    }
+}
+
+fn scan_start(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: ScanStartParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if let Some(m) = &p.mode
+        && m != "quick"
+    {
+        return err(req, RpcError::invalid_params("unsupported mode"));
+    }
+    let dev = match ctx.resolve_device(&p.device) {
+        Ok(d) => d,
+        Err(e) => return err(req, e),
+    };
+    match ctx.scans.start(dev) {
+        Ok(s) => ok(
+            req,
+            serde_json::json!({
+                "taskId": s.task_id, "fs": s.fs.as_str(), "totalBytes": s.total_bytes,
+            }),
+        ),
+        Err(e) => scan_err(req, e),
+    }
+}
+
+fn scan_status(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: TaskIdParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match ctx.scans.status(p.task_id) {
+        Ok(t) => ok(
+            req,
+            serde_json::json!({
+                "taskId": t.id, "state": crate::store::state_str(t.state),
+                "readBytes": t.read_bytes, "foundCount": t.found_count, "elapsedMs": t.elapsed_ms,
+            }),
+        ),
+        Err(e) => scan_err(req, e),
+    }
+}
+
+fn scan_results(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: ScanResultsParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if !(1..=1000).contains(&p.limit) {
+        return err(req, RpcError::invalid_params("limit out of range 1..=1000")); // 契约
+    }
+    match ctx
+        .scans
+        .results(p.task_id, p.offset, p.limit, p.deleted_only)
+    {
+        Ok((total, entries)) => ok(
+            req,
+            serde_json::json!({ "total": total, "entries": entries }),
+        ),
+        Err(e) => scan_err(req, e),
+    }
+}
+
+fn scan_pause(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: TaskIdParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match ctx.scans.pause(p.task_id) {
+        Ok(()) => ok(
+            req,
+            serde_json::json!({ "taskId": p.task_id, "state": "paused" }),
+        ),
+        Err(e) => scan_err(req, e),
+    }
+}
+
+fn scan_resume(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: TaskIdParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match ctx.scans.resume(p.task_id) {
+        Ok(Resume::InPlace) => ok(
+            req,
+            serde_json::json!({ "taskId": p.task_id, "state": "scanning" }),
+        ),
+        Ok(Resume::NeedsDevice { device_id }) => {
+            let dev = match ctx.resolve_device(&device_id) {
+                Ok(d) => d,
+                Err(e) => return err(req, e),
+            };
+            match ctx.scans.restart(p.task_id, dev) {
+                Ok(()) => ok(
+                    req,
+                    serde_json::json!({ "taskId": p.task_id, "state": "scanning" }),
+                ),
+                Err(e) => scan_err(req, e),
+            }
+        }
+        Err(e) => scan_err(req, e),
+    }
+}
+
+fn scan_cancel(ctx: &CoreCtx, req: &Request) -> Response {
+    let p: TaskIdParams = match parse_params(req) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match ctx.scans.cancel(p.task_id) {
+        Ok(()) => ok(
+            req,
+            serde_json::json!({ "taskId": p.task_id, "state": "canceled" }),
+        ),
+        Err(e) => scan_err(req, e),
     }
 }
 
@@ -99,7 +275,7 @@ mod tests {
         f.write_all(&[0u8; 4096]).unwrap();
         f.flush().unwrap();
         let dev = ImageFileDevice::open(f.path()).unwrap();
-        let ctx = CoreCtx::new(vec![Box::new(dev)]);
+        let ctx = CoreCtx::new(vec![Arc::new(dev)]);
         let Response::Ok(ok) = handle_request(&ctx, &req(3, "device.list")) else {
             panic!()
         };
@@ -115,7 +291,7 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(&[0u8; 512]).unwrap();
         let img = ImageFileDevice::open(f.path()).unwrap();
-        let ctx = CoreCtx::new(vec![Box::new(img)]).with_list_only(vec![DeviceInfo {
+        let ctx = CoreCtx::new(vec![Arc::new(img)]).with_list_only(vec![DeviceInfo {
             id: "unix:/dev/sda".into(),
             name: "Disk".into(),
             kind: DeviceKind::Physical,
@@ -151,7 +327,7 @@ mod tests {
                 Ok(0)
             }
         }
-        let ctx = CoreCtx::new(vec![Box::new(Stub)]).with_list_only(vec![DeviceInfo {
+        let ctx = CoreCtx::new(vec![Arc::new(Stub)]).with_list_only(vec![DeviceInfo {
             id: "unix:/dev/sda".into(), // 与打开项同 id → 必须被去重
             name: "enumerated".into(),
             kind: DeviceKind::Physical,
@@ -178,8 +354,8 @@ mod tests {
                 Ok(0)
             }
         }
-        let mk = |name: &str| -> Box<dyn BlockDevice> {
-            Box::new(S(DeviceInfo {
+        let mk = |name: &str| -> Arc<dyn BlockDevice> {
+            Arc::new(S(DeviceInfo {
                 id: "unix:/dev/sda".into(),
                 name: name.into(),
                 kind: DeviceKind::Physical,
@@ -196,13 +372,14 @@ mod tests {
 
     #[test]
     fn unknown_method_returns_minus_32601() {
+        // M1b：`scan.start` 已是合法方法（无 params 会走 -32602）——本用例钉真正不存在的方法名。
         let ctx = CoreCtx::new(vec![]);
-        let Response::Err(e) = handle_request(&ctx, &req(7, "scan.start")) else {
+        let Response::Err(e) = handle_request(&ctx, &req(7, "no.such.method")) else {
             panic!()
         };
         assert_eq!(e.id, serde_json::json!(7));
         assert_eq!(e.error.code, -32601);
-        assert_eq!(e.error.message, "Method not found: scan.start");
+        assert_eq!(e.error.message, "Method not found: no.such.method");
     }
 
     #[test]
@@ -232,13 +409,351 @@ mod tests {
 
     #[test]
     fn error_round_trip_matches_response_golden() {
-        // err() 输出路径同样钉死（jsonrpc 字面量在 Err 分支独立存在）
+        // err() 输出路径同样钉死（jsonrpc 字面量在 Err 分支独立存在）。
+        // M1b：v0 golden 的 message 修正为 "no.such.method"（scan.start 已从"不存在"变"存在"）。
         let ctx = CoreCtx::new(vec![]);
-        let resp = handle_request(&ctx, &req(7, "scan.start"));
+        let resp = handle_request(&ctx, &req(7, "no.such.method"));
         let expected: serde_json::Value = serde_json::from_str(
             include_str!("../../../proto/v0/examples/error_method_not_found.response.json").trim(),
         )
         .unwrap();
         assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+    }
+
+    fn req_with(id: i64, method: &str, params: serde_json::Value) -> Request {
+        Request {
+            jsonrpc: "2.0".into(),
+            id: serde_json::json!(id),
+            method: method.into(),
+            params: Some(params),
+        }
+    }
+
+    fn ctx_with_fixture() -> (tempfile::NamedTempFile, CoreCtx) {
+        let (f, dev) = crate::testutil::exfat_fixture();
+        (f, CoreCtx::new(vec![dev]))
+    }
+
+    #[test]
+    fn scan_start_happy_then_status_results() {
+        let (_f, ctx) = ctx_with_fixture();
+        let dev_id = ctx.devices[0].info().id.clone();
+        let resp = handle_request(
+            &ctx,
+            &req_with(
+                3,
+                "scan.start",
+                serde_json::json!({"device": dev_id, "mode": "quick"}),
+            ),
+        );
+        let Response::Ok(ok) = resp else {
+            panic!("{:?}", resp)
+        };
+        assert_eq!(ok.result["fs"], "exfat");
+        assert_eq!(ok.result["taskId"], 1);
+        let total_bytes = ok.result["totalBytes"].as_u64().unwrap();
+        assert!(total_bytes > 0);
+        // 轮询到 completed（handler 级小图秒级）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let r = handle_request(
+                &ctx,
+                &req_with(4, "scan.status", serde_json::json!({"taskId": 1})),
+            );
+            let Response::Ok(o) = r else { panic!() };
+            if o.result["state"] == "completed" {
+                assert_eq!(o.result["foundCount"], 3);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "scan stuck: {o:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                5,
+                "scan.results",
+                serde_json::json!({"taskId": 1, "offset": 0, "limit": 10, "deletedOnly": true}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(o.result["total"], 1);
+        assert_eq!(o.result["entries"][0]["name"], "DEL_ME.JPG");
+        assert_eq!(o.result["entries"][0]["deleted"], true);
+        assert_eq!(o.result["entries"][0]["quality"], "complete");
+        // qual-t3 纵深防御：observer 1:1 ⇒ idx 集合恰为 0..found_count（防回调重复致库内双行）
+        let Response::Ok(all) = handle_request(
+            &ctx,
+            &req_with(
+                6,
+                "scan.results",
+                serde_json::json!({"taskId": 1, "offset": 0, "limit": 10}),
+            ),
+        ) else {
+            panic!()
+        };
+        let mut idxs: Vec<u64> = all.result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["idx"].as_u64().unwrap())
+            .collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![0, 1, 2], "idx 集合 == 0..found_count");
+    }
+
+    #[test]
+    fn scan_start_response_matches_golden_normalized() {
+        // taskId/totalBytes 是运行期值：与 v0.2.0 的 `<VERSION>` 归一化同款先例——把这两个键归一
+        // 为 golden 值（taskId→1、totalBytes→整卷字节）后全等比对，其余字段逐字钉死。
+        let (_f, ctx) = ctx_with_fixture();
+        let dev_id = ctx.devices[0].info().id.clone();
+        let size = ctx.devices[0].info().size_bytes;
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                3,
+                "scan.start",
+                serde_json::json!({"device": dev_id, "mode": "quick"}),
+            ),
+        ) else {
+            panic!()
+        };
+        let mut actual = serde_json::to_value(&o).unwrap();
+        assert_eq!(actual["result"]["totalBytes"], size);
+        actual["result"]["taskId"] = serde_json::json!(1);
+        actual["result"]["totalBytes"] = serde_json::json!(3907029168u64);
+        let expected: serde_json::Value = serde_json::from_str(
+            include_str!("../../../proto/v1/examples/scan_start.response.json").trim(),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn scan_start_permission_denied_maps_to_minus_32001() {
+        struct Denied;
+        impl crate::scan_task::DeviceOpener for Denied {
+            fn open(&self, _id: &str) -> Result<Arc<dyn BlockDevice>, crate::scan_task::OpenError> {
+                Err(crate::scan_task::OpenError::PermissionDenied)
+            }
+        }
+        let ctx = CoreCtx::new(vec![]).with_scan(
+            Arc::new(ScanManager::new(
+                crate::store::Store::open_memory().unwrap(),
+                Arc::new(|_| {}),
+            )),
+            Arc::new(Denied),
+        );
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                3,
+                "scan.start",
+                serde_json::json!({"device": "unix:/dev/sdb"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32001);
+        assert_eq!(e.error.message, "Device permission denied: unix:/dev/sdb");
+    }
+
+    #[test]
+    fn scan_start_unsupported_and_unknown_device() {
+        let (_f, zeros) = crate::testutil::dev_from_bytes(&[0u8; 4096]);
+        let ctx = CoreCtx::new(vec![zeros]);
+        let dev_id = ctx.devices[0].info().id.clone();
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(3, "scan.start", serde_json::json!({"device": dev_id})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32002);
+        let Response::Err(e2) = handle_request(
+            &ctx,
+            &req_with(
+                4,
+                "scan.start",
+                serde_json::json!({"device": "unix:/dev/nope"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e2.error.code, -32602);
+        assert_eq!(e2.error.message, "Cannot open device: unix:/dev/nope");
+    }
+
+    #[test]
+    fn scan_task_not_found_and_invalid_params() {
+        let ctx = CoreCtx::new(vec![]);
+        for m in ["scan.status", "scan.pause", "scan.resume", "scan.cancel"] {
+            let Response::Err(e) =
+                handle_request(&ctx, &req_with(9, m, serde_json::json!({"taskId": 42})))
+            else {
+                panic!()
+            };
+            assert_eq!(e.error.code, -32003, "{m}");
+            assert_eq!(e.error.message, "Task not found: 42");
+        }
+        let Response::Err(e) =
+            handle_request(&ctx, &req_with(9, "scan.start", serde_json::json!({})))
+        else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602, "缺 device");
+        // qual-t1 裁定 (c)：-32602 的 message 逐字钉前缀（reason 不属契约、前缀属之）
+        assert_eq!(
+            e.error.message,
+            "Invalid params: missing or malformed params"
+        );
+        let Response::Err(e2) = handle_request(
+            &ctx,
+            &req_with(
+                9,
+                "scan.results",
+                serde_json::json!({"taskId": 1, "offset": 0, "limit": 0}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e2.error.code, -32602, "limit=0 越契约");
+        assert_eq!(
+            e2.error.message,
+            "Invalid params: limit out of range 1..=1000"
+        );
+    }
+
+    #[test]
+    fn scan_pause_on_completed_task_is_not_active() {
+        use crate::api::ScanState;
+        use crate::store::Store;
+        let store = Store::open_memory().unwrap();
+        let id = store.create_task("image:x.img", "exfat", 1).unwrap();
+        store.set_state(id, ScanState::Completed).unwrap();
+        let ctx = CoreCtx::new(vec![]).with_scan(
+            Arc::new(ScanManager::new(store, Arc::new(|_| {}))),
+            Arc::new(NoopOpener),
+        );
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(9, "scan.pause", serde_json::json!({"taskId": id})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32004);
+        assert_eq!(e.error.message, format!("Task not active: {id}"));
+    }
+
+    #[test]
+    fn scan_response_goldens_round_trip() {
+        // 确定性构造：store 直接建任务/写进度/插条目（handler 只读路径），逐字对 golden。
+        use crate::store::Store;
+        let store = Store::open_memory().unwrap();
+        let id = store
+            .create_task("unix:/dev/sdb", "exfat", 3907029168)
+            .unwrap();
+        assert_eq!(id, 1);
+        store.set_progress(id, 123456, 42, 1500).unwrap();
+        let mut entries: Vec<crate::api::ScanEntry> = serde_json::from_str(
+            r#"[{"idx":0,"name":"IMG_0001.JPG","path":"/DCIM","ext":"jpg","sizeBytes":12000,"deleted":true,"isDir":false,"quality":"complete","firstCluster":6},
+                {"idx":1,"name":"READ_ME.TXT","path":"/","ext":"txt","sizeBytes":7,"deleted":false,"isDir":false,"quality":"complete","firstCluster":9}]"#,
+        )
+        .unwrap();
+        // golden 的 total=42 是「匹配总数」（分页语义）：补 40 条确定性填充使 COUNT(*) == 42；
+        // 前两条保持 golden 逐字（limit=2 只回这两条），计划初稿漏了填充（total 会变 2，对不上 golden）。
+        for i in 2..42u64 {
+            entries.push(crate::api::ScanEntry {
+                idx: i,
+                name: format!("FILLER_{i:02}.BIN"),
+                path: "/".into(),
+                ext: "bin".into(),
+                size_bytes: 0,
+                deleted: false,
+                is_dir: false,
+                quality: "complete".into(),
+                first_cluster: 0,
+            });
+        }
+        store.insert_entries(id, &entries).unwrap();
+        let ctx = CoreCtx::new(vec![]).with_scan(
+            Arc::new(ScanManager::new(store, Arc::new(|_| {}))),
+            Arc::new(NoopOpener),
+        );
+
+        let golden = |name: &str| -> serde_json::Value {
+            serde_json::from_str(match name {
+                "status" => {
+                    include_str!("../../../proto/v1/examples/scan_status.response.json").trim()
+                }
+                "results" => {
+                    include_str!("../../../proto/v1/examples/scan_results.response.json").trim()
+                }
+                _ => unreachable!(),
+            })
+            .unwrap()
+        };
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(4, "scan.status", serde_json::json!({"taskId": 1})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(serde_json::to_value(&o).unwrap(), golden("status"));
+        let Response::Ok(o2) = handle_request(
+            &ctx,
+            &req_with(
+                5,
+                "scan.results",
+                serde_json::json!({"taskId": 1, "offset": 0, "limit": 2, "deletedOnly": false}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(serde_json::to_value(&o2).unwrap(), golden("results"));
+    }
+
+    #[test]
+    fn device_list_v1_golden_round_trip() {
+        // 确定性构造：image 设备（transport 省略）+ list_only 物理设备（transport:"usb"）。
+        // 注意：真 ImageFileDevice 的 id 含绝对路径（`image:/tmp/…`），逐字对不上 golden 的
+        // `image:test.img`——用 info 桩（device.list 零 open，只读 info，语义等价）钉全等。
+        struct ImgStub;
+        impl BlockDevice for ImgStub {
+            fn info(&self) -> &DeviceInfo {
+                static I: std::sync::OnceLock<DeviceInfo> = std::sync::OnceLock::new();
+                I.get_or_init(|| DeviceInfo {
+                    id: "image:test.img".into(),
+                    name: "test.img".into(),
+                    kind: xd_device::DeviceKind::Image,
+                    size_bytes: 4096,
+                    removable: false,
+                    fs_guess: None,
+                    transport: None,
+                })
+            }
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, xd_device::DeviceError> {
+                Ok(0)
+            }
+        }
+        let ctx = CoreCtx::new(vec![Arc::new(ImgStub)]).with_list_only(vec![DeviceInfo {
+            id: "unix:/dev/sdb".into(),
+            name: "USB Disk".into(),
+            kind: xd_device::DeviceKind::Physical,
+            size_bytes: 3907029168,
+            removable: true,
+            fs_guess: None,
+            transport: Some("usb".into()),
+        }]);
+        let Response::Ok(o) = handle_request(&ctx, &req(2, "device.list")) else {
+            panic!()
+        };
+        let expected: serde_json::Value = serde_json::from_str(
+            include_str!("../../../proto/v1/examples/device_list.response.json").trim(),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&o).unwrap(), expected);
     }
 }
