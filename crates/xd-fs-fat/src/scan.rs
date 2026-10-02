@@ -199,6 +199,52 @@ fn grade_deleted(
     Ok(RecoverQuality::Complete)
 }
 
+/// 读取文件内容（恰好 size 字节；设备边界/坏读早停 → 返回短于 size 的前缀，不伪造）。
+/// 策略：存活文件顺 FAT 链读；删除项（FAT 已清，链属他人）或环/坏链 → 按连续簇回退。
+/// 注意：返回值只有字节——"是否走了连续假设"由 `entry.deleted` 推断（M1d UI 文案据此）。
+pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, FatError> {
+    if entry.size_bytes == 0 || entry.first_cluster < 2 {
+        return Ok(Vec::new());
+    }
+    let bpb = bpb::parse(dev)?;
+    let fat = Fat::new(dev, &bpb);
+    let size = entry.size_bytes as usize;
+    let need = (size as u32).div_ceil(bpb.cluster_bytes()) as usize;
+    let chain = fat.chain(entry.first_cluster).unwrap_or_default(); // 坏链 → 空 → 走连续回退
+    let looped = chain.len() as u32 > bpb.data_cluster_count(); // 合法簇仅 count 个：> count ⟺ 必含环
+    let clusters: Vec<u32> = if !entry.deleted && !looped && chain.len() >= need {
+        chain[..need].to_vec()
+    } else {
+        // 删除项（M1a 语义下其链必属他人——删除即清 FAT）或环/坏链：按连续假设读。
+        // 界与 grade_deleted 同源（count+1）；u64 累积防野生 first_cluster 的 u32 加法溢出（qual-t6 I4）。
+        let max_cluster = bpb.data_cluster_count() as u64 + 1;
+        let mut v = Vec::new();
+        let mut c = entry.first_cluster as u64;
+        while v.len() < need && c <= max_cluster {
+            v.push(c as u32);
+            c += 1;
+        }
+        v
+    };
+    let mut out = Vec::with_capacity(size);
+    let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
+    for c in clusters {
+        let n = match dev.read_at(bpb.cluster_to_byte(c), &mut buf) {
+            Ok(n) => n,
+            Err(_) => break, // 坏道/越界：保留已读前缀（与 scan 同规则，坏道跳过不中断）
+        };
+        if n == 0 {
+            break; // 该簇在设备外
+        }
+        out.extend_from_slice(&buf[..n]); // 短读 → 只收已读部分（不得拿上一簇残字节当数据）
+        if out.len() >= size || n < buf.len() {
+            break;
+        }
+    }
+    out.truncate(size);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +481,89 @@ mod tests {
             "jpg"
         );
         assert_eq!(entries.iter().find(|e| e.name == "NOEXT").unwrap().ext, "");
+    }
+
+    #[test]
+    fn reads_live_file_exactly() {
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "DATA.BIN", &data)
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "DATA.BIN").unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes, data);
+    }
+
+    #[test]
+    fn reads_deleted_file_via_contiguous_fallback() {
+        let data: Vec<u8> = (0..1200u32).map(|i| (i % 253) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &data)
+            .delete("/", "GONE.BIN")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.deleted).unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes, data); // 删除后 FAT 链已清 → 连续回退精确还原
+    }
+
+    #[test]
+    fn deleted_entry_ignores_reused_chain_reads_original() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &data)
+            .delete("/", "GONE.BIN")
+            .build();
+        let mut patched = image.clone();
+        // 模拟非连续复用：entry(2)=7、entry(7)=8、entry(8)=EOC（旧文件数据仍在簇 2,3）
+        patched[516..518].copy_from_slice(&7u16.to_le_bytes());
+        patched[526..528].copy_from_slice(&8u16.to_le_bytes());
+        patched[528..530].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.deleted).unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes, data); // 判据修正：删除项走连续回退而非他人链
+    }
+
+    #[test]
+    fn reads_exact_size_not_full_cluster() {
+        let data = b"short".to_vec(); // 5 字节 < 1 簇
+        let image = xd_fixtures::FatImageBuilder::fat32()
+            .add_file("/", "S.TXT", &data)
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "S.TXT").unwrap();
+        assert_eq!(read_file(&dev, e).unwrap(), data);
+    }
+
+    #[test]
+    fn wild_first_cluster_is_bounded_not_panic() {
+        // I4：u32 高位被污染的删除项（first_cluster≈0xFFFFFE00）→ 连续回退必须 u64 累积 +
+        // 同界截断，不得 u32 加法溢出 panic（旧 `(0..need).map(|i| first_cluster + i)` 在此 debug 溢出）
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "X.TXT", b"x")
+            .build();
+        let mut patched = image.clone();
+        // 扩大卷几何使 count+1 逼近 u32 上界（否则界本身先挡住溢出路径）
+        patched[19..21].copy_from_slice(&0u16.to_le_bytes()); // 16 位总数清零 → 走 32 位字段
+        patched[32..36].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let e = FatEntry {
+            name: "WILD.BIN".into(),
+            path: "/".into(),
+            size_bytes: 266_240, // need=520 ≥ u32::MAX - 0xFFFFFE00 + 1 = 513 → 旧实现必溢出
+            first_cluster: 0xFFFF_FE00,
+            deleted: true,
+            is_dir: false,
+            quality: RecoverQuality::MaybeDamaged,
+            ext: "bin".into(),
+        };
+        let bytes = read_file(&dev, &e).unwrap(); // 不得 panic
+        assert!(bytes.len() < 266_240, "界截断：不得越界读，也不得伪造");
     }
 }
