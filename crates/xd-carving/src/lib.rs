@@ -10,7 +10,9 @@
 
 pub mod crc32;
 mod jpeg;
+mod png;
 pub mod signatures;
 
 pub use jpeg::carve_jpeg;
+pub use png::carve_png;
 pub use signatures::{Carved, Cursor};
