@@ -3,6 +3,9 @@ import 'package:flutter/material.dart';
 import 'core_client/core_client.dart';
 import 'core_client/protocol.dart';
 
+/// 吉祥物资源路径（与应用图标同款形象的小盾）。
+const _mascotAsset = 'assets/xiaodun.png';
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key, required this.client});
 
@@ -30,12 +33,27 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('小盾 · 选择设备')),
+      appBar: AppBar(
+        leading: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Image.asset(_mascotAsset),
+        ),
+        title: const Text('小盾 · 选择设备'),
+      ),
       body: FutureBuilder<List<DeviceInfo>>(
         future: _devices,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator());
+            return const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Image(image: AssetImage(_mascotAsset), width: 96),
+                  SizedBox(height: 16),
+                  CircularProgressIndicator(),
+                ],
+              ),
+            );
           }
           if (snapshot.hasError) {
             return Center(
@@ -51,7 +69,21 @@ class _HomePageState extends State<HomePage> {
           }
           final devices = snapshot.data ?? const <DeviceInfo>[];
           if (devices.isEmpty) {
-            return const Center(child: Text('未发现设备'));
+            return const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Image(image: AssetImage(_mascotAsset), width: 128),
+                  SizedBox(height: 16),
+                  Text('未发现设备'),
+                  SizedBox(height: 6),
+                  Text(
+                    'M1 前可用 XD_IMAGE 注册镜像文件',
+                    style: TextStyle(fontSize: 12, color: Color(0xFF8B97AC)),
+                  ),
+                ],
+              ),
+            );
           }
           return ListView.separated(
             itemCount: devices.length,

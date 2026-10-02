@@ -1,5 +1,5 @@
 name: xiaodun_ui
-description: "A new Flutter project."
+description: "小盾（Xiaodun）· 跨平台数据恢复工具界面"
 publish_to: 'none'
 version: 0.1.0+1
 
@@ -17,3 +17,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/xiaodun.png
