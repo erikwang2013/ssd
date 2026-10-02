@@ -33,6 +33,10 @@ abstract class CoreClient {
   /// 服务端通知（无 id 行）：scan.progress/scan.finished/export.progress/export.finished。
   Stream<Map<String, dynamic>> get notifications;
 
+  /// EACCES（-32001）引导：以同一 daemon 路径/参数经 pkexec 重启，返回新 client
+  /// （旧进程由实现关闭）；不支持的实现返回 null（UI 不进提权重试路径）。
+  Future<CoreClient?> restartPrivileged();
+
   /// 释放底层资源（桌面实现：关闭 daemon 进程；测试 fake：空实现）。
   Future<void> close();
 }

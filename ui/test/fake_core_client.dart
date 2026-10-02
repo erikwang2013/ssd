@@ -67,6 +67,16 @@ class FakeCoreClient implements CoreClient {
   void emitNotification(Map<String, dynamic> message) =>
       _notifications.add(message);
 
+  /// EACCES（-32001）重试：记录一次特权重启，缺省返回自身（测试用 failWith
+  /// 计数控制首次 -32001，重试即成功）。真实 pkexec 路径未验证（需真机 polkit）。
+  CoreClient? privilegedClient;
+
+  @override
+  Future<CoreClient?> restartPrivileged() async {
+    calls.add('restartPrivileged()');
+    return privilegedClient ?? this;
+  }
+
   void _fail(String method) {
     final error = failWith?.call(method);
     if (error != null) throw error;

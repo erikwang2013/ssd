@@ -76,4 +76,30 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('未发现设备'), findsOneWidget);
   });
+
+  testWidgets('tapping a device opens the scan page (M1d T5)', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          client: FakeCoreClient(
+            devices: const [
+              DeviceInfo(
+                id: 'image:nav.img',
+                name: 'nav.img',
+                kind: 'image',
+                sizeBytes: 1024,
+                removable: false,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('nav.img'));
+    await tester.pumpAndSettle();
+    expect(find.text('nav.img'), findsOneWidget); // 扫描页 AppBar
+    expect(find.text('快速扫描'), findsOneWidget);
+    expect(find.text('开始扫描'), findsOneWidget);
+  });
 }

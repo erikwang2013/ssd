@@ -8,7 +8,11 @@ import 'protocol.dart';
 
 /// 桌面实现：spawn 特权 daemon，stdio 上每行一条 JSON-RPC 消息。
 class IpcCoreClient implements CoreClient {
-  IpcCoreClient._(this._process) {
+  IpcCoreClient._(
+    this._process, [
+    this._daemonPath,
+    this._extraArgs = const [],
+  ]) {
     _sub = _process.stdout
         .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
@@ -36,7 +40,7 @@ class IpcCoreClient implements CoreClient {
       extraArgs,
       environment: environment,
     );
-    return IpcCoreClient._(process);
+    return IpcCoreClient._(process, path, extraArgs);
   }
 
   /// pkexec 启动（EACCES 引导路径）：polkit 弹窗认证后以 root 拉起同参数 daemon。
@@ -46,10 +50,14 @@ class IpcCoreClient implements CoreClient {
     List<String> extraArgs = const [],
   }) async {
     final process = await Process.start('pkexec', [daemonPath, ...extraArgs]);
-    return IpcCoreClient._(process);
+    return IpcCoreClient._(process, daemonPath, extraArgs);
   }
 
   final Process _process;
+
+  /// 原始启动参数（restartPrivileged 以同参数重启）。
+  final String? _daemonPath;
+  final List<String> _extraArgs;
   late final StreamSubscription<String> _sub;
   final List<String> stderrLines = [];
   final Map<int, Completer<Map<String, dynamic>>> _pending = {};
@@ -189,6 +197,17 @@ class IpcCoreClient implements CoreClient {
   @override
   Future<void> exportCancel(int exportId) =>
       _call('export.cancel', {'exportId': exportId});
+
+  /// EACCES（-32001）重试路径：关掉当前（非特权）daemon，经 pkexec 以**原路径/
+  /// 原参数**重启并以 root 拉起；无原始路径（测试构造）时返回 null。
+  /// 真实 polkit 认证路径未验证（需真机 + 安装后的 policy 文件）。
+  @override
+  Future<CoreClient?> restartPrivileged() async {
+    final path = _daemonPath;
+    if (path == null) return null;
+    await close();
+    return startPrivileged(daemonPath: path, extraArgs: _extraArgs);
+  }
 
   /// 关闭 daemon（结束时调用，避免 UI 退出留下孤儿进程）。
   @override

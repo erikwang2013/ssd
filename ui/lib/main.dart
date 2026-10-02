@@ -28,10 +28,17 @@ Future<void> main() async {
   runApp(XiaodunApp(client: client));
 }
 
-class XiaodunApp extends StatelessWidget {
+class XiaodunApp extends StatefulWidget {
   const XiaodunApp({super.key, required this.client});
 
   final CoreClient client;
+
+  @override
+  State<XiaodunApp> createState() => _XiaodunAppState();
+}
+
+class _XiaodunAppState extends State<XiaodunApp> {
+  late CoreClient _client = widget.client;
 
   @override
   Widget build(BuildContext context) {
@@ -41,7 +48,11 @@ class XiaodunApp extends StatelessWidget {
         colorSchemeSeed: const Color(0xFF2E6BE6),
         useMaterial3: true,
       ),
-      home: HomePage(client: client),
+      // EACCES 引导：扫描页特权重启客户端后，后续页面一律换用新 client。
+      home: HomePage(
+        client: _client,
+        onClientReplaced: (client) => setState(() => _client = client),
+      ),
     );
   }
 }
@@ -105,6 +116,9 @@ class _MissingDaemonClient implements CoreClient {
 
   @override
   Stream<Map<String, dynamic>> get notifications => const Stream.empty();
+
+  @override
+  Future<CoreClient?> restartPrivileged() async => null;
 
   @override
   Future<void> close() async {}
