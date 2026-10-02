@@ -223,6 +223,9 @@ impl ScanManager {
     }
 
     /// 恢复：worker 在场 → 解除驻停；不在场（daemon 重启）→ NeedsDevice 交由 handlers 重开设备。
+    /// 窄窗注记（qual-t5 参考）：cancel 置态后、worker unwind 前，resume 可能瞬时返回
+    /// InPlace/scanning；store 已被 `set_state_if_active` 护栏固定在 canceled——地面真相一致，
+    /// 窗口极小，刻意不改（不可确定性测试）。
     pub fn resume(&self, id: u64) -> Result<Resume, ScanError> {
         if let Some((ctrl, running, _)) = self.active_of(id)
             && running.load(Ordering::SeqCst)
@@ -301,6 +304,36 @@ mod tests {
         assert_eq!(del.quality, "complete");
         let (dtotal, dpage) = m.results(s.task_id, 0, 10, true).unwrap();
         assert_eq!((dtotal, dpage.len()), (1, 1));
+    }
+
+    #[test]
+    fn fat_path_smoke_run_worker_and_fat_to_entry_mapping() {
+        // FsKind::Fat 生产路径的唯一覆盖：probe 判型 → run_worker Fat 臂 → fat_to_entry 映射 → store 回读。
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "FAT_A.TXT", b"hello")
+            .build();
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        assert_eq!(probe(&*dev).unwrap(), FsKind::Fat);
+        let m = mgr();
+        let s = m.start(dev).unwrap();
+        assert_eq!(s.fs, FsKind::Fat);
+        let row = wait_for_state(&m, s.task_id, ScanState::Completed, Duration::from_secs(10));
+        assert_eq!(row.found_count, 1);
+        let (total, page) = m.results(s.task_id, 0, 10, false).unwrap();
+        assert_eq!((total, page.len()), (1, 1));
+        let e = &page[0];
+        assert_eq!(e.name, "FAT_A.TXT");
+        assert_eq!(e.path, "/");
+        assert_eq!(e.ext, "txt", "fat_to_entry: ext 小写");
+        assert_eq!(e.size_bytes, 5, "size_bytes 透传夹具内容长度");
+        assert_eq!(
+            e.first_cluster, 2,
+            "夹具首簇（FAT16 固定根目录区之外的最低空闲簇）"
+        );
+        assert!(!e.deleted);
+        assert!(!e.is_dir);
+        assert_eq!(e.quality, "complete");
+        assert_eq!(e.idx, 0);
     }
 
     #[test]
