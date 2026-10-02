@@ -5,6 +5,7 @@
 pub mod bpb;
 pub mod dirent;
 pub mod fat;
+pub mod scan;
 
 /// 引擎统一错误类型。
 #[derive(Debug)]
