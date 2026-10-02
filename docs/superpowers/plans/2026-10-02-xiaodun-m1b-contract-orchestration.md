@@ -2551,14 +2551,14 @@ bash scripts/e2e.sh
 
 ## 执行记录
 
-### T1（契约 v1）—— impl-m1b-t1，提交 `d67a858`，DONE_WITH_CONCERNS
+### T1（契约 v1）—— impl-m1b-t1。提交沿革：`d67a858`（首版）→ `3fa947f`（终版，含裁定落地与发现⑤）→ `f5ec631`（水印头修复）；事故详见第 8 条。DONE_WITH_CONCERNS → spec 评审 **PASS**
 
 门禁：229 passed（+12）/ clippy clean / fmt clean / flutter +18~1（新 9，skip=无 XD_DAEMON_BIN 的既有 ipc_integration）/ analyze clean / release 档 exit 0。golden 21 个用 awk 从计划提取后 `diff -r` 逐字节比对（0 差异）。
 
 实施者发现 5 条（含 2 条计划自身缺陷），lead 裁定：
 
-1. **`xd-daemon/tests/ipc.rs:79` protocol 0→1**（计划排在 T5，与 T1 全绿门禁冲突）——**批准 T1 内改**；机械波及同 Step 5.5。T5 Step 7 Rust 部分就此完成。
-2. **`xd-core/tests/contract.rs:47`**（v0 ping 用例用活常量构造期望值；Step 5.5 与 T5 Step 7 的 grep 都漏）——**批准**：期望值改封存字面量 0 + 注释（v0 是历史快照；活契约往返由 contract_v1.rs/handlers v1 用例承担），保住「当前类型仍能 decode/re-encode v0 文件」的兼容路径。
+1. **`xd-daemon/tests/ipc.rs`（:80）protocol 0→1**（计划排在 T5 且行号写 :79，与 T1 全绿门禁冲突）——**批准 T1 内改**；机械波及同 Step 5.5。T5 Step 7 Rust 部分就此完成。
+2. **`xd-core/tests/contract.rs`（:50）**（v0 ping 用例用活常量构造期望值；Step 5.5 与 T5 Step 7 的 grep 都漏）——**批准**：期望值改封存字面量 0 + 注释（v0 是历史快照；活契约往返由 contract_v1.rs/handlers v1 用例承担），保住「当前类型仍能 decode/re-encode v0 文件」的兼容路径。
 3. **T5 Step 1 重复定义三个错误构造器**（计划文本自冲突）——已删 T5 处代码块（六个全在 T1）。
 4. **文件结构注误把 ScanStartParams 归 T1**——已改注（params 归 T5，T1 未提前添加，正确）。
 5. **`linux.rs::open_with_sysfs` 是第 2 个 DeviceInfo 构造点**（计划计数错；`--device` 打开行 `transport: None`）——接受的后果：先开行在 device.list first-wins 去重时遮蔽枚举行的 transport。**裁定：升级路径（canonicalize sysfs → classify_transport，~3 行）延后到 M1d**（UI 真正显示 transport 时才有一致性诉求），记入 M1d 前置清单。
@@ -2569,6 +2569,12 @@ bash scripts/e2e.sh
 7. **发现⑤提前关闭**：`open_with_sysfs` 的 transport 经 `sysfs_transport()`（canonicalize class/block/<name> → classify_transport）与 device.list 同源；测试 `sysfs_transport_classifies_and_none_when_missing`（确定性假 sysfs 根）。M1d 计划对应前置项撤销（已回改 M1d 计划注释：遗留的是"复核"而非"实现"）。
 8. **git 事故（已恢复，如实记录）**：impl 的 amend 与 lead 的 docs 提交竞态——第一次 amend 卷入 lead 已 staged 的 4 份计划文档（悬空 d39dbef），修复后再次 amend 时又把 lead 已提交的 feb43d4（docs）`reset --soft` 撤回（内容零丢失，回工作树）。恢复：在终版 3fa947f 上重建 docs 提交（bd8f54b）+ `push --force-with-lease` 对齐远端（远端曾含悬空链，全部为自家提交、内容有本地副本）。**管线纪律更新（已写入团队管线记忆）**：代理永不 push、永不 amend/rebase/reset（修复轮一律追加提交）；lead 是唯一 push 者；lead 发"授权后续修改"消息前须确认自己不再动 git（本次竞态根因）。
 9. **lead 对齐抽查（T2 前）**：T1 落地后的 `api.rs` 里 `RpcError::invalid_params(&str)` 是 M0 原形（带参、输出 `Invalid params: {message}` 前缀），T5 计划原稿有 4 处无参调用会编译失败——计划已同步为带参调用（`"missing or malformed params"` / `"unsupported mode"` / `"limit out of range 1..=1000"`）；-32602 无 golden、文案前缀随各调用点，v1 README 不钉死文案 ✓。
+
+**spec 评审（spec-m1b-t1）——结论 PASS**（对 `3fa947f`；悬空 `d67a858` 仅作对照快照）。关键证据：21 golden 从计划 heredoc 独立重提取三方逐字节全等（并验证 heredoc 自 `837f7f8` 未变）；独立探针 `/tmp/di-probe` 18/18（六构造器文案逐字、transport None 无键/Some 有键、ScanEntry 无 byteOffset、通知信封）；门禁亲跑 230 passed/0 failed/0 ignored、CI 等价 `XD_DAEMON_BIN` 下 flutter +19 全过 0 skip；5 条发现复核全部成立、无报告出入。非阻断发现及处置：
+
+- **A（已修，`f5ec631`）**：`notify.rs:1` 字面 `// WATERMARK` 占位（全仓唯一无水印头 .rs；`apply-copyright.sh` prepend 式不会清它）→ 按「head -1 现文件」逐字节置换真水印头 + `cmp` 验证 + 零行为变化复跑。**纪律遵守：追加提交、未 amend、未 push。**
+- **B（本次订正）**：记录标题 SHA 与行号漂移（`:47→:50`、`:79→:80`、Dart `:34→:36`）已在上文修正。
+- provenance 对 api.rs 已过期——按 Task 9 Step 3 约定归发版时重签，非 T1 门禁（仅记录）。
 
 ---
 
