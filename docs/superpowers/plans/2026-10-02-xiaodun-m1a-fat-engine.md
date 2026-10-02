@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_file_has_0xE5_and_freed_fat() {
+    fn deleted_file_has_0xe5_and_freed_fat() {
         let image = FatImageBuilder::fat16()
             .add_file("/", "A.BIN", &[1u8; 1000])
             .delete("/", "A.BIN")
@@ -112,7 +112,7 @@ mod tests {
             .delete("/", "OLD.BIN")
             .add_file("/", "NEW.BIN", &[9u8; 1024]) // 复用 2..3
             .build();
-        let old = image.windows(32).position(|w| &w[1..5] == b"LD.B").unwrap();
+        let old = image.windows(32).position(|w| &w[1..5] == b"LD  ").unwrap();
         assert_eq!(image[old], 0xE5);
         // 第一个数据簇现在属于 NEW.BIN：NEW 目录项 first_cluster == 2
         let new = image.windows(32).position(|w| &w[..7] == b"NEW    ").unwrap();
@@ -187,7 +187,7 @@ impl FatImageBuilder {
         const ROOT_START: u32 = FAT_START + FAT_SIZE; // 5
         const ROOT_SECTORS: u32 = 32;
         const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 37
-        const MAX_CLUSTER: u32 = 2 + (TOTAL_SECTORS - DATA_START) / 1; // spc=1
+        const MAX_CLUSTER: u32 = 2 + (TOTAL_SECTORS - DATA_START); // spc=1
 
         let mut image = vec![0u8; (TOTAL_SECTORS * BPS) as usize];
 
