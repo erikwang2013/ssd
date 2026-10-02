@@ -8,7 +8,9 @@
 //! 填充重判、其它 `FF xx` = 新记号（**回段循环**——渐进式 JPEG 多次 SOS 合法）→
 //! `FF D9` = EOI（**完整**）。**未过 SOS 即 EOI = 无图像数据的空壳 → 假阳性拒绝（None）**；
 //! 非法记号/段长越界/结构破裂 → 截断（`complete=false`，len=已耗字节）；到 `max_len` 或
-//! run 界（游标 None）→ 诚实截断。
+//! run 界（游标 None）→ 诚实截断。**`max_len` 是返回值的硬上限**（唯一出口归一：任何路径
+//! `len ≤ max_len`；EOI 恰好跨上限即降级为截断——`complete=false, len=max_len`），
+//! 且 FF 填充循环逐轮检查上限（不被长填充区拖着读穿）。
 //!
 //! **扫描器契约承重（T6 carver.rs）：** 本函数可返回 `len=0` 的截断（SOI 后立刻破结构），
 //! 扫描器必须**无论裁决结果至少推进签名长度**（JPEG=3 字节），否则在原地打转；
@@ -19,8 +21,22 @@ use crate::signatures::{Carved, Cursor};
 const MAX_SEGMENT: u32 = 1024 * 1024; // 单段上限（防长度字段攻击；合法 JPEG 段远小于此）
 
 /// 从 SOI 起重组。`cur` 已定位在 SOI（FFD8FF 已被签名层确认前 3 字节）。
-/// `max_len`：重组上限（超出 → 截断）。
+/// `max_len`：重组**硬上限**——任何返回路径 `len ≤ max_len`，越限即诚实截断（`complete=false`）。
 pub fn carve_jpeg(cur: &mut Cursor<'_>, max_len: u64) -> Option<Carved> {
+    let c = walk(cur, max_len)?;
+    // 单一出口归一（硬上限唯一执法点）：越限的完整裁决（EOI 跨上限）降级为截断
+    Some(if c.len > max_len {
+        Carved {
+            len: max_len,
+            complete: false,
+        }
+    } else {
+        c
+    })
+}
+
+/// 走链主体。返回点的 len 语义见 `carve_jpeg`（上限归一由出口统一执法）。
+fn walk(cur: &mut Cursor<'_>, max_len: u64) -> Option<Carved> {
     let start = cur.pos;
     if cur.u8()? != 0xFF || cur.u8()? != 0xD8 {
         return None;
@@ -56,6 +72,13 @@ pub fn carve_jpeg(cur: &mut Cursor<'_>, max_len: u64) -> Option<Carved> {
                 });
             };
             m = b;
+            // 上限逐轮检查：长填充区不得拖着读穿（返回值的上限由出口归一兜底）
+            if cur.pos - start >= max_len {
+                return Some(Carved {
+                    len: max_len.min(cur.pos - start),
+                    complete: false,
+                });
+            }
         }
         match m {
             0xD9 => {
@@ -294,5 +317,32 @@ mod tests {
         let r = carve_all(&dev, 0, img.len() as u64, 64 << 20).unwrap();
         assert!(r.complete, "{r:?}");
         assert_eq!(r.len, j.len() as u64, "多次 SOS 全链重组长度精确");
+    }
+
+    #[test]
+    fn cap_split_across_eoi_truncates_hard() {
+        // cap=44，mini_jpeg(0)（45B）的 EOI 第二字节恰落在 45：EOI 未能在上限内收束
+        // → 硬上限归一降级为截断（无归一则返回 len=45/complete=true）
+        let j = xd_fixtures::mini_jpeg(0);
+        assert_eq!(j.len(), 45, "构型前提：EOI 在 44..45");
+        let mut img = vec![0u8; 64];
+        img[..j.len()].copy_from_slice(&j);
+        let (_f, dev) = dev_for(&img);
+        let r = carve_all(&dev, 0, img.len() as u64, 44).unwrap();
+        assert!(!r.complete && r.len == 44, "EOI 跨上限必须硬截断：{r:?}");
+    }
+
+    #[test]
+    fn cap_bounds_ff_fill_run() {
+        // cap=4096 + 100k 个 FF 填充后非法记号：返回硬限 4096，且填充循环上限即停
+        // （无逐轮检查则游标读穿 100k 填充区；无出口归一则返回 len=100004）
+        let mut img = vec![0xFFu8; 3 + 100_000 + 1];
+        img[1] = 0xD8; // img[2]=FF 即签名第三字节
+        img[3 + 100_000] = 0xD8; // 白名单外 → 非法记号
+        let (_f, dev) = dev_for(&img);
+        let mut cur = Cursor::new(&dev, 0, img.len() as u64);
+        let r = carve_jpeg(&mut cur, 4096).unwrap();
+        assert!(!r.complete && r.len == 4096, "填充长跑不得突破上限：{r:?}");
+        assert_eq!(cur.pos, 4096, "填充循环必须上限即停");
     }
 }
