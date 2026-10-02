@@ -13,7 +13,7 @@
 4. **导出报告**：完成通知带计数 + **降级/失败条目清单**（≤1000，截断置 `itemsTruncated`）；成功条目不回传（UI 从计数展示）——避免十万条通知爆流。
 5. UI 文案铁律（(a) 裁定后的准确表述）：删除+连续（exFAT）= 规范保证；删除+非连续 = 按删除链、可能不完整；**不得对任何条目称"连续假设"**；雕刻件 = "仅雕刻 · 可能不完整"；VDL 未初始化区不预览不导出（引擎已保证）。
 6. `file_selector`（官方）与 `rustix`（目标盘校验/降权）为本切片新增依赖。
-7. **承接 M1b T1 发现⑤**：`linux.rs::open_with_sysfs`（`--device` 打开路径）的 `transport` 补齐（canonicalize sysfs → `classify_transport`，~3 行）——本切片 UI 开始展示 transport，纳入 T1 顺带完成（先开行会遮蔽枚举行的 transport）。
+7. **承接 M1b T1 发现⑤（已提前关闭）**：`open_with_sysfs` 的 `transport` 归类已在 M1b T1 终版（`3fa947f`）随 `sysfs_transport()` 完成并有测试；本切片只需在 UI 展示 transport 时**复核**一致性（先开行与枚举行同源），无实现工作。
 
 **前置：** M1b（契约 v1/scan_task/store）、M1c（carving/深扫/检查点）已合入。
 

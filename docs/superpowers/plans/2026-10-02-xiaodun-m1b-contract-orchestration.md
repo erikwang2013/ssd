@@ -2563,6 +2563,12 @@ bash scripts/e2e.sh
 4. **文件结构注误把 ScanStartParams 归 T1**——已改注（params 归 T5，T1 未提前添加，正确）。
 5. **`linux.rs::open_with_sysfs` 是第 2 个 DeviceInfo 构造点**（计划计数错；`--device` 打开行 `transport: None`）——接受的后果：先开行在 device.list first-wins 去重时遮蔽枚举行的 transport。**裁定：升级路径（canonicalize sysfs → classify_transport，~3 行）延后到 M1d**（UI 真正显示 transport 时才有一致性诉求），记入 M1d 前置清单。
 
+**T1 终版补记（`3fa947f`，34 文件，Rust 230 / flutter +19 全过 0 skip）**：
+
+6. **contingency 被触发**：CI（ci.yml:70-71）设了 `XD_DAEMON_BIN`，`ui/test/ipc_integration_test.dart:34` 会真起 daemon 打红 → 按预先授权改为 1（仅此一处；`protocol.dart` 与其它断言仍归 T5）。**里程碑门禁清单补 `dart format --check`**（ci.yml:66 既有闸，此前不在清单）。
+7. **发现⑤提前关闭**：`open_with_sysfs` 的 transport 经 `sysfs_transport()`（canonicalize class/block/<name> → classify_transport）与 device.list 同源；测试 `sysfs_transport_classifies_and_none_when_missing`（确定性假 sysfs 根）。M1d 计划对应前置项撤销（已回改 M1d 计划注释：遗留的是"复核"而非"实现"）。
+8. **git 事故（已恢复，如实记录）**：impl 的 amend 与 lead 的 docs 提交竞态——第一次 amend 卷入 lead 已 staged 的 4 份计划文档（悬空 d39dbef），修复后再次 amend 时又把 lead 已提交的 feb43d4（docs）`reset --soft` 撤回（内容零丢失，回工作树）。恢复：在终版 3fa947f 上重建 docs 提交（bd8f54b）+ `push --force-with-lease` 对齐远端（远端曾含悬空链，全部为自家提交、内容有本地副本）。**管线纪律更新（已写入团队管线记忆）**：代理永不 push、永不 amend/rebase/reset（修复轮一律追加提交）；lead 是唯一 push 者；lead 发"授权后续修改"消息前须确认自己不再动 git（本次竞态根因）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
