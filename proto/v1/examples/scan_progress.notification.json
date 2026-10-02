@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"scan.progress","params":{"taskId":1,"state":"scanning","readBytes":123456,"foundCount":42,"elapsedMs":1500}}

@@ -76,7 +76,8 @@ fn ping_over_stdio() {
     let resp = d.call(r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":null}"#);
     assert_eq!(resp["id"], 1);
     assert_eq!(resp["result"]["pong"], true);
-    assert_eq!(resp["result"]["protocol"], 0);
+    // M1b：协议号 0→1 的机械波及（同 T1 Step 5.5 的 ping golden 改指；计划的 T5 Step 7 原列此项）
+    assert_eq!(resp["result"]["protocol"], 1);
 }
 
 #[test]

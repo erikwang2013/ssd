@@ -32,6 +32,7 @@ impl ImageFileDevice {
                 size_bytes: meta.len(),
                 removable: false,
                 fs_guess: None,
+                transport: None, // 镜像无运输类型（契约：缺失=未知）
             },
             file: Mutex::new(file),
         })

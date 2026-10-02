@@ -7,7 +7,7 @@ pub mod linux;
 
 use serde::{Deserialize, Serialize};
 
-/// 设备信息（IPC 契约类型，JSON 用 camelCase，见 proto/v0/README.md）。
+/// 设备信息（IPC 契约类型，JSON 用 camelCase，见 proto/v0/README.md 与 proto/v1/README.md）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
@@ -17,6 +17,10 @@ pub struct DeviceInfo {
     pub size_bytes: u64,
     pub removable: bool,
     pub fs_guess: Option<String>,
+    /// 运输类型（v1）：`usb|mmc|nvme|sata|virtio|other`；缺失 = 未知（镜像恒缺），
+    /// 序列化省略 null 键——v0 golden 与既有输出不受影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -122,6 +122,7 @@ mod tests {
             size_bytes: 1 << 40,
             removable: false,
             fs_guess: None,
+            transport: None,
         }]);
         let infos = ctx.device_infos();
         assert_eq!(infos.len(), 2);
@@ -143,6 +144,7 @@ mod tests {
                     size_bytes: 42,
                     removable: false,
                     fs_guess: None,
+                    transport: None,
                 })
             }
             fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, DeviceError> {
@@ -156,6 +158,7 @@ mod tests {
             size_bytes: 42,
             removable: false,
             fs_guess: None,
+            transport: None,
         }]);
         let infos = ctx.device_infos();
         assert_eq!(infos.len(), 1);
@@ -183,6 +186,7 @@ mod tests {
                 size_bytes: 42,
                 removable: false,
                 fs_guess: None,
+                transport: None,
             }))
         };
         let infos = CoreCtx::new(vec![mk("first"), mk("second")]).device_infos();
@@ -206,9 +210,10 @@ mod tests {
         // 走真实输出路径：请求 golden → handle_request → 与响应 golden 全等（含 jsonrpc 字段）。
         // version 是随发布变动的动态值：golden 存 "<VERSION>" 占位，先把实际值归一为占位再全等比对，
         // 然后单独断言实际值 == 本 crate 版本——golden 跨发布稳定，发版不再改契约文件（v0.2.0 注）。
+        // M1b：当前协议为 v1（protocol=1），改指 proto/v1 golden；v0 golden 封存不再参与本断言。
         let ctx = CoreCtx::new(vec![]);
         let req: Request = serde_json::from_str(
-            include_str!("../../../proto/v0/examples/ping.request.json").trim(),
+            include_str!("../../../proto/v1/examples/ping.request.json").trim(),
         )
         .unwrap();
         let resp = handle_request(&ctx, &req);
@@ -219,7 +224,7 @@ mod tests {
         );
         actual["result"]["version"] = serde_json::Value::String("<VERSION>".into());
         let expected: serde_json::Value = serde_json::from_str(
-            include_str!("../../../proto/v0/examples/ping.response.json").trim(),
+            include_str!("../../../proto/v1/examples/ping.response.json").trim(),
         )
         .unwrap();
         assert_eq!(actual, expected);

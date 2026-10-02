@@ -47,7 +47,27 @@ impl RawDisk {
             size_bytes: self.size_bytes,
             removable: self.removable,
             fs_guess: None, // device.list 零 open()；FS 探测归 M1b 按需调用
+            transport: Some(transport_str(self.transport).to_string()),
         }
+    }
+}
+
+/// sysfs class 目录 → 契约 transport 字符串；解析/归类失败 → None（契约：缺失=未知）。
+/// `--device` 路径（open_with_sysfs）与 device.list 同源归类——同一块盘两处行不再分歧。
+fn sysfs_transport(sysfs_root: &Path, kernel_name: &str) -> Option<String> {
+    let real = std::fs::canonicalize(sysfs_root.join("class/block").join(kernel_name)).ok()?;
+    Some(transport_str(classify_transport(&real.to_string_lossy())).to_string())
+}
+
+/// 运输类型 → 契约字符串（值域见 proto/v1/README.md）。
+fn transport_str(t: Transport) -> &'static str {
+    match t {
+        Transport::Usb => "usb",
+        Transport::Mmc => "mmc",
+        Transport::Nvme => "nvme",
+        Transport::Virtio => "virtio",
+        Transport::Sata => "sata",
+        Transport::Other => "other",
     }
 }
 
@@ -260,6 +280,7 @@ impl LinuxBlockDevice {
                 size_bytes,
                 removable,
                 fs_guess: None,
+                transport: sysfs_transport(sysfs_root, &kernel_name), // 与 device.list 同源归类
             },
             file,
         })
@@ -374,6 +395,36 @@ mod tests {
     fn parse_entry_zero_size_is_none() {
         let root = fake_sysfs(&[("loop0", "", 0, false, None, false)]);
         assert!(parse_disk_entry(&root.path().join("class/block"), "loop0").is_none());
+    }
+
+    #[test]
+    fn sysfs_transport_classifies_and_none_when_missing() {
+        // 假根路径含 /usb（classify_transport 为纯字符串判定）→ 确定性验证
+        // canonicalize → classify_transport → 契约字符串 全链；缺失条目 → None。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("usb1");
+        std::fs::create_dir_all(root.join("class/block/sda")).unwrap();
+        assert_eq!(sysfs_transport(&root, "sda").as_deref(), Some("usb"));
+        assert_eq!(sysfs_transport(&root, "nope"), None);
+    }
+
+    #[test]
+    fn transport_str_covers_contract_values() {
+        // 契约值域（proto/v1/README.md）：usb|mmc|nvme|sata|virtio|other，逐变体不遗漏
+        for (t, s) in [
+            (Transport::Usb, "usb"),
+            (Transport::Mmc, "mmc"),
+            (Transport::Nvme, "nvme"),
+            (Transport::Virtio, "virtio"),
+            (Transport::Sata, "sata"),
+            (Transport::Other, "other"),
+        ] {
+            assert_eq!(transport_str(t), s);
+        }
+        let root = fake_sysfs(&[("sdb", "USB Disk", 1000, true, None, false)]);
+        let mut d = parse_disk_entry(&root.path().join("class/block"), "sdb").unwrap();
+        d.transport = Transport::Usb;
+        assert_eq!(d.device_info().transport.as_deref(), Some("usb"));
     }
 
     #[test]

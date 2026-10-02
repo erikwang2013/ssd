@@ -40,11 +40,14 @@ fn ping_response_matches_golden() {
         "ping.response.json 的 version 必须为 \"<VERSION>\" 占位"
     );
     v["result"]["version"] = serde_json::Value::String(env!("CARGO_PKG_VERSION").into());
+    // protocol 写字面量 0：v0 已封存，golden 是历史快照，不随 PROTOCOL_VERSION（现为 1）变动；
+    // 本测试只验证当前类型仍能原样 decode/re-encode v0 文件（v1 的活契约往返见 contract_v1.rs
+    // 与 handlers.rs 的 v1 ping 用例）。
     let parsed: Response = serde_json::from_value(v.clone()).unwrap();
     let expected = Response::Ok(RpcOk {
         jsonrpc: "2.0".into(),
         id: serde_json::json!(1),
-        result: serde_json::json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL_VERSION}),
+        result: serde_json::json!({"pong": true, "version": env!("CARGO_PKG_VERSION"), "protocol": 0}),
     });
     assert_eq!(parsed, expected);
     assert_eq!(serde_json::to_value(&expected).unwrap(), v);

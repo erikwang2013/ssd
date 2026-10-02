@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":5,"result":{"total":42,"entries":[{"idx":0,"name":"IMG_0001.JPG","path":"/DCIM","ext":"jpg","sizeBytes":12000,"deleted":true,"isDir":false,"quality":"complete","firstCluster":6},{"idx":1,"name":"READ_ME.TXT","path":"/","ext":"txt","sizeBytes":7,"deleted":false,"isDir":false,"quality":"complete","firstCluster":9}]}}
