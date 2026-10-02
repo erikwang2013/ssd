@@ -90,3 +90,7 @@ user namespace（userns 内的 root 无宿主 CAP_DAC_OVERRIDE，读不了宿主
 - [ ] `euid==0` 参数防御：`pkexec /usr/libexec/xiaodun/xd-daemon --image <他人文件>` → exit 2
       且打印属主不符；`--image <符号链接>` → 打开失败；`--image <fifo>` → 不挂死。
 - [ ] 真 U 盘删除照片全链路恢复（对真实介质，非环回）。
+- [ ] 真机扫描全链路长跑（M1b 起）：真 U 盘/相机卡上启动快速扫描——观察 ①`scan.progress` 到达节奏
+      （≥250ms 或 ≥1MiB 节流）②暂停后磁盘读停（iotop/`/proc/<pid>/io` 冻结）③取消后 `scan.finished
+      state=canceled` 且 daemon stderr 无 panic 噪声 ④`--db` 库落 XDG 路径、重启 daemon 后结果可查
+      ⑤大介质（≥32GB）进度百分比为真百分比（readBytes/totalBytes）而非假动。
