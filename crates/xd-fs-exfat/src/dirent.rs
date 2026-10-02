@@ -272,6 +272,16 @@ mod tests {
     }
 
     #[test]
+    fn live_set_with_mismatched_checksum_is_still_listed() {
+        // live 不设校验门槛：只坏校验和、不坏结构 → 仍列出且 checksum_ok=false（删除侧相反，硬门槛）
+        let mut root = fixture_root();
+        root[SET_OFF + 8] ^= 0xFF; // A.TXT 主项时间戳字节
+        let d = parse_directory_bytes(&root, CB);
+        let a = d.entries.iter().find(|e| e.name == "A.TXT").unwrap();
+        assert!(!a.checksum_ok && !a.deleted, "live 不设门槛：仍须列出");
+    }
+
+    #[test]
     fn parses_deleted_set_with_full_name() {
         // exFAT 红利：删除后名字一字不差（对比 FAT 的 0xE5 首字符丢失）
         let d = parse_directory_bytes(&fixture_root(), CB);
@@ -286,7 +296,8 @@ mod tests {
     fn deleted_set_with_overwritten_byte_is_dropped() {
         let mut root = fixture_root();
         // 覆写删除项名字的某一字节（模拟槽位复用）→ 还原校验必失败 → 丢弃
-        let name_byte = SET_OFF + 3 * 32 + 2 + 3 * 2; // 第二套件（0xC1）名字第 2 个码元低字节
+        // G.BIN 集槽 6..8、名字槽 8（=SET_OFF+5*32）；第 4 个码元（k=3）低字节
+        let name_byte = SET_OFF + 5 * 32 + 2 + 3 * 2;
         root[name_byte] ^= 0xFF;
         let d = parse_directory_bytes(&root, CB);
         assert!(
@@ -324,6 +335,20 @@ mod tests {
         let img = ExfatImageBuilder::new().add_file("/", name, b"x").build();
         let d = parse_directory_bytes(root_of(&img), CB);
         assert_eq!(d.entries[0].name, name);
+        assert!(!d.entries[0].name_verified, "非 ASCII 跳过校验");
+    }
+
+    #[test]
+    fn lowercase_name_verifies_via_upcase() {
+        let img = ExfatImageBuilder::new()
+            .add_file("/", "readme.txt", b"x")
+            .build();
+        let d = parse_directory_bytes(root_of(&img), CB);
+        assert_eq!(d.entries[0].name, "readme.txt");
+        assert!(
+            d.entries[0].name_verified,
+            "小写名经上转型后 NameHash 必须验证通过"
+        );
     }
 
     #[test]
@@ -378,13 +403,13 @@ mod tests {
             .build();
         let root = root_of(&img);
         let set: Vec<u8> = root[SET_OFF..SET_OFF + 3 * 32].to_vec();
-        // 对照组：偏移 0 处放同一项集 → 可解析
+        // 对照组：偏移 0 处放同一项集 → 可解析（恰在簇尾结束的集亦被接受——spec 探针）
         let mut ok = vec![0u8; 2 * CB];
         ok[..96].copy_from_slice(&set);
         assert_eq!(parse_directory_bytes(&ok, CB).entries.len(), 1);
-        // 实验组：项集起始于簇边界前 80 字节（96 字节集必跨界）→ 必须拒绝
-        let mut bad = vec![0u8; 2 * CB];
-        let at = CB - 80;
+        // 实验组：0x01 填充 + 槽对齐偏移（4032）——扫描须真正抵达项集，96 字节集必跨界
+        let mut bad = vec![0x01u8; 2 * CB];
+        let at = CB - 64;
         bad[at..at + 96].copy_from_slice(&set);
         assert!(
             parse_directory_bytes(&bad, CB).entries.is_empty(),
