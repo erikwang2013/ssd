@@ -118,6 +118,31 @@ mod tests {
         let new = image.windows(32).position(|w| &w[..7] == b"NEW    ").unwrap();
         assert_eq!(u16::from_le_bytes([image[new + 26], image[new + 27]]), 2);
     }
+
+    #[test]
+    fn empty_file_builds_without_panic() {
+        let image = FatImageBuilder::fat16().add_file("/", "EMPTY.TXT", b"").build();
+        let de = image.windows(32).position(|w| w[0] == b'E' && &w[8..11] == b"TXT").unwrap();
+        assert_eq!(u32::from_le_bytes([image[de + 28], image[de + 29], image[de + 30], image[de + 31]]), 0);
+        assert_eq!(u16::from_le_bytes([image[de + 26], image[de + 27]]), 2); // 仍占 1 簇
+    }
+
+    #[test]
+    fn deletion_timing_respected() {
+        let img = FatImageBuilder::fat16()
+            .add_file("/", "IMG.JPG", &[7u8; 500])   // 簇 2
+            .add_file("/", "READ.TXT", b"keep me")   // 簇 3
+            .delete("/", "IMG.JPG")                  // 删除发生在两个 add 之后
+            .build();
+        // 照片字节仍在簇 2（未被后续文件覆盖）；数据区首字节 = 50*512
+        let data_start = 50usize * 512;
+        assert_eq!(&img[data_start..data_start + 4], &[7u8; 4]);
+        // READ.TXT 在簇 3
+        let rd = img.windows(32).position(|w| &w[..8] == b"READ    ").unwrap();
+        assert_eq!(u16::from_le_bytes([img[rd + 26], img[rd + 27]]), 3);
+        // IMG 的 FAT 链未写（已释放）
+        assert_eq!(u16::from_le_bytes([img[512 + 4], img[512 + 5]]), 0);
+    }
 }
 ```
 
@@ -142,8 +167,9 @@ struct BuildFile {
     dir: String,          // "/" 或 "/SUB"（T1 仅 "/"）
     name: [u8; 11],       // 8.3 原始名（大写、空格填充）
     data: Vec<u8>,
-    deleted: bool,
-    first_cluster: u32,   // build() 时分配
+    /// Some(时刻)：在该时刻（= delete() 调用时的 files.len()）释放其簇；None = 存活。
+    /// 按真实时序释放，保证「先建后删」的文件各自可恢复。
+    deleted_at: Option<usize>,
 }
 
 pub struct FatImageBuilder {
@@ -160,20 +186,20 @@ impl FatImageBuilder {
             dir: dir.to_string(),
             name: encode_sfn(name),
             data: data.to_vec(),
-            deleted: false,
-            first_cluster: 0,
+            deleted_at: None,
         });
         self
     }
 
     pub fn delete(&mut self, dir: &str, name: &str) -> &mut Self {
         let target = encode_sfn(name);
+        let now = self.files.len();
         let f = self
             .files
             .iter_mut()
-            .find(|f| !f.deleted && f.dir == dir && f.name == target)
+            .find(|f| f.deleted_at.is_none() && f.dir == dir && f.name == target)
             .expect("delete: file not found");
-        f.deleted = true;
+        f.deleted_at = Some(now);
         self
     }
 
@@ -185,54 +211,61 @@ impl FatImageBuilder {
         //  50..    数据区（簇 N → 扇区 50 + (N-2)，共 4174 簇）
         const FAT_START: u32 = 1;
         const FAT_SIZE: u32 = 17;
-        const ROOT_START: u32 = FAT_START + FAT_SIZE; // 5
+        const ROOT_START: u32 = FAT_START + FAT_SIZE; // 18
         const ROOT_SECTORS: u32 = 32;
-        const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 37
+        const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 50
         const MAX_CLUSTER: u32 = 2 + (TOTAL_SECTORS - DATA_START); // spc=1
 
         let mut image = vec![0u8; (TOTAL_SECTORS * BPS) as usize];
 
-        // ---- 分配簇（最低空闲优先；删除释放后会被后续文件复用）----
+        // FAT[0]=媒体描述符、FAT[1]=EOC（合规要求）
+        let fat0 = (FAT_START * BPS) as usize;
+        image[fat0..fat0 + 2].copy_from_slice(&0xFFF8u16.to_le_bytes());
+        image[fat0 + 2..fat0 + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+
+        // ---- 分配簇（最低空闲优先；删除按真实时序释放：在分配文件 i 前，
+        // 先释放所有 deleted_at == Some(i) 的文件簇 → 只有删除之后的文件才会复用）----
         let mut next_free: Vec<u32> = (2..MAX_CLUSTER).collect();
-        let mut placed: Vec<(u32, u32, bool, Vec<u8>, usize)> = Vec::new(); // (first,count,deleted,data,file_idx)
+        let mut placed: Vec<(Vec<u32>, Vec<u8>, usize)> = Vec::new(); // (clusters, data, file_idx)
         for (i, f) in self.files.iter().enumerate() {
-            let count = ((f.data.len() as u32) + BPS - 1).max(1) / BPS;
+            for (clusters, _data, fi) in placed.iter() {
+                if self.files[*fi].deleted_at == Some(i) {
+                    for &c in clusters {
+                        next_free.push(c);
+                    }
+                }
+            }
+            next_free.sort_unstable();
+            let count = (f.data.len() as u32).div_ceil(BPS).max(1);
             let take: Vec<u32> = next_free.drain(..count as usize).collect();
-            let first = take[0];
-            if !f.deleted {
+            if f.deleted_at.is_none() {
                 // 存活文件写 FAT 链（末簇 EOC=0xFFFF）；删除文件不写链（已释放）
                 for (j, &c) in take.iter().enumerate() {
                     let entry_off = (FAT_START * BPS + c * 2) as usize;
                     let value: u16 = if j + 1 == take.len() { 0xFFFF } else { take[j + 1] as u16 };
                     image[entry_off..entry_off + 2].copy_from_slice(&value.to_le_bytes());
                 }
-            } else {
-                // 释放：把簇还回空闲池（插回列表低端以模拟"优先复用"）
-                for c in take.iter().rev() {
-                    next_free.insert(0, *c);
-                }
             }
-            placed.push((first, count, f.deleted, f.data.clone(), i));
+            placed.push((take, f.data.clone(), i));
         }
 
         // ---- 写数据 ----
-        for (first, count, _, data, _) in &placed {
-            let start = (DATA_START * BPS + (first - 2) * BPS) as usize;
-            let _ = count;
+        for (clusters, data, _) in &placed {
+            let start = (DATA_START * BPS + (clusters[0] - 2) * BPS) as usize;
             image[start..start + data.len()].copy_from_slice(data);
         }
 
         // ---- 根目录项（32B 槽；删除项首字节 0xE5）----
         let mut slot = ROOT_START * BPS;
-        for (first, _count, deleted, data, idx) in &placed {
+        for (clusters, data, idx) in &placed {
             let f = &self.files[*idx];
             let mut entry = [0u8; 32];
             entry[..11].copy_from_slice(&f.name);
-            if *deleted {
+            if f.deleted_at.is_some() {
                 entry[0] = 0xE5;
             }
             entry[11] = 0x20; // ATTR_ARCHIVE
-            entry[26..28].copy_from_slice(&(*first as u16).to_le_bytes());
+            entry[26..28].copy_from_slice(&(clusters[0] as u16).to_le_bytes());
             entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
             image[slot as usize..slot as usize + 32].copy_from_slice(&entry);
             slot += 32;
@@ -289,7 +322,7 @@ pub fn encode_sfn(name: &str) -> [u8; 11] {
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test -p xd-fixtures`
-Expected: 3 passed。
+Expected: 5 passed。
 
 - [ ] **Step 6: Commit**
 
@@ -412,6 +445,24 @@ impl FatImageBuilder {
         let max_cluster = 2 + (total_sectors - data_start);
         let mut image = vec![0u8; (total_sectors * BPS) as usize];
 
+        // FAT[0]=媒体描述符、FAT[1]=EOC（三种类型各自的表项宽度）
+        match self.fat_type {
+            FatType::Fat12 => {
+                set_fat12(&mut image, fat_start, 0, 0xFF8);
+                set_fat12(&mut image, fat_start, 1, 0xFFF);
+            }
+            FatType::Fat16 => {
+                let o = (fat_start * BPS) as usize;
+                image[o..o + 2].copy_from_slice(&0xFFF8u16.to_le_bytes());
+                image[o + 2..o + 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+            }
+            FatType::Fat32 => {
+                let o = (fat_start * BPS) as usize;
+                image[o..o + 4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes());
+                image[o + 4..o + 8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+            }
+        }
+
         // 空闲簇池（最低优先）。FAT32 的根目录占簇 2，先从池中划走。
         let mut next_free: Vec<u32> = (2..max_cluster).collect();
         let root_cluster_actual = if root_cluster >= 2 { next_free.remove(0) } else { 0 };
@@ -421,12 +472,21 @@ impl FatImageBuilder {
             dir_clusters.push((d.clone(), next_free.remove(0)));
         }
 
-        // 分配文件簇（最低空闲优先：删除释放的簇会被后续文件复用）
-        let mut placed: Vec<(u32, u32, bool, Vec<u8>, usize)> = Vec::new();
+        // 分配文件簇（最低空闲优先；删除按真实时序释放：分配文件 i 前先释放
+        // deleted_at == Some(i) 的文件簇 → 只有删除之后的文件才会复用）
+        let mut placed: Vec<(Vec<u32>, Vec<u8>, usize)> = Vec::new();
         for (i, f) in self.files.iter().enumerate() {
-            let count = ((f.data.len() as u32) + BPS - 1).max(1) / BPS;
+            for (clusters, _data, fi) in placed.iter() {
+                if self.files[*fi].deleted_at == Some(i) {
+                    for &c in clusters {
+                        next_free.push(c);
+                    }
+                }
+            }
+            next_free.sort_unstable();
+            let count = (f.data.len() as u32).div_ceil(BPS).max(1);
             let take: Vec<u32> = next_free.drain(..count as usize).collect();
-            if !f.deleted {
+            if f.deleted_at.is_none() {
                 for (j, &c) in take.iter().enumerate() {
                     if self.fat_type == FatType::Fat12 {
                         let value: u32 = if j + 1 == take.len() { 0xFFF } else { take[j + 1] };
@@ -444,15 +504,13 @@ impl FatImageBuilder {
                         }
                     }
                 }
-            } else {
-                for c in take.iter().rev() { next_free.insert(0, *c); }
             }
-            placed.push((take[0], count, f.deleted, f.data.clone(), i));
+            placed.push((take, f.data.clone(), i));
         }
 
         // 写文件数据
-        for (first, _, _, data, _) in &placed {
-            let start = (data_start * BPS + (first - 2) * BPS) as usize;
+        for (clusters, data, _) in &placed {
+            let start = (data_start * BPS + (clusters[0] - 2) * BPS) as usize;
             image[start..start + data.len()].copy_from_slice(data);
         }
 
@@ -466,13 +524,13 @@ impl FatImageBuilder {
             image[slot..slot + 32].copy_from_slice(&e);
             slot += 32;
         }
-        for (first, _, deleted, data, idx) in &placed {
+        for (clusters, data, idx) in &placed {
             if self.files[*idx].dir != "/" { continue; }
             let mut e = [0u8; 32];
             e[..11].copy_from_slice(&self.files[*idx].name);
-            if *deleted { e[0] = 0xE5; }
+            if self.files[*idx].deleted_at.is_some() { e[0] = 0xE5; }
             e[11] = 0x20;
-            e[26..28].copy_from_slice(&(*first as u16).to_le_bytes());
+            e[26..28].copy_from_slice(&(clusters[0] as u16).to_le_bytes());
             e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
             image[slot..slot + 32].copy_from_slice(&e);
             slot += 32;
@@ -493,13 +551,13 @@ impl FatImageBuilder {
             e[26..28].copy_from_slice(&(parent_cluster as u16).to_le_bytes());
             image[base + 32..base + 64].copy_from_slice(&e);
             let mut off = base + 64;
-            for (first, _, deleted, data, fi) in &placed {
+            for (clusters, data, fi) in &placed {
                 if self.files[*fi].dir != format!("/{dir}") { continue; }
                 let mut e = [0u8; 32];
                 e[..11].copy_from_slice(&self.files[*fi].name);
-                if *deleted { e[0] = 0xE5; }
+                if self.files[*fi].deleted_at.is_some() { e[0] = 0xE5; }
                 e[11] = 0x20;
-                e[26..28].copy_from_slice(&(*first as u16).to_le_bytes());
+                e[26..28].copy_from_slice(&(clusters[0] as u16).to_le_bytes());
                 e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
                 image[off..off + 32].copy_from_slice(&e);
                 off += 32;
