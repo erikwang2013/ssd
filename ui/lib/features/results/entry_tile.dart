@@ -26,11 +26,15 @@ const Color kQualityCarvedColor = Color(0xFF546E7A);
   if (!e.deleted) return null; // live：质量由徽标呈现
   return switch (e.contiguous) {
     // exFAT NoFatChain：连续是规范保证，quality 完整 = 位图逐簇空闲
-    true => (text: '已删除 · 簇未被占用（完整性高）', color: kQualityCompleteColor),
+    // quality != complete（maybeDamaged/未知档）= 位图证据不足或簇已被占 → 不得称完整性高
+    true when e.quality == 'complete' => (
+      text: '已删除 · 簇未被占用（完整性高）',
+      color: kQualityCompleteColor,
+    ),
     // exFAT 走删除链（stale）：首个被占用/断裂簇即诚实短交付
     false => (text: '已删除 · 按删除链恢复，可能不完整', color: kQualityDamagedColor),
-    // fat / 迁移前旧行 / 未知：拓扑无契约证据，不替引擎宣称
-    null => (text: '已删除 · 恢复质量见分级', color: Color(0xFF8B97AC)),
+    // fat / 迁移前旧行 / 未知，及 true 但质量非 complete 的保守兜底：不替引擎宣称
+    _ => (text: '已删除 · 恢复质量见分级', color: Color(0xFF8B97AC)),
   };
 }
 

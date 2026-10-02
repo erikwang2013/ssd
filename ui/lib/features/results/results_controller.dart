@@ -89,6 +89,8 @@ class ResultsController extends ChangeNotifier {
     _state = ResultsUiState.loading;
     _error = null;
     _loadMoreError = null;
+    // 陈旧 loadMore 提前 return 时靠此行避免卡 spinner——隐式耦合：
+    // 增量在途期间发生重置，加载指示须随重置一起归零（loadMore 的 gen 守卫不再回写）。
     _loadingMore = false;
     _loaded.clear();
     _total = 0;

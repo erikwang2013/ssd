@@ -3,10 +3,13 @@
 // deletedOnly 重置分页并清选择 / 客户端质量过滤（只作用已加载集合，loadMore 增量扩大，
 // 服务端 offset 取已加载数）/ 多选与导航参数 / 五组铁律文案 + 禁词 grep 断言 /
 // 空态与失败重试（RpcException 只显示 message）。
+import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xiaodun_ui/core_client/core_client.dart';
 import 'package:xiaodun_ui/core_client/protocol.dart';
 import 'package:xiaodun_ui/features/preview/preview_page.dart';
 import 'package:xiaodun_ui/features/recover/recover_page.dart';
@@ -80,6 +83,91 @@ Future<FakeCoreClient> pumpResults(
 /// 滚动触底（拖拽量远超总高，位置停在 maxScrollExtent → 必越过 80% 阈值）。
 Future<void> dragToBottom(WidgetTester tester) async {
   await tester.drag(find.byType(ListView), const Offset(0, -100000));
+  await flush(tester);
+}
+
+// ↓↓ G1：`_generation` 竞态守卫的回归网（自 qual-m1d-t6 探针 pagination_probe_test.dart
+// 移植 P8a/P8b + 脚本化 ProbeClient；本文件自带 helper，仅移植探针特有的部分）。
+typedef PageFn = Future<ScanResultsPage> Function(
+  int offset,
+  int limit,
+  bool deletedOnly,
+);
+
+class ProbeClient implements CoreClient {
+  ProbeClient(this.script);
+  final List<PageFn> script;
+  final List<({int taskId, int offset, int limit, bool deletedOnly})> queries =
+      [];
+
+  @override
+  Future<ScanResultsPage> scanResults(
+    int taskId, {
+    int offset = 0,
+    int limit = 200,
+    bool deletedOnly = false,
+  }) {
+    queries.add((
+      taskId: taskId,
+      offset: offset,
+      limit: limit,
+      deletedOnly: deletedOnly,
+    ));
+    final i = math.min(queries.length - 1, script.length - 1);
+    return script[i](offset, limit, deletedOnly);
+  }
+
+  @override
+  Future<PingResult> ping() async => throw UnimplementedError();
+  @override
+  Future<List<DeviceInfo>> listDevices() async => throw UnimplementedError();
+  @override
+  Future<ScanStartResult> scanStart(
+    String device, {
+    String mode = 'quick',
+  }) async => throw UnimplementedError();
+  @override
+  Future<ScanStatusResult> scanStatus(int taskId) async =>
+      throw UnimplementedError();
+  @override
+  Future<void> scanPause(int taskId) async {}
+  @override
+  Future<void> scanResume(int taskId) async {}
+  @override
+  Future<void> scanCancel(int taskId) async {}
+  @override
+  Future<FsReadResult> fsRead(
+    int taskId,
+    int idx, {
+    int offset = 0,
+    int length = 1048576,
+  }) async => throw UnimplementedError();
+  @override
+  Future<ExportStartResult> exportStart(
+    int taskId,
+    List<int> idxs,
+    String targetDir,
+  ) async => throw UnimplementedError();
+  @override
+  Future<void> exportCancel(int exportId) async {}
+  @override
+  Stream<Map<String, dynamic>> get notifications => const Stream.empty();
+  @override
+  Future<CoreClient?> restartPrivileged() async => null;
+  @override
+  Future<void> close() async {}
+}
+
+Future<void> pumpWith(
+  WidgetTester tester,
+  CoreClient client, {
+  int taskId = 7,
+}) async {
+  await tester.pumpWidget(
+    MaterialApp(
+      home: ResultsPage(client: client, taskId: taskId),
+    ),
+  );
   await flush(tester);
 }
 
@@ -217,11 +305,12 @@ void main() {
       client: FakeCoreClient(entries: manyEntries(5)),
       taskId: 3,
     );
-    await tester.longPress(find.text('IMG_0002.jpg'));
+    // 降序点选（插入序 4 → 2 ≠ 排序序）→ 导航参数必须是 [2, 4]
+    await tester.longPress(find.text('IMG_0004.jpg'));
     await flush(tester);
     expect(find.text('恢复所选 (1)'), findsOneWidget);
 
-    await tester.tap(find.text('IMG_0004.jpg'));
+    await tester.tap(find.text('IMG_0002.jpg'));
     await flush(tester);
     expect(find.text('恢复所选 (2)'), findsOneWidget);
 
@@ -395,7 +484,10 @@ void main() {
       label: '仅雕刻',
       color: const Color(0xFF546E7A),
     ));
-    expect(qualityBadgeFor('futureValue').label, '可能损坏');
+    expect(qualityBadgeFor('futureValue'), (
+      label: '可能损坏',
+      color: const Color(0xFFE65100),
+    ));
   });
 
   test('质量文案纯函数：五条铁律与兜底档', () {
@@ -425,5 +517,69 @@ void main() {
       isNull,
       reason: 'live 由徽标呈现，不加删除/雕刻语境文案',
     );
+  });
+
+  test('F1：删除+连续+maybeDamaged 不得称「完整性高」（徽标已示可能损坏）', () {
+    final damaged = entryQualityNote(
+      entry(idx: 6, deleted: true, contiguous: true, quality: 'maybeDamaged'),
+    );
+    expect(
+      damaged?.text,
+      '已删除 · 恢复质量见分级',
+      reason: '质量非 complete 时 true 臂必须落保守臂',
+    );
+    expect(damaged?.color, isNot(kQualityCompleteColor));
+    expect(
+      entryQualityNote(
+        entry(idx: 7, deleted: true, contiguous: true, quality: 'futureGrade'),
+      )?.text,
+      '已删除 · 恢复质量见分级',
+      reason: '未知档同样保守（前向兼容）',
+    );
+  });
+
+  testWidgets('P8a reload 竞态：过期响应（旧代）不得覆盖新过滤结果', (t) async {
+    final c0 = Completer<ScanResultsPage>();
+    final c = ProbeClient([
+      (o, l, d) => c0.future,
+      (o, l, d) async =>
+          ScanResultsPage(total: 1, entries: [entry(idx: 99, deleted: true)]),
+    ]);
+    await pumpWith(t, c);
+    await t.tap(find.widgetWithText(FilterChip, '仅删除'));
+    await flush(t);
+    expect(find.text('IMG_0099.jpg'), findsOneWidget);
+    c0.complete(ScanResultsPage(total: 1, entries: [entry(idx: 1)])); // 旧请求迟到
+    await flush(t);
+    expect(find.text('IMG_0001.jpg'), findsNothing, reason: '旧代响应必须被丢弃');
+    expect(find.text('IMG_0099.jpg'), findsOneWidget);
+    await unload(t);
+  });
+
+  testWidgets('P8b loadMore 竞态：在途增量响应跨过滤切换必须丢弃', (t) async {
+    final stale = Completer<ScanResultsPage>();
+    final c = ProbeClient([
+      (o, l, d) async => ScanResultsPage(total: 450, entries: manyEntries(200)),
+      (o, l, d) => stale.future,
+      (o, l, d) async => ScanResultsPage(
+        total: 450,
+        entries: List.generate(
+          200,
+          (i) => entry(idx: 1000 + i, name: 'FRESH_$i.jpg', deleted: true),
+        ),
+      ),
+    ]);
+    await pumpWith(t, c);
+    await dragToBottom(t); // loadMore 在途（挂起）
+    expect(find.text('已加载 200 / 共 450 项'), findsOneWidget);
+    await t.tap(find.widgetWithText(FilterChip, '仅删除'));
+    await flush(t);
+    expect(find.textContaining('FRESH_'), findsWidgets);
+    expect(find.text('IMG_0000.jpg'), findsNothing, reason: '旧集合已被 reload 替换');
+    stale.complete(ScanResultsPage(total: 450, entries: [entry(idx: 777)]));
+    await flush(t);
+    expect(find.text('IMG_0777.jpg'), findsNothing, reason: '跨过滤切换的在途增量必须丢弃');
+    expect(c.queries.length, 3);
+    await unload(t);
   });
 }

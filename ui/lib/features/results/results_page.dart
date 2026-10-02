@@ -2,7 +2,9 @@
 // 结果浏览页：服务端分页（idx 序）+ 客户端质量过滤 + 多选；条目行见 entry_tile.dart。
 //
 // 文案铁律（widget 测试逐条断言；源码禁词整串零出现由 results_page_test.dart 的 grep 断言把关）：
-// 1. 已删除 + 拓扑连续（exFAT NoFatChain，contiguous == true）→「已删除 · 簇未被占用（完整性高）」；
+// 1. 已删除 + 拓扑连续（exFAT NoFatChain，contiguous == true）且 quality == complete
+//    →「已删除 · 簇未被占用（完整性高）」；true 但质量非 complete（位图证据不足/簇已被占）
+//    一律落兜底保守文案，不得称完整性高（qual-m1d-t6 F1 门控）；
 // 2. 已删除 + 非连续（contiguous == false）→「已删除 · 按删除链恢复，可能不完整」；
 // 3. 任何文案不得对拓扑作出未经证实的断言（禁词为四字「连…假设」组合，测试运行时拼接构造）；
 // 4. 雕刻件 → 仅「仅雕刻 · 可能不完整」，subtitle 不含路径（path 恒空）；
