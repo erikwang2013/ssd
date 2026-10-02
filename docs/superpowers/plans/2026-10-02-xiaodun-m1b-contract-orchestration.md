@@ -755,6 +755,8 @@ git commit -m "feat(fs): 两引擎 scan_with_observer 流式回调（后序/终�
 - Modify: `crates/xd-fs-exfat/src/read.rs`（头注 + `read_file` 早分支 + 删旧回退块 + 两探针测试）
 - Modify: `crates/xd-fs-exfat/src/scan.rs`（`grade_deleted` 重写 + 一个分级测试）
 
+> **执行后同步（重要——本任务实现含三道追加界卫，代码以仓库为准）**：计划原稿只有「链不足 need 永不 Complete」。执行中经 impl 自抓 + spec/qual 三轮，`read_file`（deleted 早分支、live 链式分支）与 `grade_deleted`（非连续臂）落成**三道诚实性界卫**：①可达界卫（起点越界或 `need > max_cluster - fc + 1` → 空 / MaybeDamaged）；②链前缀回访检测（环/回折自证伪：deleted → 空交付，live → 截断至首回访点——**刻意不对称**，证据权威论）；③live 回访扫描界 `min(need, len)`（性能）。完整裁定链与变异实证见文末执行记录 T4。下方 Step 2/3 代码块为裁定前原稿，**以仓库 `read.rs`/`scan.rs` 现状为规格**。
+
 - [ ] **Step 1: read.rs —— 头注更新（第 2-7 行替换）**
 
 ```rust
@@ -2623,6 +2625,17 @@ bash scripts/e2e.sh
 - **qual 变异表（8 条）**：前序化/透传断链/降级前回调 **双引擎全 KILL**；**重复回调 6a/6b KILL**（精确序列断言已覆盖"每条目恰一次"——T5 `found_count` 虚增风险在引擎层已守）；`scan()` 内联 = 等价变异（观察者 noop 不可观测）；fat 卷标项不进回调流 = 语义差但裁定可接受 → **已补 `observer_stream_matches_table_with_volume_label`**（1:1 计数，真实盘必走路径；质询者亲验双态：干净绿/变异红——该测为 qual 自验代码，落码后免复审增量，理由记录于此）。
 - **质量裁定**：`&mut dyn FnMut(&Entry)` 保留（收益=公共签名不泄类型参数；探问词"递归单态化"论据不成立，qual 纠正，源码无此措辞）；fat 8 参不抽 context struct（exfat 9 参先例；参数全为穿透借用）；头注"后序/终值"与实现逐条一致且对 T5 承重。
 - **T5 纵深防御（已入计划）**：集成测试断言 `results` 的 idx 集合 == `0..found_count`。
+
+### T4（(a) 裁定 + 三道诚实性界卫）—— impl-m1b-t4。提交沿革：`15d8481`（(a) 落码）→ `f680e93`（可达界卫）→ `d100766`（deleted 前缀回访）→ `6a0be97`（live 回访截断）→ `7d43f37`（G1 判别测试 + 性能界 need + 文档 + G2/G3）→ `4e0ddc8`（G2/G3 判别力补强）。DONE_WITH_CONCERNS → spec **PASS** → qual ISSUES → 补丁 → 增量复审 → 定向补强（T4 关闭，262/0；workspace 249 → 262，+13 测试）
+
+**裁定链（本任务的核心产出，全部有 mutant 实证支撑）**：
+1. **(a) 本体**：deleted+!contiguous 只沿 stale 链（探针 B/C：链被清→4096 诚实前缀；链簇被占→截断）。**spec 三维对照证明判据价值**：pre-T4 对探针 B 交付 9000B **错位数据**且评 Complete；mid（(a) 但无界卫）在泛化构型交付 12288B=同一簇×3 且评 Complete。
+2. **可达界卫**（impl 自抓）：`need > max_cluster - fc + 1` → 物理不可能（fc 近堆尾 + DL 污染 + 环链可达 254 长）。qual 首轮发现**现有 loop 测试被回访检测双重兜住、界卫无判别输入**（真缺口）→ G1 用**非回访链**（253→6→7）补测，read/scan 各一，独立复杀"恰两红且环测仍绿"。
+3. **链前缀回访检测**（spec 抓 + lead 裁定）：环/回折 → 交付重复簇字节（伪造序）。裁定用**前缀去重**而非 `len>reachable`（后者误伤 need=1 合法单簇交付）；deleted → 空（整链不可信证据），live → 截断至首回访点（FAT 权威、逐跳可信至首次矛盾）——**刻意不对称**，四处文档一致（证据权威论措辞，`grep 实指`=0）。
+4. **live 车道同病收口**（impl 自抓）：live 自环此前同样重复交付 → 回访截断；quality 维持 entry 层 checksum 语义（scan.rs 分级梯已注释；M1c 若升级链感知分级需注意 I/O 放大）。
+5. **性能**（qual 抓）：live 回访扫描原为**全链 O(n²)**（1M 簇链 ≈5×10¹¹ 比较）→ 界 `min(need, len)`，qual 穷举 32,800 (chain,need) 对证明逐点等价。
+
+**变异实证汇总**：spec+qual 合计 KILL ≈ 20 个变异（含早分支回退连续、位图门控、live/deleted 车道混淆、链不足 Complete 等），等价变异 1（scan 连续臂界卫仅短路——`is_free` Err 已兜）、1 处判别力归属修正（G2 末簇→三簇中段；G3 设备尾巧合→堆中段，均以 qual 预定义 M1/M2 复刻双红收口）。**既有 15 个删除/分级测试逐函数体比对零改动、行为零变化**（spec 独立验证）。
 
 ---
 
