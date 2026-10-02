@@ -222,8 +222,8 @@ impl FatImageBuilder {
     pub fn build(&self) -> Vec<u8> {
         // 布局（扇区）：
         //  0        reserved / 引导扇区
-        //  1..5     FAT#1（4 扇区）
-        //  5..37    根目录（512 项 × 32B = 32 扇区）
+        //  1..18    FAT#1（17 扇区）
+        //  18..50   根目录（512 项 × 32B = 32 扇区）
         //  50..    数据区（簇 N → 扇区 50 + (N-2)，共 4174 簇）
         const FAT_START: u32 = 1;
         const FAT_SIZE: u32 = 17;
@@ -309,7 +309,7 @@ impl FatImageBuilder {
         bs[22..24].copy_from_slice(&(FAT_SIZE as u16).to_le_bytes());
         bs[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track（惯例值）
         bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
-        bs[28..32].copy_from_slice(&37u32.to_le_bytes()); // hidden sectors（惯例）
+        bs[28..32].copy_from_slice(&DATA_START.to_le_bytes()); // hidden sectors（夹具惯例值）
         bs[32..36].copy_from_slice(&TOTAL_SECTORS.to_le_bytes());
         bs[36] = 0x80; // drive number
         bs[38] = 0x29; // boot signature
