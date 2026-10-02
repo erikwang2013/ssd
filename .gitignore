@@ -26,3 +26,7 @@ ui/.flutter-plugins*
 
 # Generated test images
 fixtures/*.img
+.worktrees/
+
+# Build artifacts
+dist/

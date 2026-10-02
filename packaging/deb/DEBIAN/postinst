@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+# control 的 libc6 下限 2.34 = 当前构建基线（本地 release 实测要求 GLIBC_2.34）；CI/工具链若更高需同步上调。
+# 让已插入的块设备重新触发规则（U 盘通常安装后才插，无需此步也可）
+if command -v udevadm >/dev/null 2>&1; then
+  udevadm control --reload-rules || true   # 旧 udevd 的保险（255+ 自动重载 rules 目录）
+  udevadm trigger --action=change --subsystem-match=block || true
+fi
+exit 0
