@@ -14,7 +14,9 @@ mod jpeg;
 mod png;
 pub mod signatures;
 
-pub use carver::{CHUNK_BYTES, CarveEvent, CarveStats, CarvedEntry, MAX_FILE_BYTES, carve_runs};
+pub use carver::{
+    CHUNK_BYTES, CarveEvent, CarveStats, CarvedEntry, MAX_FILE_BYTES, carve_runs, carve_runs_from,
+};
 pub use jpeg::carve_jpeg;
 pub use png::carve_png;
 pub use signatures::{Carved, Cursor};

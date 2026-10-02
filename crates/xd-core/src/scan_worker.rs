@@ -124,34 +124,61 @@ fn exfat_to_entry(e: &xd_fs_exfat::scan::ExfatEntry) -> ScanEntry {
     }
 }
 
+/// 断点前已尝试扫描的字节（任务级累计坐标）：续跑时 readBytes 自断点续起而非回零，
+/// 收尾仍恰为 Σrun 长（= `totalBytes`，百分比 100%）。断点落于 run 内时含该 run 的前缀段。
+fn scanned_base(runs: &[Range<u64>], resume_from: u64) -> u64 {
+    let mut base = 0;
+    for r in runs {
+        if resume_from >= r.end {
+            base += r.end - r.start; // 整段在断点前
+        } else {
+            base += resume_from.saturating_sub(r.start); // 断点在本 run 内：前缀段
+            break;
+        }
+    }
+    base
+}
+
 /// 深扫线程体：雕刻（自家循环 → 取消即回调返回 false）→ 终态置态 → 通知。
 /// 与快扫的**有意不对称**：`run_worker` 的取消必须走 `ScanCanceled` unwind（引擎回调不返回
 /// 控制值），而雕刻回调**返回 false 即停**——语义更直接，故 carve 路径不产生 unwind；
 /// catch_unwind 在此仅兜真 panic 的崩溃隔离。
+///
+/// `resume_from`/`next_idx`：首跑传 0/0；断点续跑传检查点与已落库条目数（idx 续号，
+/// `INSERT OR REPLACE` 使重扫区间同编号覆盖而非追加）。
+#[allow(clippy::too_many_arguments)] // 与 WorkerFn 线程体同构：参数即入参，不引入结构体
 pub(crate) fn run_carve_worker(
     id: u64,
     device: Arc<dyn BlockDevice>,
     runs: Vec<Range<u64>>,
+    resume_from: u64,
+    next_idx: u64,
     ctrl: Arc<Ctrl>,
     store: Arc<Store>,
     notify: NotifyFn,
 ) {
     let start = Instant::now();
+    let base = scanned_base(&runs, resume_from);
     let mut cb = CarveProgress {
         task_id: id,
         store: &store,
         notify: &*notify,
         ctrl: &ctrl,
         start,
-        found: 0,
-        scanned: 0,
+        found: next_idx,
+        scanned: base,
+        progress_base: base,
         last_notify_at: start,
-        last_notify_bytes: 0,
+        last_notify_bytes: base,
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        xd_carving::carve_runs(&*device, &runs, xd_carving::MAX_FILE_BYTES, &mut |ev| {
-            cb.on(ev)
-        })
+        xd_carving::carve_runs_from(
+            &*device,
+            &runs,
+            resume_from,
+            xd_carving::MAX_FILE_BYTES,
+            &mut |ev| cb.on(ev),
+        )
     }));
     let (state, msg): (ScanState, Option<String>) = match outcome {
         Ok(_) if ctrl.canceled.load(Ordering::SeqCst) => (ScanState::Canceled, None),
@@ -175,7 +202,12 @@ pub(crate) fn run_carve_worker(
 }
 
 /// 雕刻事件回调：返回 false = 停止（取消）；暂停在回调内驻停（驻停中亦响应取消）。
-/// `readBytes` 口径 = **已扫描**字节（与 `totalBytes`=Σ空闲区间对齐，百分比不超 100%）。
+/// `readBytes` 口径 = **已扫描**字节（任务级：断点前累计 + 本次；与 `totalBytes`=Σ空闲区间
+/// 对齐，百分比不超 100%）。
+///
+/// **驻停次序（T7 契约）**：`Scanned` 先落检查点再驻停（暂停期间进度/断点不倒退）；
+/// `Entry` 先驻停再落盘（**已落库条目恒在 `carved_offset` 之前**——重启续扫不会把已落库内容
+/// 甩在断点之后重扫）。取消检查恒在最先（响应性不因次序变化）。
 struct CarveProgress<'a> {
     task_id: u64,
     store: &'a Store,
@@ -184,6 +216,8 @@ struct CarveProgress<'a> {
     start: Instant,
     found: u64,
     scanned: u64,
+    /// 断点前累计（任务级进度基准，见 `scanned_base`）。
+    progress_base: u64,
     last_notify_at: Instant,
     last_notify_bytes: u64,
 }
@@ -193,15 +227,12 @@ impl CarveProgress<'_> {
         if self.ctrl.canceled.load(Ordering::SeqCst) {
             return false;
         }
-        while self.ctrl.paused.load(Ordering::SeqCst) {
-            if self.ctrl.canceled.load(Ordering::SeqCst) {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
         match ev {
-            xd_carving::CarveEvent::Scanned(n) => {
-                self.scanned = n;
+            xd_carving::CarveEvent::Scanned { scanned, at } => {
+                self.scanned = self.progress_base + scanned;
+                // 检查点是**安全机制**，不参与进度节流：每窗口一条小 UPDATE（≤4MiB 粒度）——
+                // 节流漏写会让暂停时的断点滞后，续扫重做已落库窗口（T7 移交给出的口径）。
+                let _ = self.store.set_carved_offset(self.task_id, at);
                 let now = Instant::now();
                 if now.duration_since(self.last_notify_at) >= Duration::from_millis(250)
                     || self.scanned.saturating_sub(self.last_notify_bytes) >= 1024 * 1024
@@ -220,8 +251,14 @@ impl CarveProgress<'_> {
                     self.last_notify_at = now;
                     self.last_notify_bytes = self.scanned;
                 }
+                if !self.park_if_paused() {
+                    return false;
+                }
             }
             xd_carving::CarveEvent::Entry(e) => {
+                if !self.park_if_paused() {
+                    return false;
+                }
                 let entry = ScanEntry {
                     idx: self.found,
                     name: String::new(),
@@ -240,6 +277,17 @@ impl CarveProgress<'_> {
                     std::slice::from_ref(&entry), // 库错不中断扫描（found/idx 照进、库内可缺行——T7 断点设计须知情）
                 );
             }
+        }
+        true
+    }
+
+    /// 驻停（驻停中亦响应取消）。返回 false = 取消。
+    fn park_if_paused(&self) -> bool {
+        while self.ctrl.paused.load(Ordering::SeqCst) {
+            if self.ctrl.canceled.load(Ordering::SeqCst) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
         true
     }
@@ -328,6 +376,7 @@ mod tests {
                 start,
                 found: 0,
                 scanned: 0,
+                progress_base: 0,
                 last_notify_at: start,
                 last_notify_bytes: 0,
             };
@@ -341,7 +390,10 @@ mod tests {
         // 驻停中置 canceled → on() 立即返回 false。
         let ctrl = Arc::new(Ctrl::default());
         ctrl.paused.store(true, Ordering::SeqCst);
-        let h = in_thread(ctrl.clone(), xd_carving::CarveEvent::Scanned(0));
+        let h = in_thread(
+            ctrl.clone(),
+            xd_carving::CarveEvent::Scanned { scanned: 0, at: 0 },
+        );
         std::thread::sleep(Duration::from_millis(200));
         assert!(!h.is_finished(), "paused 时 on() 必须驻停不返回");
         ctrl.canceled.store(true, Ordering::SeqCst);
@@ -349,8 +401,25 @@ mod tests {
         // 对照：未驻停 → 立即返回 true（扫描继续）
         let h2 = in_thread(
             Arc::new(Ctrl::default()),
-            xd_carving::CarveEvent::Scanned(0),
+            xd_carving::CarveEvent::Scanned { scanned: 0, at: 0 },
         );
         assert!(h2.join().unwrap());
+    }
+
+    #[test]
+    fn scanned_base_counts_prefix_before_checkpoint() {
+        // 任务级进度基准：整段在断点前的 run 全计；断点所在 run 只计前缀；断点之后不计
+        let runs = [0..1000u64, 2000..3000, 5000..6000];
+        assert_eq!(scanned_base(&runs, 0), 0, "首跑无基准");
+        assert_eq!(scanned_base(&runs, 500), 500, "断点在首 run 内：前缀段");
+        assert_eq!(scanned_base(&runs, 1000), 1000, "恰在 run 界");
+        assert_eq!(scanned_base(&runs, 2500), 1000 + 500, "跨 run：整段 + 前缀");
+        assert_eq!(
+            scanned_base(&runs, 4500),
+            2000,
+            "断点在 run 间隙（Rust 半开区间）"
+        );
+        assert_eq!(scanned_base(&runs, 6000), 3000, "越界：全量");
+        assert_eq!(scanned_base(&runs, 9999), 3000, "远超：全量");
     }
 }

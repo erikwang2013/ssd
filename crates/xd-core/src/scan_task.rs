@@ -191,7 +191,8 @@ impl ScanManager {
 
     /// 深扫启动（mode:"deep"）：**先解未分配区间**（失败 → 拒绝，绝不入册空跑），
     /// `total_bytes` = Σ空闲区间长（进度百分比口径）。区间在启动时解一次并随 worker 闭包固定
-    /// ——扫描期内不再重解（分配表可能变化，重解会与已落库偏移脱节）。
+    /// ——扫描期内不再重解（分配表可能变化，重解会与已落库偏移脱节）；重启续跑**必须**重解
+    /// （见 `restart`：闭包随进程消失，runs 无法从库恢复）。
     pub fn start_deep(&self, device: Arc<dyn BlockDevice>) -> Result<ScanStarted, ScanError> {
         let fs = probe(&*device).map_err(|_| ScanError::UnsupportedFs)?;
         let runs = unallocated_runs_of(&*device, fs)?;
@@ -199,18 +200,40 @@ impl ScanManager {
         let id = self
             .store
             .create_task(&device.info().id, fs.as_str(), "deep", total)?;
-        self.spawn(
-            id,
-            device,
-            Box::new(move |id, dev, ctrl, store, notify| {
-                crate::scan_worker::run_carve_worker(id, dev, runs, ctrl, store, notify)
-            }),
-        );
+        self.spawn_carve(id, device, runs, 0, 0);
         Ok(ScanStarted {
             task_id: id,
             fs,
             total_bytes: total,
         })
+    }
+
+    /// 入册深扫 worker：`resume_from` = 检查点绝对偏移（首跑 0），`next_idx` = 已落库条目数
+    /// （首跑 0；续跑续号，配合 `INSERT OR REPLACE` 让重扫区间覆盖而非追加）。
+    fn spawn_carve(
+        &self,
+        id: u64,
+        device: Arc<dyn BlockDevice>,
+        runs: Vec<Range<u64>>,
+        resume_from: u64,
+        next_idx: u64,
+    ) {
+        self.spawn(
+            id,
+            device,
+            Box::new(move |id, dev, ctrl, store, notify| {
+                crate::scan_worker::run_carve_worker(
+                    id,
+                    dev,
+                    runs,
+                    resume_from,
+                    next_idx,
+                    ctrl,
+                    store,
+                    notify,
+                )
+            }),
+        );
     }
 
     fn spawn(&self, id: u64, device: Arc<dyn BlockDevice>, work: WorkerFn) {
@@ -295,25 +318,40 @@ impl ScanManager {
         }
     }
 
-    /// 重启后重跑（quick scan 重跑成本低；真断点续跑归 M1c）：清旧结果 → 重新入册开跑。
+    /// 重启后按 mode 分派：quick → 清旧结果重跑（成本低）；deep → 从检查点续扫，
+    /// **不清 results**（已雕条目保留）、`idx` 自 `found_count` 续号。
     /// 仅 handlers 的 `Resume::NeedsDevice` 路径调用；守卫防公开 API 误用（worker 在场所的
     /// paused 应走 resume，否则同 id 双 worker、旧线程被遗弃）。
+    ///
+    /// 已知局限（README）：断点所在窗口内已落库的条目会被重扫——同编号 `INSERT OR REPLACE`
+    /// 覆盖为等价记录，罕见时序（两次检查点写之间被杀）下残留至多一条重复条目（不丢数据）。
     pub fn restart(&self, id: u64, device: Arc<dyn BlockDevice>) -> Result<(), ScanError> {
         if let Some((_, running, _)) = self.active_of(id)
             && running.load(Ordering::SeqCst)
         {
             return Err(ScanError::TaskNotActive(id));
         }
-        if self.status(id)?.state != ScanState::Paused {
+        let row = self.status(id)?;
+        if row.state != ScanState::Paused {
             return Err(ScanError::TaskNotActive(id));
         }
-        probe(&*device).map_err(|_| ScanError::UnsupportedFs)?;
-        self.store.clear_entries(id)?;
-        self.store.set_state(id, ScanState::Scanning)?;
-        // 注：restart 恒走快扫线程体——deep 的重启分派（按 row.scan_mode）归 T7
-        //（断点续跑要带 checkpoint 起点，届时一并改）；T6 的 deep 任务重启后跑到
-        // quick worker 属已知缺口，见 T6 报告移交项。
-        self.spawn(id, device, Box::new(crate::scan_worker::run_worker));
+        let fs = probe(&*device).map_err(|_| ScanError::UnsupportedFs)?;
+        if row.scan_mode == "deep" {
+            // runs 随进程消失、无法从库恢复：重解一次（失败 → 拒绝，与首跑同契约）
+            let runs = unallocated_runs_of(&*device, fs)?;
+            self.store.set_state(id, ScanState::Scanning)?;
+            self.spawn_carve(
+                id,
+                device,
+                runs,
+                row.carved_offset.unwrap_or(0),
+                row.found_count,
+            );
+        } else {
+            self.store.clear_entries(id)?;
+            self.store.set_state(id, ScanState::Scanning)?;
+            self.spawn(id, device, Box::new(crate::scan_worker::run_worker));
+        }
         Ok(())
     }
 
@@ -620,6 +658,214 @@ mod tests {
             3,
             "清后重跑结果完整"
         );
+    }
+
+    /// 续跑夹具：**两个空闲 run**（删除的 BIG.TMP 簇段 + 卷尾 LIVE 之后的簇段），各埋一枚
+    /// mini_png。两 run 均 >128KiB → `SlowDev::wrap_big_reads` 下窗口读是唯一慢点。
+    struct DeepResume {
+        image: Vec<u8>,
+        a: (u64, Vec<u8>),
+        b: (u64, Vec<u8>),
+    }
+
+    fn deep_resume_fixture() -> DeepResume {
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "BIG.TMP", &[0u8; 300 * 1024])
+            .add_file("/", "LIVE.TXT", b"live")
+            .delete("/", "BIG.TMP")
+            .build();
+        let (_f0, dev0) = crate::testutil::dev_from_bytes(&image);
+        let runs = xd_fs_exfat::freespace::unallocated_runs(&*dev0).unwrap();
+        assert!(runs.len() >= 2, "夹具须有两个空闲区间: {runs:?}");
+        let a = xd_fixtures::mini_png(b"first-segment");
+        let b = xd_fixtures::mini_png(b"second-segment");
+        let a_off = runs[0].start + 4096;
+        let b_off = runs[1].start + 4096;
+        xd_fixtures::plant_in_run(&mut image, a_off, &a);
+        xd_fixtures::plant_in_run(&mut image, b_off, &b);
+        DeepResume {
+            image,
+            a: (a_off, a),
+            b: (b_off, b),
+        }
+    }
+
+    /// 深扫 carved 条目的形状（与 scan_worker 的映射同构）。
+    fn carved_entry(idx: u64, byte_offset: u64, size: u64) -> ScanEntry {
+        ScanEntry {
+            idx,
+            name: String::new(),
+            path: String::new(),
+            ext: "png".into(),
+            size_bytes: size,
+            deleted: true,
+            is_dir: false,
+            quality: "carved".into(),
+            first_cluster: 0,
+            byte_offset: Some(byte_offset),
+        }
+    }
+
+    #[test]
+    fn deep_pause_restart_resumes_from_checkpoint() {
+        // 真流程：慢速深扫 → 暂停（检查点已落盘）→ 丢 manager（模拟进程被杀）→ 同库新 manager
+        // → recover_after_restart → resume → NeedsDevice → restart → 续跑至 completed。
+        let fx = deep_resume_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let id;
+        {
+            let m = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+            let (_f, dev) = crate::testutil::dev_from_bytes(&fx.image);
+            let slow = crate::testutil::SlowDev::wrap_big_reads(dev, Duration::from_millis(120));
+            let s = m.start_deep(slow).unwrap();
+            id = s.task_id;
+            m.pause(id).unwrap();
+            wait_for_state(&m, id, ScanState::Paused, Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(300)); // 驻停稳定窗口
+            let row = m.status(id).unwrap();
+            assert!(
+                row.carved_offset.is_some(),
+                "深扫暂停时检查点必须已落盘（None → 重启从 0 整段重扫）"
+            );
+        } // 模拟 daemon 退出：worker 随进程死（此处已驻停）
+        let m2 = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+        m2.recover_after_restart().unwrap();
+        assert_eq!(m2.status(id).unwrap().state, ScanState::Paused);
+        match m2.resume(id).unwrap() {
+            Resume::NeedsDevice { .. } => {}
+            Resume::InPlace => panic!("worker 已不在场，必须 NeedsDevice"),
+        }
+        let (_f2, dev2) = crate::testutil::dev_from_bytes(&fx.image);
+        m2.restart(id, dev2).unwrap();
+        wait_for_state(&m2, id, ScanState::Completed, Duration::from_secs(20));
+        let (total, page) = m2.results(id, 0, 10, false).unwrap();
+        for (off, png) in [&fx.a, &fx.b] {
+            let hits: Vec<_> = page
+                .iter()
+                .filter(|e| e.byte_offset == Some(*off))
+                .collect();
+            assert_eq!(hits.len(), 1, "偏移 {off} 恰一条（无丢条）: {page:?}");
+            assert_eq!(hits[0].size_bytes, png.len() as u64);
+            assert_eq!(hits[0].quality, "carved");
+        }
+        assert_eq!(
+            total, 2,
+            "本场景暂停在窗口界：零残余（最坏允许 +1 条，见 README 局限）: {page:?}"
+        );
+        assert_eq!(
+            m2.status(id).unwrap().read_bytes,
+            m2.status(id).unwrap().total_bytes,
+            "续跑收尾 100%（进度含断点前缀）"
+        );
+    }
+
+    #[test]
+    fn deep_restart_keeps_landed_entries_and_resumes_from_checkpoint() {
+        // 手工布置「首段已扫、进程被杀」的库态（条目 + 检查点 + paused）→ restart 必须
+        // **不清 results**、idx 自 found_count 续号、只扫断点之后（首段条目原地保留、不重扫）。
+        let fx = deep_resume_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let (_f0, dev0) = crate::testutil::dev_from_bytes(&fx.image);
+        let runs = xd_fs_exfat::freespace::unallocated_runs(&*dev0).unwrap();
+        let total: u64 = runs.iter().map(|r| r.end - r.start).sum();
+        let breakpoint = runs[1].start; // 断点 = 第二个 run 起点：首段（run 1）整段在断点前
+        let id;
+        {
+            let s = Store::open(&path).unwrap();
+            id = s
+                .create_task(&dev0.info().id, "exfat", "deep", total)
+                .unwrap();
+            s.insert_entries(id, &[carved_entry(0, fx.a.0, fx.a.1.len() as u64)])
+                .unwrap();
+            s.set_progress(id, 0, 1, 0).unwrap();
+            s.set_carved_offset(id, breakpoint).unwrap();
+            s.set_state(id, ScanState::Paused).unwrap();
+        }
+        let m = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+        m.recover_after_restart().unwrap();
+        let (_f2, dev) = crate::testutil::dev_from_bytes(&fx.image);
+        m.restart(id, dev).unwrap();
+        wait_for_state(&m, id, ScanState::Completed, Duration::from_secs(20));
+        let (n, page) = m.results(id, 0, 10, false).unwrap();
+        assert_eq!(
+            n, 2,
+            "首段条目保留 + 续段新增（清表会把首段丢掉）: {page:?}"
+        );
+        assert_eq!(
+            (page[0].idx, page[0].byte_offset),
+            (0, Some(fx.a.0)),
+            "首段条目原地保留（断点之前不重扫）"
+        );
+        assert_eq!(
+            (page[1].idx, page[1].byte_offset),
+            (1, Some(fx.b.0)),
+            "idx 自 found_count 续号（从 0 重号会覆盖首段条目）"
+        );
+        assert_eq!(
+            m.status(id).unwrap().read_bytes,
+            total,
+            "续跑进度 = 断点前缀 + 本次扫描（基准漏加则收尾 < 100%）"
+        );
+    }
+
+    #[test]
+    fn carved_offset_persisted_during_scan() {
+        // 深扫进行中（首段条目已落库后暂停）：检查点已写且 ≥ 全部已落库条目的 byte_offset
+        // ——「已落库条目恒在 carved_offset 之前」是续跑不重扫已落库内容的前提。
+        let fx = deep_resume_fixture();
+        let m = mgr();
+        let (_f, dev) = crate::testutil::dev_from_bytes(&fx.image);
+        let slow = crate::testutil::SlowDev::wrap_big_reads(dev, Duration::from_millis(120));
+        let s = m.start_deep(slow).unwrap();
+        crate::testutil::wait_for_entries(&m, s.task_id, 1, Duration::from_secs(10));
+        m.pause(s.task_id).unwrap();
+        wait_for_state(&m, s.task_id, ScanState::Paused, Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(250)); // 驻停稳定窗口
+        let row = m.status(s.task_id).unwrap();
+        let off = row
+            .carved_offset
+            .expect("深扫进行中检查点必须已写（None → 重启从 0 整段重扫）");
+        assert!(off > 0, "检查点须在首个空闲区间起点之后");
+        let (total, page) = m.results(s.task_id, 0, 10, false).unwrap();
+        assert!(total > 0, "前提：首段条目已落库");
+        for e in &page {
+            assert!(
+                e.byte_offset.unwrap() <= off,
+                "已落库条目必须 ≤ 检查点: {e:?} vs {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_restart_still_clears_stale_entries() {
+        // quick 语义不回归：重启清旧结果重跑（深扫的「保留」不得泄漏到 quick 分支）
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let id;
+        {
+            let m = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+            let (_f, dev) = exfat_fixture();
+            let slow = crate::testutil::SlowDev::wrap(dev, Duration::from_millis(30));
+            let s = m.start(slow).unwrap();
+            id = s.task_id;
+            m.pause(id).unwrap();
+            wait_for_state(&m, id, ScanState::Paused, Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        {
+            // 注入陈旧条目（idx 99）：重启后必须消失
+            let s = Store::open(&path).unwrap();
+            s.insert_entries(id, &[carved_entry(99, 4242, 7)]).unwrap();
+        }
+        let m2 = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+        m2.recover_after_restart().unwrap();
+        let (_f2, dev2) = exfat_fixture();
+        m2.restart(id, dev2).unwrap();
+        wait_for_state(&m2, id, ScanState::Completed, Duration::from_secs(10));
+        let (total, page) = m2.results(id, 0, 10, false).unwrap();
+        assert_eq!(total, 3, "陈旧条目必须被清（quick 重跑语义）: {page:?}");
     }
 
     #[test]

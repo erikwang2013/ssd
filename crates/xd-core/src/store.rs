@@ -65,6 +65,9 @@ pub struct TaskRow {
     pub total_bytes: u64,
     /// "quick" | "deep"（T7 断点续跑按此分派 worker）。
     pub scan_mode: String,
+    /// 深扫检查点（v4）：已完整处理内容的绝对右界（安全续扫点，见 `xd_carving` 头注）。
+    /// `None` = 无检查点（从未写过 / 迁移前旧行）——0 是合法偏移（区间起点），不得与未知混同。
+    pub carved_offset: Option<u64>,
 }
 
 /// 连接锁中毒即 fail-stop（`unwrap`）——重启后的任务态由 `mark_interrupted`/`recover_after_restart` 兜底。
@@ -146,6 +149,17 @@ impl Store {
             }
             conn.execute_batch("PRAGMA user_version = 3")?;
         }
+        // v3 → v4 迁移（M1c T7）：tasks.carved_offset（深扫断点续跑的检查点）。
+        // 模版同前；**可空且不给 DEFAULT**——旧行/未写过 = NULL（未知），0 是合法偏移。
+        if ver < 4 {
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'carved_offset'")?
+                .exists([])?;
+            if !has {
+                conn.execute("ALTER TABLE tasks ADD COLUMN carved_offset INTEGER", [])?;
+            }
+            conn.execute_batch("PRAGMA user_version = 4")?;
+        }
         Ok(())
     }
 
@@ -207,6 +221,15 @@ impl Store {
         Ok(())
     }
 
+    /// 深扫检查点写（worker 每窗口调用；`v` = 安全续扫点绝对偏移）。
+    pub fn set_carved_offset(&self, id: u64, v: u64) -> Result<(), StoreError> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE tasks SET carved_offset = ?2 WHERE id = ?1",
+            params![id as i64, v as i64],
+        )?;
+        Ok(())
+    }
+
     /// `INSERT OR REPLACE`：同 `(task_id, idx)` 重插=替换——供 M1c 断点续跑重扫区间复用。
     pub fn insert_entries(&self, task_id: u64, entries: &[ScanEntry]) -> Result<(), StoreError> {
         if entries.is_empty() {
@@ -253,7 +276,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(
             "SELECT id, device_id, fs, state, read_bytes, found_count, elapsed_ms, total_bytes,
-                    scan_mode
+                    scan_mode, carved_offset
              FROM tasks WHERE id = ?1",
         )?;
         let mut rows = st.query(params![id as i64])?;
@@ -272,6 +295,7 @@ impl Store {
             elapsed_ms: r.get::<_, i64>(6)? as u64,
             total_bytes: r.get::<_, i64>(7)? as u64,
             scan_mode: r.get(8)?,
+            carved_offset: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         }))
     }
 
@@ -543,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_database_migrates_to_v3() {
+    fn v1_database_migrates_to_v4() {
         // 手工造 v1 库（无 byte_offset 列、user_version=1，含一条真实旧行）→ Store::open 迁移后可读写
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
@@ -571,12 +595,17 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 3, "迁移后版本标记必须前进到 3（v1 连跳 v2/v3）");
+        assert_eq!(ver, 4, "迁移后版本标记必须前进到 4（v1 连跳 v2/v3/v4）");
         // 迁移前已存在的旧行：偏移未知，必须读回 NULL（DEFAULT 0 会把未知伪造成「偏移=0」）
         let (_, old) = s.entries(1, 0, 10, false).unwrap();
         assert_eq!(
             old[0].byte_offset, None,
             "迁移前旧行未知必须 NULL——DEFAULT 0 伪造「偏移=0」"
+        );
+        assert_eq!(
+            s.task(1).unwrap().unwrap().carved_offset,
+            None,
+            "旧行无深扫检查点：必须 NULL（DEFAULT 0 会把未知伪造成「断点=0」→ 重启整段重扫）"
         );
         let id = s.create_task("d", "exfat", "quick", 1).unwrap();
         let mut e = entry(0, "OLD.JPG", true);
@@ -589,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_database_migrates_to_v3_and_old_rows_default_quick() {
+    fn v2_database_migrates_to_v4_and_old_rows_default_quick() {
         // 手工造 v2 库（有 byte_offset、无 scan_mode、user_version=2，含一条真实旧行）→
         // Store::open 迁移后旧行 scan_mode == 'quick'（M1c 前只有 quick），且新任务可写 deep。
         let dir = tempfile::tempdir().unwrap();
@@ -617,7 +646,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 3, "v2 库必须前进到 3");
+        assert_eq!(ver, 4, "v2 库必须前进到 4");
         assert_eq!(
             s.task(1).unwrap().unwrap().scan_mode,
             "quick",
@@ -625,6 +654,65 @@ mod tests {
         );
         let id = s.create_task("d", "exfat", "deep", 1).unwrap();
         assert_eq!(s.task(id).unwrap().unwrap().scan_mode, "deep");
+    }
+
+    #[test]
+    fn v3_database_migrates_to_v4_and_old_rows_have_null_checkpoint() {
+        // 手工造 v3 库（有 scan_mode、无 carved_offset、user_version=3，含一条 deep 旧行）→
+        // Store::open 迁移后旧行 carved_offset == None（从未写过检查点），且可写入新值。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, fs TEXT NOT NULL,
+                     state TEXT NOT NULL, read_bytes INTEGER NOT NULL DEFAULT 0, found_count INTEGER NOT NULL DEFAULT 0,
+                     elapsed_ms INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL,
+                     scan_mode TEXT NOT NULL DEFAULT 'quick');
+                 CREATE TABLE entries (task_id INTEGER NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+                     ext TEXT NOT NULL, size_bytes INTEGER NOT NULL, deleted INTEGER NOT NULL, is_dir INTEGER NOT NULL,
+                     quality TEXT NOT NULL, first_cluster INTEGER NOT NULL, byte_offset INTEGER,
+                     PRIMARY KEY (task_id, idx));
+                 INSERT INTO tasks (id, device_id, fs, state, total_bytes, scan_mode)
+                     VALUES (1, 'image:v3.img', 'exfat', 'paused', 4096, 'deep');
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let ver: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 4, "v3 库必须前进到 4");
+        assert_eq!(
+            s.task(1).unwrap().unwrap().carved_offset,
+            None,
+            "旧行无检查点必须 NULL（0 会被当成「断点=区间起点」→ 静默整段重扫）"
+        );
+        s.set_carved_offset(1, 2048).unwrap();
+        assert_eq!(s.task(1).unwrap().unwrap().carved_offset, Some(2048));
+    }
+
+    #[test]
+    fn carved_offset_roundtrips_and_defaults_null() {
+        let s = Store::open_memory().unwrap();
+        let id = s.create_task("d", "exfat", "deep", 4096).unwrap();
+        assert_eq!(
+            s.task(id).unwrap().unwrap().carved_offset,
+            None,
+            "新建任务 = 无检查点（不是 0）"
+        );
+        s.set_carved_offset(id, 0).unwrap();
+        assert_eq!(
+            s.task(id).unwrap().unwrap().carved_offset,
+            Some(0),
+            "0 是合法偏移（区间起点）——三态语义：None=未知 / 0=起点 / n=断点"
+        );
+        s.set_carved_offset(id, 835584).unwrap();
+        assert_eq!(s.task(id).unwrap().unwrap().carved_offset, Some(835584));
     }
 
     #[test]

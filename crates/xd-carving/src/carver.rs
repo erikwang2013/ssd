@@ -4,6 +4,13 @@
 //! **runs 契约**：区间须**互不相交**（重叠段会重复计入 `scanned`，百分比虚高）；本层不校验，
 //! 契约由 freespace 侧合并算法保证。
 //!
+//! **断点续跑契约（`carve_runs_from`）**：`resume_from` 为绝对偏移——完全在其前的 run 跳过、
+//! 跨断点的首 run 自断点起读；`stats.scanned_bytes` 为**本次调用**尝试扫描的字节（session 口径），
+//! 任务级进度 = 断点前累计 + 本值（调用方 `scan_worker::scanned_base` 补基准）。
+//! `Scanned.at` = 窗口起点绝对偏移，即**安全续扫点**：`[run 起点, at)` 已完整处理（含条目落库）
+//! ——扫描器在此点之前不会再报出任何候选（候选恒整体在窗内），故从 `at` 重扫不丢条目；
+//! 窗口重叠（不变量 2）恰好把跨界签名的起点包含在 `at` 之前 7 字节内，重扫能再找到它。
+//!
 //! **扫描器不变量：**
 //! 1. 每个候选无论裁决结果，扫描位置**至少推进其签名长度**（len=0 不原地打转）——
 //!    对现签名集**不可观测**（JPEG/PNG 结构互斥，无跨签名重叠起点），属未来跨签名防护；
@@ -71,7 +78,12 @@ pub struct CarveStats {
 
 /// 扫描事件：窗口级进度 + 每条雕刻结果。回调返回 false → 立即停止（取消）。
 pub enum CarveEvent<'a> {
-    Scanned(u64),
+    /// 窗口级：`scanned` = 本次调用累计尝试扫描字节（session 口径）；`at` = 本窗口起点绝对偏移
+    /// （安全续扫点，见模块头注的断点续跑契约）。
+    Scanned {
+        scanned: u64,
+        at: u64,
+    },
     Entry(&'a CarvedEntry),
 }
 
@@ -81,25 +93,48 @@ pub fn carve_runs(
     max_file_bytes: u64,
     ev: &mut dyn FnMut(CarveEvent) -> bool,
 ) -> CarveStats {
+    carve_runs_from(dev, runs, 0, max_file_bytes, ev)
+}
+
+/// 自 `resume_from`（绝对偏移）续扫：完全在其前的 run 跳过，跨断点的首 run 自断点起读
+/// （断点落于 run 间隙/越界都自然吸收）。契约与口径见模块头注。
+pub fn carve_runs_from(
+    dev: &dyn BlockDevice,
+    runs: &[Range<u64>],
+    resume_from: u64,
+    max_file_bytes: u64,
+    ev: &mut dyn FnMut(CarveEvent) -> bool,
+) -> CarveStats {
     let mut stats = CarveStats::default();
     for run in runs {
-        if !scan_run(dev, run, max_file_bytes, ev, &mut stats) {
+        if run.end <= resume_from {
+            continue; // 完全在断点前：不读、不计
+        }
+        if !scan_run(
+            dev,
+            run,
+            resume_from.max(run.start),
+            max_file_bytes,
+            ev,
+            &mut stats,
+        ) {
             return stats; // 取消
         }
     }
     stats
 }
 
-/// 单 run 扫描。返回 false = 取消。
+/// 单 run 扫描（`from` = 本 run 的读取起点，断点续跑时 > run.start）。返回 false = 取消。
 fn scan_run(
     dev: &dyn BlockDevice,
     run: &Range<u64>,
+    from: u64,
     max_file_bytes: u64,
     ev: &mut dyn FnMut(CarveEvent) -> bool,
     stats: &mut CarveStats,
 ) -> bool {
-    let mut pos = run.start; // 已处理到的绝对位置（候选起点下界）
-    let mut next_read = run.start; // 下一窗口读取起点
+    let mut pos = from; // 已处理到的绝对位置（候选起点下界）
+    let mut next_read = from; // 下一窗口读取起点
     let base = stats.scanned_bytes; // 本 run 前的累计（不变量 4 的口径见模块头注）
     while next_read < run.end {
         let window_start = next_read;
@@ -107,8 +142,11 @@ fn scan_run(
         let mut buf = vec![0u8; want];
         let got = dev.read_at(next_read, &mut buf).unwrap_or_default();
         let span_end = next_read + want as u64;
-        stats.scanned_bytes = base + (span_end - run.start); // 不变量 4：尝试扫描到的最远处
-        if !ev(CarveEvent::Scanned(stats.scanned_bytes)) {
+        stats.scanned_bytes = base + (span_end - from); // 不变量 4：尝试扫描到的最远处（session 口径）
+        if !ev(CarveEvent::Scanned {
+            scanned: stats.scanned_bytes,
+            at: window_start,
+        }) {
             return false;
         }
         if got == 0 {
@@ -199,6 +237,109 @@ mod tests {
             true
         });
         (stats, out)
+    }
+
+    /// 续跑形态：收集条目 + 统计（`resume_from` 绝对偏移）。
+    fn carve_from(
+        dev: &dyn BlockDevice,
+        runs: &[Range<u64>],
+        resume_from: u64,
+        max: u64,
+    ) -> (CarveStats, Vec<CarvedEntry>) {
+        let mut out = Vec::new();
+        let stats = carve_runs_from(dev, runs, resume_from, max, &mut |ev| {
+            if let CarveEvent::Entry(e) = ev {
+                out.push(*e);
+            }
+            true
+        });
+        (stats, out)
+    }
+
+    #[test]
+    fn resume_from_mid_run_scans_remainder() {
+        // 断点落在第二个文件起点：恰找到第二个（第一个在其前，不重报）；session 口径 scanned
+        // = run 内 [resume_from, run.end) 的字节数（任务级进度由调用方补基准）
+        let a = xd_fixtures::mini_jpeg(500);
+        let b = xd_fixtures::mini_jpeg(700);
+        let mut img = vec![0u8; 8192];
+        xd_fixtures::plant_in_run(&mut img, 100, &a);
+        xd_fixtures::plant_in_run(&mut img, 4000, &b);
+        let (_f, dev) = dev_for(&img);
+        let (stats, e) = carve_from(&dev, std::slice::from_ref(&(0..8192)), 4000, 64 << 20);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(
+            (e[0].byte_offset, e[0].size, e[0].complete),
+            (4000, b.len() as u64, true)
+        );
+        assert_eq!(stats.found, 1);
+        assert_eq!(
+            stats.scanned_bytes,
+            8192 - 4000,
+            "session 口径：只计断点之后的尝试字节"
+        );
+    }
+
+    #[test]
+    fn resume_from_between_runs_skips_earlier() {
+        // 断点落 run 间隙（3000 ∈ (2000, 4000)）：第一个 run 整段跳过、第二个 run 全扫
+        let a = xd_fixtures::mini_jpeg(300);
+        let b = xd_fixtures::mini_jpeg(400);
+        let mut img = vec![0u8; 8192];
+        xd_fixtures::plant_in_run(&mut img, 100, &a);
+        xd_fixtures::plant_in_run(&mut img, 5000, &b);
+        let (_f, dev) = dev_for(&img);
+        let runs = [0..2000u64, 4000..8192];
+        let (stats, e) = carve_from(&dev, &runs, 3000, 64 << 20);
+        assert_eq!(e.len(), 1, "第一个 run 里的候选不得重报: {e:?}");
+        assert_eq!(e[0].byte_offset, 5000);
+        assert_eq!(stats.scanned_bytes, 8192 - 4000, "整段第二个 run");
+    }
+
+    #[test]
+    fn resume_from_beyond_end_is_empty_stats() {
+        // 断点 ≥ 全面界 → 空扫描（已完成态）：零条目、零尝试字节
+        let a = xd_fixtures::mini_jpeg(300);
+        let b = xd_fixtures::mini_jpeg(400);
+        let mut img = vec![0u8; 8192];
+        xd_fixtures::plant_in_run(&mut img, 100, &a);
+        xd_fixtures::plant_in_run(&mut img, 5000, &b);
+        let (_f, dev) = dev_for(&img);
+        let runs = [0..2048u64, 4096..8192];
+        let (stats, e) = carve_from(&dev, &runs, 8192, 64 << 20);
+        assert!(e.is_empty());
+        assert_eq!((stats.found, stats.scanned_bytes), (0, 0));
+        // 恰在 run 界（4096）= 第二个 run 起点：第一个跳过、第二个整段扫（其内条目照找）
+        let (stats2, e2) = carve_from(&dev, &runs, 4096, 64 << 20);
+        assert_eq!(e2.len(), 1, "{e2:?}");
+        assert_eq!(e2[0].byte_offset, 5000, "第一个 run 的候选（100）不得重报");
+        assert_eq!(stats2.scanned_bytes, 4096);
+    }
+
+    #[test]
+    fn resume_event_at_is_window_start_and_scanned_is_session_scoped() {
+        // 事件契约：at = 窗口起点（安全续扫点），scanned = session 累计尝试（收尾 == 本次扫描字节）
+        let mut img = vec![0u8; 3000];
+        xd_fixtures::plant_in_run(&mut img, 10, &xd_fixtures::mini_png(b"ev"));
+        let (_f, dev) = dev_for(&img);
+        let mut scans = Vec::new();
+        carve_runs_from(
+            &dev,
+            std::slice::from_ref(&(0..3000)),
+            1000,
+            64 << 20,
+            &mut |ev| {
+                if let CarveEvent::Scanned { scanned, at } = ev {
+                    scans.push((scanned, at));
+                }
+                true
+            },
+        );
+        assert_eq!(
+            scans,
+            vec![(2000, 1000)],
+            "首窗口：at=断点，scanned=断点后尝试字节"
+        );
     }
 
     #[test]
