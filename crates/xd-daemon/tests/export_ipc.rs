@@ -82,24 +82,6 @@ fn read_response(
     }
 }
 
-/// 等通知（同 id 的响应须先被 `read_response` 取走；导出场景里的 progress 会被跳过）。
-fn wait_notification(
-    rx: &Receiver<serde_json::Value>,
-    method: &str,
-    timeout: Duration,
-) -> serde_json::Value {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left) {
-            Ok(v) if v.get("method").and_then(|x| x.as_str()) == Some(method) => return v,
-            Ok(_) => continue,
-            Err(RecvTimeoutError::Timeout) => panic!("timeout waiting notification {method}"),
-            Err(RecvTimeoutError::Disconnected) => panic!("daemon closed stdout"),
-        }
-    }
-}
-
 /// `device.list` 的 `devices[0]` = `--image` 注册项（打开项恒在最前）。
 fn first_image_device(stdin: &mut ChildStdin, rx: &Receiver<serde_json::Value>) -> String {
     send(
@@ -113,6 +95,8 @@ fn first_image_device(stdin: &mut ChildStdin, rx: &Receiver<serde_json::Value>) 
 }
 
 /// 快扫至 completed（返回 taskId）；导出用例统一以此落库。
+/// 响应与 `scan.finished` 竞序（1MiB 卷毫秒级扫完）⇒ 走顺序容忍取数器，不得用 `read_response`
+/// 先吞响应（否则先到的通知被丢，30s 后超时红——qual 实测命中）。
 fn scan_to_completed(
     stdin: &mut ChildStdin,
     rx: &Receiver<serde_json::Value>,
@@ -122,10 +106,10 @@ fn scan_to_completed(
         stdin,
         json!({"jsonrpc":"2.0","id":2,"method":"scan.start","params":{"device":dev_id}}),
     );
-    let task_id = read_response(rx, 2, Duration::from_secs(10))["result"]["taskId"]
-        .as_i64()
-        .unwrap();
-    let fin = wait_notification(rx, "scan.finished", Duration::from_secs(30));
+    let (st, fin) =
+        collect_response_and_notification(rx, 2, "scan.finished", Duration::from_secs(30));
+    let task_id = st["result"]["taskId"].as_i64().unwrap();
+    let fin = fin.expect("扫描已起 ⇒ 必有 scan.finished");
     assert_eq!(fin["params"]["taskId"], task_id);
     assert_eq!(fin["params"]["state"], "completed");
     task_id
@@ -160,30 +144,36 @@ fn collect_named_entries(
     out
 }
 
-/// cancel 用例的取数器：cancel 响应与 `export.finished` **顺序不定**（导出可能先跑完 ⇒
-/// finished 先于响应到达），逐行分流收齐两条——`read_response` 会丢弃先到的通知，不能用。
-fn collect_cancel_outcome(
+/// 「响应 + 后续通知」的**顺序容忍**取数器：`start` 类请求在返回响应前就起了后台线程，小任务
+/// （1MiB 卷的扫描、1 件导出——毫秒级）可在响应行之前跑完 ⇒ 通知先到。逐行分流收齐两条；
+/// `read_response`/`wait_notification` 会把先到的那条当噪声丢掉，凡「既要响应又要通知」的
+/// 用例都不能用（qual 探针：150 次全量跑命中 6 次抢跑——5×scan.finished、1×export.finished；
+/// 命中即触发「先到者被丢 → 30s 超时红」，修前实测 2/130 真红）。
+/// 响应带 `error`（任务未起）时不再等通知，返回 `(resp, None)`——调用方先断言错误码。
+fn collect_response_and_notification(
     rx: &Receiver<serde_json::Value>,
     id: i64,
+    method: &str,
     timeout: Duration,
-) -> (serde_json::Value, serde_json::Value) {
+) -> (serde_json::Value, Option<serde_json::Value>) {
     let deadline = Instant::now() + timeout;
-    let (mut resp, mut fin) = (None, None);
-    while resp.is_none() || fin.is_none() {
+    let (mut resp, mut fin): (Option<serde_json::Value>, Option<serde_json::Value>) = (None, None);
+    while !(resp.is_some() && fin.is_some()) {
+        if resp.as_ref().is_some_and(|r| r.get("error").is_some()) {
+            break; // 出错 ⇒ 不会有终报（任务未起）
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
             Ok(v) if v.get("id").and_then(|x| x.as_i64()) == Some(id) => resp = Some(v),
-            Ok(v) if v.get("method").and_then(|x| x.as_str()) == Some("export.finished") => {
-                fin = Some(v)
-            }
+            Ok(v) if v.get("method").and_then(|x| x.as_str()) == Some(method) => fin = Some(v),
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {
-                panic!("等 cancel 响应/export.finished 超时（resp={resp:?} fin={fin:?}）")
+                panic!("等响应 id={id}/{method} 超时（resp={resp:?} fin={fin:?}）")
             }
             Err(RecvTimeoutError::Disconnected) => panic!("daemon closed stdout"),
         }
     }
-    (resp.unwrap(), fin.unwrap())
+    (resp.unwrap(), fin)
 }
 
 /// happy 夹具（计划 Step 4.1 的「exfat 两文件」）：LIVE_A.TXT 5000B 模式字节 + LIVE_B.PNG 真 PNG。
@@ -243,7 +233,8 @@ fn exports_all_bytes_exactly() {
         json!({"jsonrpc":"2.0","id":3,"method":"export.start",
                "params":{"taskId":task_id,"idxs":idxs,"targetDir":out.to_str().unwrap()}}),
     );
-    let st = read_response(&rx, 3, Duration::from_secs(10));
+    let (st, exf) =
+        collect_response_and_notification(&rx, 3, "export.finished", Duration::from_secs(30));
     assert_eq!(st["result"]["fileCount"], 2, "{st}");
     assert_eq!(
         st["result"]["estimatedBytes"].as_u64(),
@@ -251,8 +242,7 @@ fn exports_all_bytes_exactly() {
         "estimated = Σ sizeBytes：{st}"
     );
     assert!(st["result"]["exportId"].is_u64(), "{st}");
-
-    let exf = wait_notification(&rx, "export.finished", Duration::from_secs(30));
+    let exf = exf.expect("导出已起 ⇒ 必有终报");
     let p = &exf["params"];
     assert_eq!(p["exportId"], st["result"]["exportId"]);
     assert_eq!(p["succeeded"], 2, "{exf}");
@@ -310,10 +300,10 @@ fn degraded_reported_for_damaged_deleted() {
         json!({"jsonrpc":"2.0","id":3,"method":"export.start",
                "params":{"taskId":task_id,"idxs":idxs,"targetDir":out.to_str().unwrap()}}),
     );
-    let st = read_response(&rx, 3, Duration::from_secs(10));
+    let (st, exf) =
+        collect_response_and_notification(&rx, 3, "export.finished", Duration::from_secs(30));
     assert!(st.get("error").is_none(), "{st}");
-
-    let exf = wait_notification(&rx, "export.finished", Duration::from_secs(30));
+    let exf = exf.expect("导出已起 ⇒ 必有终报");
     let p = &exf["params"];
     assert_eq!(p["degraded"], 1, "{exf}");
     assert_eq!(p["succeeded"], 1, "{exf}");
@@ -405,10 +395,12 @@ fn cancel_stops_export_two_state_tolerance() {
         &mut stdin,
         json!({"jsonrpc":"2.0","id":6,"method":"export.cancel","params":{"exportId":export_id}}),
     );
-    let (c, exf) = collect_cancel_outcome(&rx, 6, Duration::from_secs(30));
+    let (c, exf) =
+        collect_response_and_notification(&rx, 6, "export.finished", Duration::from_secs(30));
     let state = c["result"]["state"].as_str().unwrap_or_else(|| {
         panic!("cancel 须 ok（未知 id 才是 -32602）：{c}");
     });
+    let exf = exf.expect("cancel 命中运行中态 ⇒ 必有终报");
     let p = &exf["params"];
     assert_eq!(p["exportId"].as_u64(), Some(export_id), "{exf}");
     let (succ, deg, fail) = (
@@ -565,15 +557,15 @@ fn carved_unknown_ext_reports_failed_and_leaves_no_residue() {
         json!({"jsonrpc":"2.0","id":3,"method":"export.start",
                "params":{"taskId":task_id,"idxs":[42],"targetDir":out.to_str().unwrap()}}),
     );
-    let st = read_response(&rx, 3, Duration::from_secs(10));
+    let (st, exf) =
+        collect_response_and_notification(&rx, 3, "export.finished", Duration::from_secs(30));
     assert!(
         st.get("error").is_none(),
         "伪造行须过父侧校验（条目在场即可）：{st}"
     );
     assert_eq!(st["result"]["fileCount"], 1, "{st}");
     assert_eq!(st["result"]["estimatedBytes"], 4096, "{st}");
-
-    let exf = wait_notification(&rx, "export.finished", Duration::from_secs(30));
+    let exf = exf.expect("导出已起 ⇒ 必有终报");
     let p = &exf["params"];
     assert_eq!(p["succeeded"], 0, "{exf}");
     assert_eq!(p["degraded"], 0, "{exf}");
@@ -630,10 +622,10 @@ fn hostile_row_names_and_ext_cannot_escape_target_dir() {
         json!({"jsonrpc":"2.0","id":3,"method":"export.start",
                "params":{"taskId":task_id,"idxs":[42,43],"targetDir":out.to_str().unwrap()}}),
     );
-    let st = read_response(&rx, 3, Duration::from_secs(10));
+    let (st, exf) =
+        collect_response_and_notification(&rx, 3, "export.finished", Duration::from_secs(30));
     assert!(st.get("error").is_none(), "{st}");
-
-    let exf = wait_notification(&rx, "export.finished", Duration::from_secs(30));
+    let exf = exf.expect("导出已起 ⇒ 必有终报");
     let p = &exf["params"];
     assert_eq!(p["succeeded"], 1, "活条目按簇读出整件成功：{exf}");
     assert_eq!(p["degraded"], 0, "{exf}");
