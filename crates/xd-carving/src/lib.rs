@@ -9,6 +9,8 @@
 //! 并行收益须实测后按需加，届时并行的是"多个 run 的读"而非签名匹配）。
 
 pub mod crc32;
+mod jpeg;
 pub mod signatures;
 
+pub use jpeg::carve_jpeg;
 pub use signatures::{Carved, Cursor};
