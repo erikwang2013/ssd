@@ -9,6 +9,7 @@ use xd_device::BlockDevice;
 const EXFAT_SIG: &[u8; 8] = b"EXFAT   ";
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExfatBoot {
     pub bytes_per_sector_shift: u8,
     pub sectors_per_cluster_shift: u8,
@@ -112,16 +113,22 @@ fn geometry(sector: &[u8]) -> Result<ExfatBoot, ExfatError> {
 
     let bad = |m: &str| ExfatError::InvalidBoot(m.to_string());
     if !(9..=12).contains(&bytes_per_sector_shift) {
-        return Err(bad("bytes_per_sector_shift 越界"));
+        return Err(bad(&format!(
+            "bytes_per_sector_shift 越界: {bytes_per_sector_shift}"
+        )));
     }
     if sectors_per_cluster_shift > 25 - bytes_per_sector_shift {
-        return Err(bad("sectors_per_cluster_shift 越界"));
+        return Err(bad(&format!(
+            "sectors_per_cluster_shift 越界: {sectors_per_cluster_shift}"
+        )));
     }
     if number_of_fats != 1 && number_of_fats != 2 {
-        return Err(bad("number_of_fats 非法"));
+        return Err(bad(&format!("number_of_fats 非法: {number_of_fats}")));
     }
     if fat_offset < 24 || fat_length < 1 {
-        return Err(bad("fat_offset/fat_length 非法"));
+        return Err(bad(&format!(
+            "fat_offset/fat_length 非法: {fat_offset}/{fat_length}"
+        )));
     }
     let sector_bytes = 1u64 << bytes_per_sector_shift;
     let heap_min = fat_offset as u64 + fat_length as u64 * number_of_fats as u64;
@@ -131,11 +138,12 @@ fn geometry(sector: &[u8]) -> Result<ExfatBoot, ExfatError> {
     if volume_length < cluster_heap_offset as u64 {
         return Err(bad("volume_length 小于 cluster_heap_offset"));
     }
-    if !(1..=0xFFFF_FFF6).contains(&cluster_count) {
-        return Err(bad("cluster_count 越界"));
+    // 上界 2^32−11：不得把 BAD_CLUSTER(0xFFFFFFF7) 等保留值放进合法簇域
+    if !(1..=0xFFFF_FFF5).contains(&cluster_count) {
+        return Err(bad(&format!("cluster_count 越界: {cluster_count}")));
     }
     if !(2..=cluster_count as u64 + 1).contains(&(root_cluster as u64)) {
-        return Err(bad("root_cluster 越界"));
+        return Err(bad(&format!("root_cluster 越界: {root_cluster}")));
     }
     let fat_min_bytes = ((cluster_count as u64 + 2) * 4).div_ceil(sector_bytes);
     if fat_length as u64 * sector_bytes < fat_min_bytes {
@@ -166,7 +174,13 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<ExfatBoot, ExfatError> {
     if &head[3..11] != EXFAT_SIG {
         return Err(ExfatError::InvalidBoot("EXFAT 签名不符".into()));
     }
-    let bps = 1u64 << head[108];
+    let bps_shift = head[108];
+    if !(9..=12).contains(&bps_shift) {
+        return Err(ExfatError::InvalidBoot(format!(
+            "bytes_per_sector_shift 越界: {bps_shift}"
+        )));
+    }
+    let bps = 1u64 << bps_shift;
     // bps > 512 时补齐再解析
     let mut sector = head.to_vec();
     if bps > 512 {
@@ -261,20 +275,68 @@ mod tests {
 
     #[test]
     fn rejects_bad_geometry() {
-        let cases: &[(usize, Vec<u8>, &str)] = &[
-            (108, vec![8], "bps_shift=8"),
-            (109, vec![17], "spc_shift=17"),
-            (110, vec![3], "number_of_fats=3"),
-            (80, 23u32.to_le_bytes().to_vec(), "fat_offset=23"),
-            (92, 0u32.to_le_bytes().to_vec(), "cluster_count=0"),
-            (96, 300u32.to_le_bytes().to_vec(), "root=300"),
+        let cases: &[(usize, Vec<u8>, &str, &str)] = &[
+            (108, vec![8], "bytes_per_sector_shift", "bps_shift=8"),
+            (109, vec![17], "sectors_per_cluster_shift", "spc_shift=17"),
+            (110, vec![3], "number_of_fats", "number_of_fats=3"),
+            (
+                80,
+                23u32.to_le_bytes().to_vec(),
+                "fat_offset",
+                "fat_offset=23",
+            ),
+            (
+                92,
+                0u32.to_le_bytes().to_vec(),
+                "cluster_count",
+                "cluster_count=0",
+            ),
+            (
+                96,
+                300u32.to_le_bytes().to_vec(),
+                "root_cluster",
+                "root=300",
+            ),
         ];
-        for (off, bytes, what) in cases {
+        for (off, bytes, expect, what) in cases {
             let mut img = xd_fixtures::ExfatImageBuilder::new().build();
             patch_boot_both(&mut img, &[(*off, bytes.as_slice())]);
             let (_f, dev) = dev_for(&img);
-            assert!(parse(&dev).is_err(), "{what} 应被拒绝");
+            assert!(
+                matches!(parse(&dev), Err(ExfatError::InvalidBoot(m)) if m.contains(expect)),
+                "{what}: 实际 {:?}",
+                parse(&dev)
+            );
         }
+    }
+
+    #[test]
+    fn rejects_bad_bps_shift_without_panic() {
+        // 108=64：修复前 debug 移位溢出 panic / release 容量溢出
+        let mut img = xd_fixtures::ExfatImageBuilder::new().build();
+        patch_boot_both(&mut img, &[(108, &64u8.to_le_bytes())]);
+        let (_f, dev) = dev_for(&img);
+        assert!(
+            matches!(parse(&dev), Err(ExfatError::InvalidBoot(m)) if m.contains("bytes_per_sector_shift"))
+        );
+    }
+
+    #[test]
+    fn backup_geometry_bps_guard_load_bearing() {
+        // 主区失效（byte80 篡改）+ 备区 byte108=13（按 512 宽重算备区 checksum）
+        // → 必须拒绝备区几何，不得返回 Ok{bps_shift:13}
+        let mut img = xd_fixtures::ExfatImageBuilder::new().build();
+        img[80] = 25;
+        img[12 * 512 + 108] = 13;
+        let sum = xd_fixtures::boot_checksum(&img[12 * 512..12 * 512 + 512 * 11]);
+        for k in 0..128 {
+            img[(12 + 11) * 512 + k * 4..(12 + 11) * 512 + k * 4 + 4]
+                .copy_from_slice(&sum.to_le_bytes());
+        }
+        let (_f, dev) = dev_for(&img);
+        assert!(
+            matches!(parse(&dev), Err(ExfatError::InvalidBoot(m)) if m.contains("bytes_per_sector_shift"))
+        );
     }
 
     #[test]
@@ -306,6 +368,7 @@ mod tests {
         let (_f, dev) = dev_for(&img);
         let b = parse(&dev).unwrap(); // 不 panic 即达标（宽容语义见 doc）
         assert_eq!(b.cluster_count, 252);
+        assert_eq!(b.volume_length, u64::MAX);
     }
 
     #[test]
