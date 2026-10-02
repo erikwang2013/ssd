@@ -4,3 +4,4 @@
 pub mod api;
 pub mod handlers;
 pub mod notify;
+pub mod store;
