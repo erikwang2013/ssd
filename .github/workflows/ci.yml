@@ -29,6 +29,21 @@ jobs:
       - run: bash scripts/e2e-loop.sh
         if: runner.os == 'Linux'
 
+  package-deb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y libxml2-utils
+      - run: cargo build --locked --release -p xd-daemon
+      - run: bash scripts/build-deb.sh
+      - run: bash scripts/e2e-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xiaodun-deb
+          path: dist/*.deb
+
   flutter:
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+# 让已插入的块设备重新触发规则（U 盘通常安装后才插，无需此步也可）
+if command -v udevadm >/dev/null 2>&1; then
+  udevadm control --reload-rules || true   # 旧 udevd 的保险（255+ 自动重载 rules 目录）
+  udevadm trigger --action=change --subsystem-match=block || true
+fi
+exit 0
