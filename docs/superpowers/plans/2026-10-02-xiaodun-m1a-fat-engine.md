@@ -1268,6 +1268,17 @@ mod tests {
     }
 
     #[test]
+    fn wild_cluster_on_fat12_does_not_overflow() {
+        // 0xAAAA_AAAB 的 12 位偏移加法曾经 u32 溢出（debug panic）；u64 后为超设备偏移 → Err
+        let image = xd_fixtures::FatImageBuilder::fat12().build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let err = fat.entry(0xAAAA_AAAB).unwrap_err();
+        assert!(matches!(err, FatError::InvalidBpb(m) if m.contains("beyond device")));
+    }
+
+    #[test]
     fn is_free_reports_freed_clusters() {
         let image = xd_fixtures::FatImageBuilder::fat16()
             .add_file("/", "GONE.BIN", &[0u8; 1024])
@@ -1395,7 +1406,7 @@ impl<'d> Fat<'d> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 18 passed（13 + 5）。
+Expected: 19 passed（13 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -1668,7 +1679,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 24 passed（18 + 6）。
+Expected: 25 passed（19 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -1926,7 +1937,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 29 passed（24 + 5）。
+Expected: 30 passed（25 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -2025,7 +2036,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 32 passed（29 + 3）。
+Expected: 33 passed（30 + 3）。
 
 - [ ] **Step 5: Commit**
 
@@ -2087,7 +2098,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 33 passed（32 + 1，含新 e2e）。
+Expected: 34 passed（33 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
