@@ -2637,6 +2637,18 @@ bash scripts/e2e.sh
 
 **变异实证汇总**：spec+qual 合计 KILL ≈ 20 个变异（含早分支回退连续、位图门控、live/deleted 车道混淆、链不足 Complete 等），等价变异 1（scan 连续臂界卫仅短路——`is_free` Err 已兜）、1 处判别力归属修正（G2 末簇→三簇中段；G3 设备尾巧合→堆中段，均以 qual 预定义 M1/M2 复刻双红收口）。**既有 15 个删除/分级测试逐函数体比对零改动、行为零变化**（spec 独立验证）。
 
+### T5（scan_task 编排 + 路由 + 协议号收尾）—— impl-m1b-t5。提交沿革：`f2bf297`（主）→ `c1c6cf2`（FAT 冒烟+窄窗注记）→ `00a84eb`（spec 收尾：restart 护栏/README 三处/模块头）→ `ce56d21`（qual 收尾：两缺口补测/线程命名/残留）。DONE → spec **PASS**（flake 0/40）→ qual ISSUES → 补丁 → 定点自证（T5 关闭，283/0；workspace 262 → 283）
+
+**产物**：`scan_task.rs`（公开 API/状态机，285 行）+ `scan_worker.rs`（worker 内部，183 行）+ `testutil.rs`；handlers 六路由 + CoreCtx Arc 化；Dart fake 收尾。
+
+**计划缺陷（实施者实修，均编译/门禁所迫）**：计划测试代码两处 `let Response::Err(..) = …;` 缺 `else`（E0005）；clippy 两处（`type_complexity` → `ActiveHandle`；`new_ret_no_self` → `SlowDev::wrap`）；golden 往返两处对不上（真 ImageFileDevice 的 id 含绝对路径 → info 桩；`total:42` 需 40 条填充）；cancel 测试原设计会 flake（cancel 同步置态 vs finished 异步）→ 改轮询事件本体；daemon `main.rs` Arc 最小迁移被迫前置（workspace 编译要求）；v0 golden `error_method_not_found` message 修正（scan.start 转正）——v0 封存声明的唯一例外（README 已注）。
+
+**裁定**：FAT 臂零覆盖（实施者自发现）→ 补 `fat_path_smoke_run_worker_and_fat_to_entry_mapping`（映射全字段）；cancel↔resume 窄窗 → **文档化不修**（地面真相一致、不可确定性测试；注记抽至 `Ctrl` doc 覆盖 pause/cancel/resume 三分支）；`restart` 双 worker 脚枪 → 加护栏 + 有牙测试（拒绝无副作用：resume 仍走完）；节流不 pin（无可判别观测手段）；worker 线程命名 `scan-{id}`（stderr 归因）。
+
+**qual 变异表（13 条）**：8 KILL（cancel 检查/paused 驻停/idx 偏移/错误码互换/limit 界/spawn 登记/downcast/restart 护栏）；2 真缺口当场补测并定点自证（`mode` 校验、"已打开优先"）；等价 1（null params）；无判别 2（节流=性能非正确性；worker 终局条件写=竞态护栏类，与窄窗同族可接受）。**flake 压力 0/40**（串行 20 + 并发 20 进程次）。
+
+**前向注记**：`tasks` map 持有 `Arc<dyn BlockDevice>` 至 daemon 退出（M1c 续跑复用；USB 安全弹出前的句柄策略归 M1d/M2）；`mode:"deep"` 现拒绝、M1c 转正时其断言改合法路径；`elapsedMs`=墙钟（README 已改）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
