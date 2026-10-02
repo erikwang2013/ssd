@@ -79,19 +79,25 @@ impl<'d> Fat<'d> {
         Ok(self.is_eoc(v) || v == 1) // 1 = 保留值（坏簇标记亦按链尾处理）
     }
 
-    /// 从 start 顺链读取簇号序列（含 start）。守卫：环/超长链（≤ 全盘簇数 + 2）。
+    /// 从 start 顺链读取簇号序列（含 start）。
+    /// 合法簇号上界为 `data_cluster_count() + 1`；链长超过 `data_cluster_count()` 必含环
+    /// （鸽笼：合法簇数量有限）——T7 可用 `chain.len() > bpb.data_cluster_count()` 判环。
     pub fn chain(&self, start: u32) -> Result<Vec<u32>, FatError> {
+        let max_cluster = self.bpb.data_cluster_count() + 1;
+        if !(2..=max_cluster).contains(&start) {
+            return Err(FatError::InvalidBpb(format!(
+                "chain start {start} out of range"
+            )));
+        }
         let mut out = vec![start];
         let mut cur = start;
-        // M2：越界守卫 count+2 有一格宽（合法簇上界为 count+1）；面对真实损坏盘时收紧或显式记录破损链。
-        let limit = self.bpb.data_cluster_count() + 2;
-        while out.len() as u32 <= limit {
+        while out.len() as u32 <= max_cluster {
             let v = self.entry(cur)?;
-            if v == 0 || self.is_eoc(v) || v == 1 {
+            if v == 0 || v == 1 || self.is_eoc(v) {
                 break;
             }
-            if v < 2 || v > limit {
-                break; // 越界值按断链处理
+            if v > max_cluster {
+                break; // 同时覆盖坏簇标记（0xFF7/0xFFF7/0x0FFF_FFF7）与越界值
             }
             out.push(v);
             cur = v;
@@ -150,6 +156,26 @@ mod tests {
         let bpb = bpb::parse(&dev).unwrap();
         let fat = Fat::new(&dev, &bpb);
         assert_eq!(fat.chain(2).unwrap(), vec![2, 3]); // 600B → 2 簇
+    }
+
+    #[test]
+    fn chain_detects_cycle_within_legal_bound() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "A.BIN", &[0u8; 1024])
+            .build();
+        let mut patched = image.clone();
+        // FAT16 entry(2) @ 516、entry(3) @ 518：造 2→3→2 环
+        patched[516..518].copy_from_slice(&3u16.to_le_bytes());
+        patched[518..520].copy_from_slice(&2u16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let chain = fat.chain(2).unwrap();
+        assert!(
+            chain.len() as u32 > bpb.data_cluster_count(),
+            "环应表现为超长链（> count）"
+        );
+        assert!(chain.len() as u32 <= bpb.data_cluster_count() + 2, "且有界");
     }
 
     #[test]
