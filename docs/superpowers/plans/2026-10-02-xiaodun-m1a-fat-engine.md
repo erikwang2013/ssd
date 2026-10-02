@@ -2107,7 +2107,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 36 passed（31 + 5）。
+Expected: 37 passed（31 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -2227,7 +2227,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 40 passed（36 + 4）。
+Expected: 41 passed（37 + 4）。
 
 - [ ] **Step 5: Commit**
 
@@ -2289,7 +2289,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 41 passed（40 + 1，含新 e2e）。
+Expected: 42 passed（41 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
