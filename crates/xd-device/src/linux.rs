@@ -9,9 +9,12 @@
 //! - 只读铁律落点 = 类型系统（`BlockDevice` 无写方法）+ `O_RDONLY`。
 
 use crate::{BlockDevice, DeviceError, DeviceInfo, DeviceKind};
-use std::fs::File;
-use std::os::unix::fs::{FileExt, FileTypeExt};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{FileExt, FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+/// Linux x86_64 O_NONBLOCK（见 man 2 open）。块设备忽略该位；仅防 `--device <fifo>` 永久阻塞。
+const O_NONBLOCK: i32 = 0o4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -154,7 +157,7 @@ pub fn classify_transport(realpath: &str) -> Transport {
     }
 }
 
-/// 名称白名单（整盘形态）：sd*、nvme*、mmcblk*（排除 boot0/rpmb）、vd*。
+/// 名称白名单（整盘形态）：sd*、nvme*、mmcblk<纯数字>、vd*。
 /// 分区的排除靠 `kind == Volume`（sysfs 的 `partition` 文件），不按名字数位猜。
 fn is_listable_name(name: &str) -> bool {
     if ["loop", "ram", "zram", "dm-", "md", "nbd", "sr"]
@@ -163,13 +166,11 @@ fn is_listable_name(name: &str) -> bool {
     {
         return false;
     }
-    if name.ends_with("boot0") || name.ends_with("rpmb") {
-        return false;
+    if let Some(rest) = name.strip_prefix("mmcblk") {
+        // 紧化形态：mmcblk<纯数字>。boot0/boot1/rpmb/gp0 等伪设备（幻影盘）天然排除。
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
     }
-    name.starts_with("sd")
-        || name.starts_with("nvme")
-        || name.starts_with("mmcblk")
-        || name.starts_with("vd")
+    name.starts_with("sd") || name.starts_with("nvme") || name.starts_with("vd")
 }
 
 /// glibc dev_t 编码（gnu_dev_makedev / major / minor）。
@@ -188,10 +189,12 @@ pub fn block_size_bytes(rdev: u64, sysfs_root: &Path) -> Result<u64, DeviceError
     let (maj, min) = major_minor(rdev);
     let p = sysfs_root.join(format!("dev/block/{maj}:{min}/size"));
     let s = std::fs::read_to_string(&p).map_err(DeviceError::Io)?;
-    s.trim()
-        .parse::<u64>()
-        .map(|n| n * 512)
-        .map_err(|e| DeviceError::NotAFile(format!("坏 size 字段 {}: {e}", p.display())))
+    s.trim().parse::<u64>().map(|n| n * 512).map_err(|e| {
+        DeviceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("坏 size 字段 {}: {e}", p.display()),
+        ))
+    })
 }
 
 /// 只读块设备后端（O_RDONLY；类型系统无写方法）。
@@ -206,7 +209,11 @@ impl LinuxBlockDevice {
     }
 
     pub fn open_with_sysfs(node: &Path, sysfs_root: &Path) -> Result<Self, DeviceError> {
-        let file = File::open(node)?; // O_RDONLY
+        // O_RDONLY + O_NONBLOCK（后者防 --device <fifo> 卡死在 open；块设备忽略该位）
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(node)?;
         let md = file.metadata()?;
         if !md.file_type().is_block_device() {
             return Err(DeviceError::NotAFile(format!(
@@ -214,18 +221,29 @@ impl LinuxBlockDevice {
                 node.display()
             )));
         }
-        let size_bytes = block_size_bytes(std::os::unix::fs::MetadataExt::rdev(&md), sysfs_root)?;
-        let kernel_name = node
+        // 规范路径：--device /dev/disk/by-id/... 解到 /dev/sdX，与枚举项 id 必须逐字一致（T2 去重依赖）
+        let canon = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
+        let kernel_name = canon
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| node.display().to_string());
+            .unwrap_or_else(|| canon.display().to_string());
+        let size_bytes = block_size_bytes(std::os::unix::fs::MetadataExt::rdev(&md), sysfs_root)?;
+        // removable 只存在于 sysfs（块设备 stat 无此信息）；条目缺失 → false
+        let removable = std::fs::read_to_string(
+            sysfs_root
+                .join("block")
+                .join(&kernel_name)
+                .join("removable"),
+        )
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
         Ok(Self {
             info: DeviceInfo {
-                id: format!("unix:{}", node.display()),
+                id: format!("unix:{}", canon.display()),
                 name: kernel_name,
                 kind: DeviceKind::Physical,
                 size_bytes,
-                removable: false,
+                removable,
                 fs_guess: None,
             },
             file,
@@ -239,7 +257,16 @@ impl BlockDevice for LinuxBlockDevice {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        self.file.read_at(buf, offset).map_err(DeviceError::Io)
+        // lib.rs 契约：读取直到填满 buf 或到达 EOF；块设备短读常见，需循环补齐。
+        let mut done = 0usize;
+        while done < buf.len() {
+            match self.file.read_at(&mut buf[done..], offset + done as u64) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(e) => return Err(DeviceError::Io(e)),
+            }
+        }
+        Ok(done)
     }
 }
 
@@ -367,6 +394,7 @@ mod tests {
             ("nbd0", "", 11000, false, None, false),
             ("sr0", "", 12000, false, None, false),
             ("mmcblk0boot0", "", 13000, false, None, false),
+            ("mmcblk0boot1", "", 13001, false, None, false),
             ("mmcblk0rpmb", "", 14000, false, None, false),
             ("sda1", "Part", 15000, false, None, true), // 分区（volume）
         ]);
@@ -377,15 +405,15 @@ mod tests {
 
     #[test]
     fn list_skips_unreadable_entry_not_abort() {
-        // 一个条目 size 文件不可读（近似 EIO 路径）→ 跳过该条目，其余照常返回
+        // 一个条目 size 读不出（近似 EIO 路径）→ 跳过该条目，其余照常返回。
+        // 用同名目录替代 chmod 000：read_to_string 必 EISDIR，root 下同样成立。
         let root = fake_sysfs(&[
             ("sda", "A", 1000, false, None, false),
             ("sdb", "B", 2000, false, None, false),
         ]);
         let sdb_size = root.path().join("class/block/sdb/size");
-        let mut perms = fs::metadata(&sdb_size).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
-        fs::set_permissions(&sdb_size, perms).unwrap();
+        fs::remove_file(&sdb_size).unwrap();
+        fs::create_dir(&sdb_size).unwrap();
         let disks = BlockEnumerator::with_root(root.path()).list().unwrap();
         assert_eq!(
             disks
@@ -394,6 +422,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["sda"]
         );
+    }
+
+    #[test]
+    fn list_skips_non_utf8_entry_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = fake_sysfs(&[("sda", "A", 1000, false, None, false)]);
+        let class = root.path().join("class/block");
+        fs::create_dir(class.join(std::ffi::OsStr::from_bytes(b"sdc\xff"))).unwrap();
+        let disks = BlockEnumerator::with_root(root.path()).list().unwrap();
+        assert_eq!(
+            disks
+                .iter()
+                .map(|d| d.kernel_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sda"]
+        );
+    }
+
+    #[test]
+    fn parse_entry_size_non_numeric_is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let d = root.path().join("class/block/sda");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("size"), "abc\n").unwrap();
+        assert!(parse_disk_entry(&root.path().join("class/block"), "sda").is_none());
+    }
+
+    #[test]
+    fn is_listable_name_mmc_forms() {
+        // 整盘 = mmcblk<纯数字>；boot0/boot1/rpmb/gp0 等伪设备（幻影盘）一律排除
+        assert!(is_listable_name("mmcblk0"));
+        assert!(is_listable_name("mmcblk12"));
+        assert!(!is_listable_name("mmcblk0boot0"));
+        assert!(!is_listable_name("mmcblk0boot1"));
+        assert!(!is_listable_name("mmcblk0rpmb"));
+        assert!(!is_listable_name("mmcblk0gp0"));
+        assert!(!is_listable_name("mmcblk"));
     }
 
     #[test]
