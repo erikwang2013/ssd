@@ -31,4 +31,4 @@ out=dist/xiaodun_${version}_amd64.deb
 mkdir -p dist
 dpkg-deb --build --root-owner-group "$stage" "$out"
 echo "built: $out"
-dpkg-deb -I "$out" | head -12
+dpkg-deb -I "$out" | head -12 || true   # pipefail 下 dpkg-deb 第 13 行的 SIGPIPE 竞态（实测并行 3/10；|| true 后 0/60）
