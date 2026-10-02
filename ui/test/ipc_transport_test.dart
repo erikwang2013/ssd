@@ -1,6 +1,7 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 // 传输层单元测试：用 /bin/sh 假 daemon 在进程级钉住「无 id 行 = 通知」分流、
 // 应答配对与线上请求逐字（参数构造）。真 daemon 往返见 ipc_integration_test.dart。
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -28,11 +29,19 @@ sleep 5
     );
     addTearDown(client.close);
     final events = <Map<String, dynamic>>[];
-    final sub = client.notifications.listen(events.add);
+    final firstEvent = Completer<void>();
+    final sub = client.notifications.listen((event) {
+      events.add(event);
+      if (!firstEvent.isCompleted) firstEvent.complete();
+    });
     addTearDown(sub.cancel);
+    // 多监听者：notifications 必须 broadcast（T5 扫描页 + T8 导出页可同时在场）
+    final sub2 = client.notifications.listen((_) {});
+    addTearDown(sub2.cancel);
 
     final status = await client.scanStatus(1);
-    await Future<void>.delayed(const Duration(milliseconds: 100));
+    // 通知先于应答写出（假 daemon 顺序固定）——等到达而非固定睡眠
+    await firstEvent.future.timeout(const Duration(seconds: 5));
 
     // 应答只由带 id 行完成（通知不得污染在途请求）
     expect(status.readBytes, 5);
@@ -55,5 +64,10 @@ sleep 5
       'method': 'scan.status',
       'params': {'taskId': 1},
     });
+    // close 语义 = 通知流 onDone（T5 进度订阅以此收尾）；double-close 幂等（tearDown 兜底）
+    var done = false;
+    client.notifications.listen(null, onDone: () => done = true);
+    await client.close();
+    expect(done, isTrue);
   }, skip: Platform.isWindows ? 'POSIX sh 假 daemon' : null);
 }

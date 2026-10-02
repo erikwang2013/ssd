@@ -120,9 +120,17 @@ class FakeCoreClient implements CoreClient {
       deletedOnly: deletedOnly,
     ));
     _fail('scanResults');
-    final filtered = deletedOnly
-        ? entries.where((e) => e.deleted).toList()
-        : entries;
+    if (limit < 1 || limit > 1000) {
+      // daemon 契约（xd-core handlers.rs）：limit ∈ 1..=1000，文案逐字
+      throw const RpcException(
+        -32602,
+        'Invalid params: limit out of range 1..=1000',
+      );
+    }
+    // daemon 侧 ORDER BY idx：分页排序键 = idx，乱序注入也按 idx 出页
+    final filtered =
+        (deletedOnly ? entries.where((e) => e.deleted) : entries).toList()
+          ..sort((a, b) => a.idx.compareTo(b.idx));
     return ScanResultsPage(
       total: filtered.length,
       entries: filtered.skip(offset).take(limit).toList(),
