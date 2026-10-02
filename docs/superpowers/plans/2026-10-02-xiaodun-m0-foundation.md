@@ -1796,8 +1796,8 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: 3.47.5
-      - run: cargo build -p xd-daemon --locked
       - run: dart format --output=none --set-exit-if-changed lib test
+      - run: cargo build -p xd-daemon --locked
       - run: flutter analyze
       - run: flutter test
         env:
