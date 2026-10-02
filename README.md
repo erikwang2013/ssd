@@ -86,5 +86,20 @@ docs/       # 文档与设计
 
 ## 项目状态
 
-**设计阶段**——设计文档已定稿，代码尚未开始。目标：全端 1.0 约 9-12 个月
-（5-6 人团队，4 条工作流并行）。
+**M0 地基完成**（v0.1.0）——Rust 核心（IPC 契约 v0、只读镜像后端、stdio daemon）与
+Flutter 骨架（协议模型、设备列表页）已端到端打通，CI 三平台矩阵就位。
+下一步：M1（FAT/exFAT 快速扫描、照片雕刻、Windows 提权打包）。目标：全端 1.0
+约 9-12 个月（5-6 人团队，4 条工作流并行）。
+
+### M0 快速上手
+
+```bash
+# Rust 侧：全部测试 + 端到端冒烟
+cargo test --workspace
+bash scripts/e2e.sh
+
+# UI 侧：构建 daemon，以镜像设备启动桌面应用（Linux/macOS/Windows）
+cargo build -p xd-daemon
+bash fixtures/gen_image.sh /tmp/xiaodun.img 1048576
+cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon XD_IMAGE=/tmp/xiaodun.img flutter run -d linux
+```
