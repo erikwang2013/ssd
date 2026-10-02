@@ -99,10 +99,18 @@ impl FatImageBuilder {
             placed.push((take, f.data.clone(), i));
         }
 
-        // ---- 写数据 ----
+        // ---- 写数据（按 FAT 链逐簇落盘：释放簇复用可能碎裂，从首簇线性写会
+        // 溢出到相邻文件的数据簇，导致内容与链不一致）----
         for (clusters, data, _) in &placed {
-            let start = (DATA_START * BPS + (clusters[0] - 2) * BPS) as usize;
-            image[start..start + data.len()].copy_from_slice(data);
+            for (j, &c) in clusters.iter().enumerate() {
+                let off = j * BPS as usize;
+                if off >= data.len() {
+                    break; // 空文件；末簇不足 512B 时下面按实际长度截断
+                }
+                let end = (off + BPS as usize).min(data.len());
+                let start = (DATA_START * BPS + (c - 2) * BPS) as usize;
+                image[start..start + (end - off)].copy_from_slice(&data[off..end]);
+            }
         }
 
         // ---- 根目录项（32B 槽；删除项首字节 0xE5）----
@@ -273,5 +281,21 @@ mod tests {
         assert_eq!(u16::from_le_bytes([img[rd + 26], img[rd + 27]]), 3);
         // IMG 的 FAT 链未写（已释放）
         assert_eq!(u16::from_le_bytes([img[512 + 4], img[512 + 5]]), 0);
+    }
+
+    #[test]
+    fn fragmented_reuse_writes_data_per_cluster() {
+        // 删 A 后建 3 簇的 C：C 复用 [2,3] + 新簇 6（碎裂），数据必须按链逐簇落盘
+        let img = FatImageBuilder::fat16()
+            .add_file("/", "A.BIN", &[0xA1; 1024]) // 簇 2,3
+            .add_file("/", "B.BIN", &[0xB2; 1024]) // 簇 4,5（存活，不得被写穿）
+            .delete("/", "A.BIN")
+            .add_file("/", "C.BIN", &[0xC3; 1536])
+            .build();
+        let cl = |n: usize| (50 + (n - 2)) * 512;
+        assert_eq!(u16::from_le_bytes([img[512 + 6], img[512 + 7]]), 6); // FAT[3]=6（跳过洞）
+        assert_eq!(u16::from_le_bytes([img[512 + 12], img[512 + 13]]), 0xFFFF); // FAT[6]=EOC
+        assert_eq!([img[cl(2)], img[cl(3)], img[cl(6)]], [0xC3; 3]); // C 三分片各就其簇
+        assert_eq!([img[cl(4)], img[cl(5)]], [0xB2; 2]); // B 完好
     }
 }
