@@ -31,6 +31,10 @@ fn deleted_photo_fully_recovered_from_exfat_image() {
     );
     assert_eq!(photo_entry.size_bytes, 12000);
     assert_eq!(photo_entry.path, "/DCIM");
+    assert_eq!(
+        photo_entry.quality,
+        xd_fs_exfat::scan::RecoverQuality::Complete
+    );
     assert_eq!(entries.iter().filter(|e| e.deleted).count(), 1);
 
     let recovered = xd_fs_exfat::scan::read_file(&dev, photo_entry).unwrap();
@@ -53,8 +57,9 @@ fn deleted_photo_fully_recovered_from_exfat_image() {
 #[test]
 fn deleted_chained_photo_recovered_byte_exact() {
     let photo: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+    // 碎片化：数据段 0/1/2 分别落在簇 6/9/7（NoFatChain=0 → 读侧须按 stale FAT 链序拼接）
     let image_bytes = xd_fixtures::ExfatImageBuilder::new()
-        .add_file_chained("/", "BURST.BIN", &photo)
+        .add_file_in_clusters("/", "BURST.BIN", &photo, &[6, 9, 7], false)
         .delete("/", "BURST.BIN")
         .build();
 
@@ -69,5 +74,6 @@ fn deleted_chained_photo_recovered_byte_exact() {
         .into_iter()
         .find(|e| e.deleted)
         .expect("deleted file not found");
+    assert_eq!(e.name, "BURST.BIN");
     assert_eq!(xd_fs_exfat::scan::read_file(&dev, &e).unwrap(), photo);
 }
