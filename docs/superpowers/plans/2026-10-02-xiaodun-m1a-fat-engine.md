@@ -174,6 +174,22 @@ Expected: 编译失败（`FatImageBuilder` 未定义）。
 //! 参数固定（T1 只支持 FAT16；T2 扩展 FAT12/32）：bps=512、spc=1、reserved=1、
 //! fats=1、root_entries=512、fat_size=17 扇区、total=4224 扇区（≈2.1 MiB）。
 //! 4174 数据簇 ≥ 4085 → 按微软簇数规则也是真 FAT16（避免真实驱动判为 FAT12）。
+//!
+//! 契约（测试作者必读）：
+//! 1. 写入历史按调用顺序模拟：delete() 的时刻记为 files.len()，该文件的簇在
+//!    「下一次 add 时」才被释放 → 只有删除**之后**添加的文件才可能复用其簇。
+//! 2. M1a 恢复按「连续簇假设」：碎裂的已删文件（其后有新文件绕过空洞占其邻簇）
+//!    连续回退读可能读到他人字节——刻意的夹具边界，勿在 T6/T8 构造该形状。
+//!
+//! 夹具边界（测试作者必读二）：
+//! - 子目录含真实 "." / ".." 目录项；扫描器必须跳过（T5 parse_directory_bytes 已处理）。
+//! - 目录簇取最低空闲簇并写 EOC（单簇目录，不产生多簇目录链）。
+//! - 容量上限（超限触发 fail-fast 断言）：FAT32 根 16 项 / 子目录 14 成员 /
+//!   FAT12 根 224 项 / FAT16 根 512 项；簇池 FAT12 1006 / FAT16 4174 /
+//!   FAT32 1952（根目录占 1 → 文件可用 1951）。
+//! - FAT32 为简化版扩展 BPB（fsinfo 声明但空、16 位簇字段、单 FAT 副本、
+//!   簇数 < 65525 → 真实驱动会拒认；本引擎结构优先判型不受影响）。
+//! - encode_sfn 只接受 ASCII ≤ 8.3（超长/非 ASCII 由 debug_assert 拦截）。
 
 pub const BPS: u32 = 512; // bytes per sector
 pub const TOTAL_SECTORS: u32 = 4224;
@@ -253,6 +269,11 @@ impl FatImageBuilder {
             }
             next_free.sort_unstable();
             let count = (f.data.len() as u32).div_ceil(BPS).max(1);
+            assert!(
+                next_free.len() >= count as usize,
+                "簇池不足：需要 {count} 簇，仅剩 {}（夹具卷太小）",
+                next_free.len()
+            );
             let take: Vec<u32> = next_free.drain(..count as usize).collect();
             if f.deleted_at.is_none() {
                 // 存活文件写 FAT 链（末簇 EOC=0xFFFF）；删除文件不写链（已释放）
@@ -418,6 +439,34 @@ git commit -m "feat(fixtures): FAT16 合成镜像构建器（分配/删除/簇�
         assert_eq!(u16::from_le_bytes([image[base + 90], image[base + 91]]), 3);
         assert_eq!(&image[(50 + (3 - 2)) * 512..][..5], b"inner");
     }
+
+    #[test]
+    #[should_panic(expected = "根目录单簇容量不足")]
+    fn fat32_root_capacity_fails_fast() {
+        let mut b = FatImageBuilder::fat32();
+        for i in 0..17 {
+            b.add_file("/", &format!("F{i:02}.TXT"), b"x");
+        }
+        b.build();
+    }
+
+    #[test]
+    #[should_panic(expected = "成员超出单簇容量")]
+    fn subdir_capacity_fails_fast() {
+        let mut b = FatImageBuilder::fat16();
+        b.add_subdir("/", "DIR");
+        for i in 0..15 {
+            b.add_file("/DIR", &format!("M{i:02}.TXT"), b"x");
+        }
+        b.build();
+    }
+
+    #[test]
+    #[should_panic(expected = "簇池不足")]
+    fn pool_exhaustion_fails_fast() {
+        let data = vec![0u8; 1007 * 512]; // FAT12 池 1006 簇，差一簇
+        FatImageBuilder::fat12().add_file("/", "BIG.BIN", &data).build();
+    }
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -549,6 +598,11 @@ impl FatImageBuilder {
             }
             next_free.sort_unstable();
             let count = (f.data.len() as u32).div_ceil(BPS).max(1);
+            assert!(
+                next_free.len() >= count as usize,
+                "簇池不足：需要 {count} 簇，仅剩 {}（夹具卷太小）",
+                next_free.len()
+            );
             let take: Vec<u32> = next_free.drain(..count as usize).collect();
             if f.deleted_at.is_none() {
                 for (j, &c) in take.iter().enumerate() {
@@ -585,6 +639,24 @@ impl FatImageBuilder {
             }
         }
 
+        // 槽位容量 fail-fast（静默溢出会覆盖活文件数据簇）
+        let root_file_count = placed
+            .iter()
+            .filter(|(_, _, fi)| self.files[*fi].dir == "/")
+            .count();
+        if root_entries == 0 {
+            assert!(
+                dir_clusters.len() + root_file_count <= BPS as usize / 32,
+                "FAT32 根目录单簇容量不足（最多 {} 项）",
+                BPS as usize / 32
+            );
+        } else {
+            assert!(
+                dir_clusters.len() + root_file_count <= root_entries as usize,
+                "根目录项超出 root_entries={root_entries}"
+            );
+        }
+
         // 根目录槽
         let mut slot = (root_start * BPS) as usize;
         for (dir, cluster) in &dir_clusters {
@@ -609,6 +681,15 @@ impl FatImageBuilder {
 
         // 子目录内容区（每个一簇）："." ".." + 成员项
         for (idx, (dir, cluster)) in dir_clusters.iter().enumerate() {
+            let members = placed
+                .iter()
+                .filter(|(_, _, fi)| self.files[*fi].dir == format!("/{dir}"))
+                .count();
+            assert!(
+                members + 2 <= BPS as usize / 32,
+                "子目录 {dir} 成员超出单簇容量（最多 {} + 2）",
+                BPS as usize / 32 - 2
+            );
             let base = (data_start * BPS + (cluster - 2) * BPS) as usize;
             let parent_cluster = if root_cluster_actual >= 2 { root_cluster_actual } else { 0 };
             let mut e = [0u8; 32];
