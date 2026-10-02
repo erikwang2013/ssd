@@ -22,22 +22,12 @@ impl<'d> Fat<'d> {
         match self.bpb.fat_type {
             FatType::Fat32 => {
                 let mut b = [0u8; 4];
-                let n = self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
-                if n < 4 {
-                    return Err(FatError::InvalidBpb(format!(
-                        "fat entry {cluster} beyond device"
-                    )));
-                }
+                self.read_entry(self.bpb.fat_entry_byte(cluster), &mut b, cluster)?;
                 Ok(u32::from_le_bytes(b) & 0x0FFF_FFFF)
             }
             FatType::Fat16 => {
                 let mut b = [0u8; 2];
-                let n = self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
-                if n < 2 {
-                    return Err(FatError::InvalidBpb(format!(
-                        "fat entry {cluster} beyond device"
-                    )));
-                }
+                self.read_entry(self.bpb.fat_entry_byte(cluster), &mut b, cluster)?;
                 Ok(u16::from_le_bytes(b) as u32)
             }
             FatType::Fat12 => {
@@ -45,12 +35,7 @@ impl<'d> Fat<'d> {
                     + cluster as u64
                     + cluster as u64 / 2;
                 let mut b = [0u8; 2];
-                let n = self.dev.read_at(off, &mut b)?;
-                if n < 2 {
-                    return Err(FatError::InvalidBpb(format!(
-                        "fat entry {cluster} beyond device"
-                    )));
-                }
+                self.read_entry(off, &mut b, cluster)?;
                 let pair = u16::from_le_bytes(b) as u32;
                 Ok(if cluster.is_multiple_of(2) {
                     pair & 0x0FFF
@@ -59,6 +44,17 @@ impl<'d> Fat<'d> {
                 })
             }
         }
+    }
+
+    /// 读取表项字节；短读（EOF）返回错误而非静默 0。
+    fn read_entry(&self, off: u64, buf: &mut [u8], cluster: u32) -> Result<(), FatError> {
+        let n = self.dev.read_at(off, buf)?;
+        if n < buf.len() {
+            return Err(FatError::InvalidBpb(format!(
+                "fat entry {cluster} beyond device"
+            )));
+        }
+        Ok(())
     }
 
     pub fn is_free(&self, cluster: u32) -> Result<bool, FatError> {
@@ -73,10 +69,10 @@ impl<'d> Fat<'d> {
         }
     }
 
-    /// `entry` 指向链尾（含 EOC/**保留值/坏簇**——都视为不可继续）。
+    /// entry 指向链尾（EOC 或保留值 1）——两者都视为不可继续。
     pub fn is_eoc_reachable(&self, cluster: u32) -> Result<bool, FatError> {
         let v = self.entry(cluster)?;
-        Ok(self.is_eoc(v) || v == 1) // 1 = 保留值（坏簇标记亦按链尾处理）
+        Ok(self.is_eoc(v) || v == 1) // 1 = 保留值（不可继续）
     }
 
     /// 从 start 顺链读取簇号序列（含 start）。
@@ -97,7 +93,7 @@ impl<'d> Fat<'d> {
                 break;
             }
             if v > max_cluster {
-                break; // 同时覆盖坏簇标记（0xFF7/0xFFF7/0x0FFF_FFF7）与越界值
+                break; // 顺带接住坏簇标记（0xFF7/0xFFF7/0x0FFF_FFF7 均 > max_cluster）
             }
             out.push(v);
             cur = v;
