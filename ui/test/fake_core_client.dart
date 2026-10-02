@@ -71,9 +71,13 @@ class FakeCoreClient implements CoreClient {
   /// 计数控制首次 -32001，重试即成功）。真实 pkexec 路径未验证（需真机 polkit）。
   CoreClient? privilegedClient;
 
+  /// 注入「实现不支持提权重启」（restartPrivileged → null）。
+  bool restartReturnsNull = false;
+
   @override
   Future<CoreClient?> restartPrivileged() async {
     calls.add('restartPrivileged()');
+    if (restartReturnsNull) return null;
     return privilegedClient ?? this;
   }
 

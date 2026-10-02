@@ -21,10 +21,13 @@ enum ScanUiState {
 /// - `StateError`：daemon 退出（-15 是用户在途退出的正常路径，直接 `'$e'`
 ///   会渲染 `Bad state: daemon exited with code -15`）；
 /// - `TimeoutException`：close 后的新调用是挂 10s 超时，非 StateError；
-/// - 其余（RpcException 契约文案等）：沿用现有文案。
+/// - `RpcException`：只显示契约 `message`（-32002/-32005/-32003… 文案自带上下文，
+///   不加 `RpcException(code):` 前缀）；
+/// - 其余：`'$error'`。
 String describeScanError(Object error) {
   if (error is StateError) return '核心服务已退出，请重启应用';
   if (error is TimeoutException) return '核心服务无响应';
+  if (error is RpcException) return error.message;
   return '$error';
 }
 
@@ -248,7 +251,10 @@ class ScanController extends ChangeNotifier {
     final id = _taskId;
     if (id == null || _state != ScanUiState.scanning) return;
     try {
-      _applyStatus(await _client.scanStatus(id));
+      final status = await _client.scanStatus(id);
+      // 在途响应可能过期（已暂停/取消/重扫）→ 丢弃，防状态回跳
+      if (id != _taskId || _state != ScanUiState.scanning) return;
+      _applyStatus(status);
     } catch (e) {
       // 对账失败 = 传输层已死（daemon 退出/超时）→ 终态失败，不静默悬挂
       _finish(ScanUiState.failed, error: e);
