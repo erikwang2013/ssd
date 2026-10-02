@@ -65,7 +65,7 @@ pub struct TaskRow {
     pub total_bytes: u64,
 }
 
-/// 连接锁中毒即 fail-stop（`unwrap`）——daemon 由监督重启兜底。
+/// 连接锁中毒即 fail-stop（`unwrap`）——重启后的任务态由 `mark_interrupted`/`recover_after_restart` 兜底。
 pub struct Store {
     conn: Mutex<Connection>,
 }
