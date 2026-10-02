@@ -778,7 +778,7 @@ fn set_fat12(image: &mut [u8], fat_start: u32, cluster: u32, value: u32) {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fixtures`
-Expected: 6 passed。
+Expected: 12 passed（T1 6 + T2 3 + 收尾加固 3，见修订轮）。
 
 - [ ] **Step 5: Commit**
 
@@ -933,6 +933,19 @@ mod tests {
         assert_eq!(bpb.cluster_bytes(), 512);
         assert_eq!(bpb.data_cluster_count(), 4174);
     }
+
+    #[test]
+    fn total_sectors16_branch() {
+        // 真实 FAT16 盘走 t16 分支（夹具恒写 total16=0+total32）
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut patched = image.clone();
+        patched[19..21].copy_from_slice(&4224u16.to_le_bytes()); // total16
+        patched[32..36].copy_from_slice(&0u32.to_le_bytes()); // total32 = 0 → 强制走 t16
+        let (_f, dev) = device_with(&patched);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.total_sectors, 4224);
+        assert_eq!(bpb.fat_type, FatType::Fat16);
+    }
 }
 ```
 
@@ -1031,22 +1044,25 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<Bpb, FatError> {
         return Err(FatError::InvalidBpb("zero total sectors".into()));
     }
     let fat16_size = u16::from_le_bytes([sector0[22], sector0[23]]) as u32;
-    let fat32_size = u32::from_le_bytes([sector0[36], sector0[37], sector0[38], sector0[39]]) & 0x0FFF_FFFF;
-    let root_cluster = u32::from_le_bytes([sector0[44], sector0[45], sector0[46], sector0[47]]) & 0x0FFF_FFFF;
+    let fat32_size =
+        u32::from_le_bytes([sector0[36], sector0[37], sector0[38], sector0[39]]) & 0x0FFF_FFFF;
 
-    let (fat_type, fat_size_sectors) = if root_entry_count == 0 && fat16_size == 0 {
+    // 44..48 仅在 FAT32 是 root_cluster；FAT12/16 该区间属卷标，须按结构分支才读。
+    let (fat_type, fat_size_sectors, root_cluster) = if root_entry_count == 0 && fat16_size == 0 {
+        let root_cluster =
+            u32::from_le_bytes([sector0[44], sector0[45], sector0[46], sector0[47]]) & 0x0FFF_FFFF;
         if root_cluster < 2 {
             return Err(FatError::InvalidBpb("fat32 without root cluster".into()));
         }
         if fat32_size == 0 {
             return Err(FatError::InvalidBpb("fat32 without fat size".into()));
         }
-        (FatType::Fat32, fat32_size)
+        (FatType::Fat32, fat32_size, root_cluster)
     } else {
         if fat16_size == 0 {
             return Err(FatError::InvalidBpb("no fat size".into()));
         }
-        (FatType::Fat16, fat16_size) // 先按 16 占位，下面按簇数改为 12
+        (FatType::Fat16, fat16_size, 0) // 先按 16 占位，下面按簇数改为 12
     };
 
     let root_sectors = ((root_entry_count as u32) * 32).div_ceil(bytes_per_sector as u32);
@@ -1092,7 +1108,7 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<Bpb, FatError> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 6 passed。
+Expected: 7 passed（含 total16 分支覆盖）。
 
 - [ ] **Step 5: Commit**
 
@@ -1276,7 +1292,7 @@ impl<'d> Fat<'d> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 11 passed（6 + 5）。
+Expected: 12 passed（7 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1549,7 +1565,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 17 passed（11 + 6）。
+Expected: 18 passed（12 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -1807,7 +1823,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 21 passed（16 + 5）。
+Expected: 23 passed（18 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1906,7 +1922,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 24 passed（21 + 3）。
+Expected: 26 passed（23 + 3）。
 
 - [ ] **Step 5: Commit**
 
@@ -1968,7 +1984,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 25 passed（24 + 1，含新 e2e）。
+Expected: 27 passed（26 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
