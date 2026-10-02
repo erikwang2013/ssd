@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":22,"method":"export.start","params":{"taskId":1,"idxs":[0,1],"targetDir":"/home/user/Recovered"}}

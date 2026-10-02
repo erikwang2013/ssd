@@ -123,8 +123,8 @@ void expectRpcError(String file, int code, String message) {
 }
 
 void main() {
-  test('golden set is exactly the 23 contract files', () {
-    // 与 Rust 侧 golden_set_is_exactly_the_23_contract_files 对称：
+  test('golden set is exactly the 36 contract files', () {
+    // 与 Rust 侧 golden_set_is_exactly_the_36_contract_files 对称：
     // 新增/删除契约文件必须同步两侧测试（flutter test 的 cwd 为 ui/）。
     final names = Directory(
       '../proto/v1/examples',
@@ -133,9 +133,22 @@ void main() {
       'device_list.request.json',
       'device_list.response.json',
       'error_device_permission.response.json',
+      'error_entry_not_found.response.json',
+      'error_entry_too_large.response.json',
+      'error_insufficient_space.response.json',
+      'error_target_not_writable.response.json',
+      'error_target_on_source.response.json',
       'error_task_not_active.response.json',
       'error_unallocated_unavailable.response.json',
       'error_unsupported_fs.response.json',
+      'export_cancel.request.json',
+      'export_cancel.response.json',
+      'export_finished.notification.json',
+      'export_progress.notification.json',
+      'export_start.request.json',
+      'export_start.response.json',
+      'fs_read.request.json',
+      'fs_read.response.json',
       'ping.request.json',
       'ping.response.json',
       'scan_cancel.request.json',
