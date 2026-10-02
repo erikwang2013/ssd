@@ -38,6 +38,16 @@ pub struct ExfatEntry {
 }
 
 pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<ExfatEntry>, ExfatError> {
+    scan_with_observer(dev, &mut |_| {})
+}
+
+/// 扫描并逐条回调 `observer`。**后序语义**：目录条目在其子项枚举完毕后回调，`quality` 为终值
+/// （子目录不可枚举的降级已写回）——流式落盘与整表结果分级逐字一致。观察者只读、不得中断
+/// （中断由上层取消机制处理，见 xd-core scan_task）。
+pub fn scan_with_observer(
+    dev: &dyn BlockDevice,
+    observer: &mut dyn FnMut(&ExfatEntry),
+) -> Result<Vec<ExfatEntry>, ExfatError> {
     let boot = boot::parse(dev)?;
     let fat = Fat32::new(dev, &boot);
     let mut out = Vec::new();
@@ -53,6 +63,7 @@ pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<ExfatEntry>, ExfatError> {
         "/",
         0,
         &mut out,
+        observer,
     )?;
     Ok(out)
 }
@@ -104,6 +115,7 @@ fn scan_parsed(
     path: &str,
     depth: u32,
     out: &mut Vec<ExfatEntry>,
+    observer: &mut dyn FnMut(&ExfatEntry),
 ) -> Result<(), ExfatError> {
     if depth > MAX_DEPTH || out.len() > MAX_ENTRIES {
         return Ok(()); // out.len() > 臂不可达（循环内 `>=` 已封顶；M1a 注 7 同款）
@@ -161,6 +173,7 @@ fn scan_parsed(
                         &child_path,
                         depth + 1,
                         out,
+                        observer,
                     )?;
                 }
                 Err(_) => {
@@ -168,6 +181,8 @@ fn scan_parsed(
                 }
             }
         }
+        // 后序单回调：子目录降级已写回 out[pushed]，此处 quality 即终值
+        observer(&out[pushed]);
     }
     Ok(())
 }
@@ -599,6 +614,7 @@ mod tests {
             "/",
             MAX_DEPTH,
             &mut at_limit,
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(at_limit.len(), 1, "depth == MAX_DEPTH 须处理");
@@ -612,6 +628,7 @@ mod tests {
             "/",
             MAX_DEPTH + 1,
             &mut over,
+            &mut |_| {},
         )
         .unwrap();
         assert!(over.is_empty(), "depth > MAX_DEPTH 须截断");
@@ -635,6 +652,7 @@ mod tests {
             "/",
             0,
             &mut out,
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(out.len(), MAX_ENTRIES, "满额即 Ok 且不增");
@@ -779,6 +797,41 @@ mod tests {
             RecoverQuality::Complete,
             "只按 need 前缀判空闲，链尾被占不牵连"
         );
+    }
+
+    #[test]
+    fn observer_streams_post_order_with_final_quality() {
+        // 健康 DCIM：IMG.JPG 先于 DCIM 回调（后序）；根文件 ROOT.TXT 在 DCIM 后
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_subdir("/", "DCIM")
+            .add_file("/DCIM", "IMG.JPG", &[3u8; 100])
+            .add_file("/", "ROOT.TXT", b"root")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let mut seen: Vec<String> = Vec::new();
+        let entries = scan_with_observer(&dev, &mut |e| seen.push(e.name.clone())).unwrap();
+        assert_eq!(
+            seen,
+            vec!["IMG.JPG", "DCIM", "ROOT.TXT"],
+            "后序：子项在目录前"
+        );
+        assert_eq!(entries.len(), 3, "返回值与整表同源");
+    }
+
+    #[test]
+    fn observer_sees_downgraded_dir_quality() {
+        // DCIM 不可枚举（首簇越界）→ observer 收到 DCIM 时 quality 已是终值 MaybeDamaged
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_subdir("/", "DCIM")
+            .add_file("/DCIM", "IMG.JPG", &[3u8; 100])
+            .build();
+        let mut patched = image.clone();
+        patched[SET + 32 + 20..SET + 32 + 24].copy_from_slice(&9999u32.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let mut seen: Vec<(String, RecoverQuality)> = Vec::new();
+        scan_with_observer(&dev, &mut |e| seen.push((e.name.clone(), e.quality))).unwrap();
+        let dcim = seen.iter().find(|(n, _)| n == "DCIM").unwrap();
+        assert_eq!(dcim.1, RecoverQuality::MaybeDamaged, "流式层拿到终值分级");
     }
 
     #[test]

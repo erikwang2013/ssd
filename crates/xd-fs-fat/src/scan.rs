@@ -36,13 +36,32 @@ const MAX_DEPTH: u32 = 32;
 /// 根目录无法开始枚举（根链解析失败或根区读不到内容）→ Err，与空盘 `Ok([])` 区分；
 /// 其余局部损坏按保守降级处理（跳过或标记 MaybeDamaged），不中止全盘。
 pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<FatEntry>, FatError> {
+    scan_with_observer(dev, &mut |_| {})
+}
+
+/// 扫描并逐条回调 `observer`。**后序语义**：目录条目在其子项枚举完毕后回调，`quality` 为终值
+/// （子目录不可枚举的降级已写回）——流式落盘与整表结果分级逐字一致。观察者只读、不得中断
+/// （中断由上层取消机制处理，见 xd-core scan_task）。
+pub fn scan_with_observer(
+    dev: &dyn BlockDevice,
+    observer: &mut dyn FnMut(&FatEntry),
+) -> Result<Vec<FatEntry>, FatError> {
     let bpb = bpb::parse(dev)?;
     let fat = Fat::new(dev, &bpb);
     let mut out = Vec::new();
     let readable = if bpb.fat_type == FatType::Fat32 {
-        scan_cluster_dir(dev, &bpb, &fat, bpb.root_cluster, "/", 0, &mut out)?
+        scan_cluster_dir(
+            dev,
+            &bpb,
+            &fat,
+            bpb.root_cluster,
+            "/",
+            0,
+            &mut out,
+            observer,
+        )?
     } else {
-        scan_fixed_root(dev, &bpb, &fat, &mut out)?
+        scan_fixed_root(dev, &bpb, &fat, &mut out, observer)?
     };
     if !readable {
         return Err(FatError::InvalidBpb("根目录不可读".into()));
@@ -56,6 +75,7 @@ fn scan_fixed_root(
     bpb: &Bpb,
     fat: &Fat,
     out: &mut Vec<FatEntry>,
+    observer: &mut dyn FnMut(&FatEntry),
 ) -> Result<bool, FatError> {
     let root_bytes = ((bpb.root_entry_count as u32) * 32) as usize;
     let mut buf = vec![0u8; root_bytes];
@@ -65,11 +85,12 @@ fn scan_fixed_root(
         return Ok(false); // 根区在设备外：无法开始枚举
     }
     let parsed = dirent::parse_directory_bytes(&buf[..n]); // 短读 → 只解析已读部分（不得零填充当 End）
-    append_parsed(dev, bpb, fat, parsed, "/", 0, out)?;
+    append_parsed(dev, bpb, fat, parsed, "/", 0, out, observer)?;
     Ok(true)
 }
 
 /// 簇链目录（FAT32 根与所有子目录）。返回值：该目录是否可枚举。
+#[allow(clippy::too_many_arguments)]
 fn scan_cluster_dir(
     dev: &dyn BlockDevice,
     bpb: &Bpb,
@@ -78,6 +99,7 @@ fn scan_cluster_dir(
     path: &str,
     depth: u32,
     out: &mut Vec<FatEntry>,
+    observer: &mut dyn FnMut(&FatEntry),
 ) -> Result<bool, FatError> {
     if depth > MAX_DEPTH || out.len() > MAX_ENTRIES {
         return Ok(true); // 命中深度/容量上限：内容已尽量取到，不算不可读
@@ -110,10 +132,11 @@ fn scan_cluster_dir(
         return Ok(false); // 首簇即读不到：不可枚举
     }
     let parsed = dirent::parse_directory_bytes(&data);
-    append_parsed(dev, bpb, fat, parsed, path, depth, out)?;
+    append_parsed(dev, bpb, fat, parsed, path, depth, out, observer)?;
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_parsed(
     dev: &dyn BlockDevice,
     bpb: &Bpb,
@@ -122,6 +145,7 @@ fn append_parsed(
     path: &str,
     depth: u32,
     out: &mut Vec<FatEntry>,
+    observer: &mut dyn FnMut(&FatEntry),
 ) -> Result<(), FatError> {
     for e in parsed {
         if out.len() >= MAX_ENTRIES {
@@ -160,13 +184,23 @@ fn append_parsed(
             } else {
                 format!("{path}/{}", e.name)
             };
-            let readable =
-                scan_cluster_dir(dev, bpb, fat, e.first_cluster, &child_path, depth + 1, out)?;
+            let readable = scan_cluster_dir(
+                dev,
+                bpb,
+                fat,
+                e.first_cluster,
+                &child_path,
+                depth + 1,
+                out,
+                observer,
+            )?;
             if !readable {
                 // 目录项本身可读但内容不可枚举 → 该条目标记不完整（Rec3）
                 out[pushed].quality = RecoverQuality::MaybeDamaged;
             }
         }
+        // 后序单回调：子目录降级已写回 out[pushed]，此处 quality 即终值
+        observer(&out[pushed]);
     }
     Ok(())
 }
@@ -640,5 +674,45 @@ mod tests {
         assert_eq!(read_file(&dev, empty).unwrap(), Vec::<u8>::new());
         let gone = entries.iter().find(|e| e.deleted).unwrap();
         assert_eq!(read_file(&dev, gone).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn observer_streams_post_order_with_final_quality() {
+        // 后序：子项 IN.TXT 先于目录 DIR 回调，根文件 ROOT.TXT 在 DIR 后
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_subdir("/", "DIR")
+            .add_file("/DIR", "IN.TXT", b"x")
+            .add_file("/", "ROOT.TXT", b"y")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let mut seen: Vec<String> = Vec::new();
+        let entries = scan_with_observer(&dev, &mut |e| seen.push(e.name.clone())).unwrap();
+        assert_eq!(
+            seen,
+            vec!["IN.TXT", "DIR", "ROOT.TXT"],
+            "后序：子项在目录前"
+        );
+        assert_eq!(entries.len(), 3, "返回值与整表同源");
+    }
+
+    #[test]
+    fn observer_sees_downgraded_dir_quality() {
+        // 坏目录链（首簇越界，既有手法）→ observer 收到 DIR 时 quality 已是终值 MaybeDamaged
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_subdir("/", "DIR")
+            .add_file("/DIR", "IN.TXT", b"x")
+            .build();
+        let mut patched = image.clone();
+        let base = 18 * 512; // FAT16 根目录区起点
+        let pos = patched[base..base + 32 * 8]
+            .chunks(32)
+            .position(|c| &c[..3] == b"DIR")
+            .unwrap();
+        patched[base + pos * 32 + 26..base + pos * 32 + 28].copy_from_slice(&5000u16.to_le_bytes()); // > data_cluster_count()+1
+        let (_f, dev) = dev_for(&patched);
+        let mut seen: Vec<(String, RecoverQuality)> = Vec::new();
+        scan_with_observer(&dev, &mut |e| seen.push((e.name.clone(), e.quality))).unwrap();
+        let dir = seen.iter().find(|(n, _)| n == "DIR").unwrap();
+        assert_eq!(dir.1, RecoverQuality::MaybeDamaged, "流式层拿到终值分级");
     }
 }
