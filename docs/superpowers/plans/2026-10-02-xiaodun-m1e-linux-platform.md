@@ -951,7 +951,7 @@ out=dist/xiaodun_${version}_amd64.deb
 mkdir -p dist
 dpkg-deb --build --root-owner-group "$stage" "$out"
 echo "built: $out"
-dpkg-deb -I "$out" | head -12
+dpkg-deb -I "$out" | head -12 || true   # pipefail 下 dpkg-deb 第 13 行的 SIGPIPE 竞态（spec-m1e-t4 实测并行 3/10；|| true 后 0/60）
 ```
 （`/opt/xiaodun` 的 Flutter bundle 由 M1d 产物接入——本脚本留 TODO 注释一句，不阻塞。）
 
@@ -997,6 +997,7 @@ docker run --rm -v "$PWD/dist:/pkg:ro" ubuntu:24.04 bash -c '
 - [ ] `bash scripts/build-deb.sh` 产出 deb；`bash scripts/e2e-deb.sh` 本机（有 docker）容器装/卸 OK
 - [ ] `strace -f -e trace=openat ./target/debug/xd-daemon </dev/null 2>&1 | grep -E "openat.*(/dev/(sd|nvme|mmc|vd))" ` → **无输出**（device.list 零 open 的机器断言；手测记录入库）
 - [ ] `bash scripts/apply-copyright.sh` 幂等（新 .rs 已带头；rules/policy/脚本为配置件不加头）
+- [ ] `.gitignore` 补一行 `dist/`（T4 裁量结论：deb 产物不入库；防未来 `git add -A` 吞 250KB 二进制）
 - [ ] **未验证清单（平台专有，交付标注"未验证"，M1 出口真机手测）**：pkexec 真实认证路径（CI 无 tty 必 127）、
       udev uaccess 真机生效（需装包+插盘）、真 U 盘删除照片全链路、`/dev/sdX` 真实介质行为；
       **补三项（qual-m1e-t3）**：① USB 硬盘盒/易驱线（RMB=0，`SUBSYSTEMS=="usb"` 规则的关键覆盖面）；
