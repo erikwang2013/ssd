@@ -245,4 +245,17 @@ mod tests {
         assert_eq!(bpb.cluster_bytes(), 512);
         assert_eq!(bpb.data_cluster_count(), 4174);
     }
+
+    #[test]
+    fn total_sectors16_branch() {
+        // 真实 FAT16 盘走 t16 分支（夹具恒写 total16=0+total32）
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut patched = image.clone();
+        patched[19..21].copy_from_slice(&4224u16.to_le_bytes()); // total16
+        patched[32..36].copy_from_slice(&0u32.to_le_bytes()); // total32 = 0 → 强制走 t16
+        let (_f, dev) = device_with(&patched);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.total_sectors, 4224);
+        assert_eq!(bpb.fat_type, FatType::Fat16);
+    }
 }
