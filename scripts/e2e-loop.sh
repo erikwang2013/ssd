@@ -9,7 +9,9 @@ cd "$(dirname "$0")/.."
 sudo -n true 2>/dev/null || { echo "skip: 无免密 sudo（真块设备 e2e 需 root 建环回）"; exit 0; }
 
 img=$(mktemp /tmp/xd-loop-$$-XXXX.img)
-loop=""; tmpdb=""
+tmpdb=$(mktemp /tmp/xd-loop-db-XXXXXX)
+loop=""
+rm -f "$tmpdb"   # 让 sqlite 自建；步骤 2/3 共用——防 sudo 下写 root/真实 HOME 状态库（同增补 1 类纪律）
 trap 'if [ -n "$loop" ]; then sudo losetup -d "$loop"; fi; rm -f "$img"; [ -z "$tmpdb" ] || rm -f "$tmpdb"' EXIT
 
 cargo run -q --locked -p xd-fixtures --example gen_fat_image -- "$img"
@@ -26,15 +28,13 @@ XD_LOOP_DEV="$loop" XD_LOOP_IMG="$img" cargo test -q --locked -p xd-device --tes
 
 # 2) daemon：--device 注册 + device.list 零 open() 路径出现 unix:$loop
 out=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"device.list","params":null}' \
-  | sudo ./target/debug/xd-daemon --device "$loop")
+  | sudo ./target/debug/xd-daemon --device "$loop" --db "$tmpdb")
 grep -q "unix:$loop" <<<"$out" || { echo "FAIL: device.list 未含 $loop"; echo "$out"; exit 1; }
 
 # 3) M1b：环回设备真扫描全链路（start → 读至 scan.finished → results）。
 #    扫描在 daemon 的 worker 线程异步跑：必须等 finished 再问 results，单管道一次性喂入会与
 #    扫描竞态 —— 用 coproc 交互（计划许可的 mkfifo/coproc 方案）。export（镜像导出）归 M1d，
 #    本脚本只断言扫描侧。
-tmpdb=$(mktemp /tmp/xd-loop-db-XXXXXX)
-rm -f "$tmpdb"   # 让 sqlite 自建
 coproc XD { sudo ./target/debug/xd-daemon --device "$loop" --db "$tmpdb"; }
 printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"scan.start\",\"params\":{\"device\":\"unix:$loop\",\"mode\":\"quick\"}}" >&"${XD[1]}"
 scan_task=""; scan_start=""; fin_line=""
