@@ -29,6 +29,10 @@ pub enum ReadError {
 
 /// 读取 `[offset, offset+length)`；返回 (bytes, eof)。
 /// eof = 交付已到该条目**可得数据的末端**（损坏/短链件可能 < sizeBytes——UI 以此判"可能不完整"）。
+// ponytail: 分片读每片重走结构——雕刻件每片重跑 `unallocated_runs` 并自条目头回读前缀，
+// FS 件每片自链头走链；总读 ∝ size²/4MiB（导出侧雕刻件已改单次全量回读，见 xd-daemon
+// export_worker；预览分片维持现状）。升级路径 = 给 `read_prefix_at`/引擎读加 skip/take 区段
+// 形态（按片定位而非重走），归 M4/M2 性能账。
 pub fn read_entry_range(
     dev: &dyn BlockDevice,
     fs: FsKind,
@@ -325,6 +329,13 @@ mod tests {
             read_entry_range(&*dev, FsKind::Exfat, &e, 0, 64),
             Err(ReadError::Internal(_))
         ));
+    }
+
+    #[test]
+    fn max_preview_is_contract_anchor() {
+        // 契约绝对锚（qual I2）：-32009 的门槛是契约数字，改动必须同步 README/-32009 测试的
+        // 字面量——本测把常量钉死在 64MiB，防「悄悄调大上限」。
+        assert_eq!(MAX_PREVIEW, 64 * 1024 * 1024);
     }
 
     #[test]

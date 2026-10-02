@@ -12,7 +12,7 @@
 //! 线程前**调用，故与进程级降权等价（security 文档 §4「必须在建任何线程之前」在此成立）。
 //! **降权路径未验证（需真机 root/pkexec）**：本机非 root 走不到降权臂；单测只覆盖纯决策函数。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -113,8 +113,9 @@ fn run_inner(args: &ExportArgs) -> Result<(), String> {
     let total = entries.len() as u64;
     let (mut ok, mut degraded, mut failed, mut written) = (0u64, 0u64, 0u64, 0u64);
     let mut used: HashSet<String> = HashSet::new();
+    let mut next: HashMap<String, u32> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
-        let name = unique_name(&mut used, file_name_for(e));
+        let name = unique_name(&mut used, &mut next, file_name_for(e));
         match export_one(&*dev, fs, e, &args.target.join(&name)) {
             Ok(w) if w == e.size_bytes => {
                 ok += 1;
@@ -184,8 +185,10 @@ fn read_entries(store: &Store, task_id: u64) -> Result<Vec<ScanEntry>, String> {
 }
 
 /// 单件导出：`create_new`（名字已去重；重跑同目录同会 EEIST → 该件 failed，不覆盖既有文件）→
-/// 4MiB 片循环写盘。短交付（`eof` 且已写 < `sizeBytes`）→ `Ok(已写)`（父侧记 degraded）；
+/// 写盘。短交付（写 < `sizeBytes`）→ `Ok(已写)`（父侧记 degraded）；
 /// 读/写错误 → `Err`（**删除半成品后**返回——半成品与完好文件不可区分，「宁可漏报不可错报」）。
+///
+/// 读取形态两道：**雕刻件单次全量回读**（下注），其余按 4MiB 片流式。
 fn export_one(
     dev: &dyn BlockDevice,
     fs: FsKind,
@@ -201,6 +204,23 @@ fn export_one(
         .create_new(true)
         .open(path)
         .map_err(|err| format!("create {}: {err}", path.display()))?;
+    // 雕刻件：**单次全量回读**（雕刻期裁决受 MAX_FILE_BYTES=64MiB 上限约束）→ 内存内落盘。
+    // 逐片读会每片重走 `unallocated_runs` 并自条目头重读前缀，总读 ∝ size²/4MiB（见 fs_read 的
+    // ponytail 注）；雕刻件有 64MiB 硬上限，单读是唯一无放大的形态，峰值 = 单件 size。
+    if e.byte_offset.is_some() {
+        let (bytes, _eof) = match read_entry_range(dev, fs, e, 0, e.size_bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                cleanup(f);
+                return Err(format!("read: {err:?}"));
+            }
+        };
+        if let Err(err) = f.write_all(&bytes) {
+            cleanup(f);
+            return Err(format!("write: {err}"));
+        }
+        return Ok(bytes.len() as u64);
+    }
     let mut off = 0u64;
     while off < e.size_bytes {
         let want = CHUNK.min(e.size_bytes - off);
@@ -225,10 +245,12 @@ fn export_one(
 }
 
 /// 落盘名：空名（雕刻件）→ `carved_{idx:06}.{ext}`；否则 sanitize 原文件名。
+/// `ext` 是**库内数据**（库行可被调用者改写）——与文件名同过 `sanitize`：伪造
+/// `ext="../../evil"` 不能借 `carved_...{ext}` 越出目标目录；空 ext 回退 `bin`。
 fn file_name_for(e: &ScanEntry) -> String {
     if e.name.is_empty() {
-        let ext = if e.ext.is_empty() { "bin" } else { &e.ext };
-        format!("carved_{:06}.{ext}", e.idx)
+        let raw = if e.ext.is_empty() { "bin" } else { &e.ext };
+        format!("carved_{:06}.{}", e.idx, sanitize(raw))
     } else {
         sanitize(&e.name)
     }
@@ -257,17 +279,24 @@ fn sanitize(name: &str) -> String {
 
 /// 重名去重（计划：`_2`/`_3` 计数后缀，插在扩展名前）：首个原名原样，其后 `{stem}_{n}.{ext}`；
 /// 计数名若也被占（如真有 `A_2.JPG`）继续递增——**最终名以 `used` 集合唯一为准**。
-fn unique_name(used: &mut HashSet<String>, name: String) -> String {
+/// `next`（基名 → 上次用到的计数）把重探起点前移：自 2 起线性重探在 n 件同名时是 O(n²)，
+/// 记档后摊还 O(1)（qual 维 3）。
+fn unique_name(
+    used: &mut HashSet<String>,
+    next: &mut HashMap<String, u32>,
+    name: String,
+) -> String {
     if used.insert(name.clone()) {
         return name;
     }
-    for n in 2u32.. {
-        let cand = with_counter(&name, n);
+    let n = next.entry(name.clone()).or_insert(2);
+    loop {
+        let cand = with_counter(&name, *n);
+        *n += 1; // 计数域 2^32 远大于任何真实批（MAX_IDXS = 10 万），溢出不可达
         if used.insert(cand.clone()) {
             return cand;
         }
     }
-    unreachable!("u32 计数域内必有空位")
 }
 
 fn with_counter(name: &str, n: u32) -> String {
@@ -403,6 +432,7 @@ fn passwd_gid(passwd: &str, uid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parse_args_accepts_parent_order_and_rejects_damage() {
@@ -493,17 +523,49 @@ mod tests {
     #[test]
     fn unique_name_appends_counter_before_ext_and_claims_names() {
         let mut used = HashSet::new();
-        assert_eq!(unique_name(&mut used, "A.JPG".into()), "A.JPG");
-        assert_eq!(unique_name(&mut used, "A.JPG".into()), "A_2.JPG");
-        assert_eq!(unique_name(&mut used, "A.JPG".into()), "A_3.JPG");
+        let mut next = HashMap::new();
+        let un = |used: &mut HashSet<String>, n: &mut HashMap<String, u32>, s: &str| {
+            unique_name(used, n, s.into())
+        };
+        assert_eq!(un(&mut used, &mut next, "A.JPG"), "A.JPG");
+        assert_eq!(un(&mut used, &mut next, "A.JPG"), "A_2.JPG");
+        assert_eq!(un(&mut used, &mut next, "A.JPG"), "A_3.JPG");
         // 计数名被真占（后到的原件恰叫 A_2.JPG）不妨碍唯一性
-        assert_eq!(unique_name(&mut used, "A_2.JPG".into()), "A_2_2.JPG");
+        assert_eq!(un(&mut used, &mut next, "A_2.JPG"), "A_2_2.JPG");
         // 无扩展名
-        assert_eq!(unique_name(&mut used, "NOEXT".into()), "NOEXT");
-        assert_eq!(unique_name(&mut used, "NOEXT".into()), "NOEXT_2");
+        assert_eq!(un(&mut used, &mut next, "NOEXT"), "NOEXT");
+        assert_eq!(un(&mut used, &mut next, "NOEXT"), "NOEXT_2");
         // 点开头（隐藏文件）不当作扩展名切分（stem 为空）
-        assert_eq!(unique_name(&mut used, ".hidden".into()), ".hidden");
-        assert_eq!(unique_name(&mut used, ".hidden".into()), ".hidden_2");
+        assert_eq!(un(&mut used, &mut next, ".hidden"), ".hidden");
+        assert_eq!(un(&mut used, &mut next, ".hidden"), ".hidden_2");
+    }
+
+    #[test]
+    fn unique_name_many_duplicates_stays_linear() {
+        // 200 件同名：后缀 `_2.._201` 连续正确（语义面）
+        let mut used = HashSet::new();
+        let mut next = HashMap::new();
+        let names: Vec<String> = (0..200)
+            .map(|_| unique_name(&mut used, &mut next, "DUP.BIN".into()))
+            .collect();
+        assert_eq!(names[0], "DUP.BIN");
+        assert_eq!(names[1], "DUP_2.BIN");
+        assert_eq!(names[199], "DUP_200.BIN");
+        assert_eq!(used.len(), 200, "全部唯一");
+
+        // 5 万件同名的时间上界（qual 维 3 的牙）：记档后线性 ≈ 毫秒级；线性重探是 O(n²)
+        // （≈1.25e9 次候选构造，分钟级）——回归旧写法此断言必红。
+        let mut used = HashSet::new();
+        let mut next = HashMap::new();
+        let t = Instant::now();
+        for _ in 0..50_000 {
+            unique_name(&mut used, &mut next, "SAME.NAME".into());
+        }
+        let dt = t.elapsed();
+        assert!(
+            dt < Duration::from_secs(5),
+            "5 万件同名耗时 {dt:?}：应为摊还 O(1)（旧 O(n²) 写法分钟级）"
+        );
     }
 
     #[test]
@@ -528,6 +590,129 @@ mod tests {
             "ext 缺失回退 bin"
         );
         assert_eq!(file_name_for(&mk("a/../b.JPG", "jpg", 0)), "a___b.JPG");
+        // ext 注入（库行可伪造）：过同一 sanitize，无 `/`、无 `..` 子串 —— 删 ext 净化必红
+        let evil = file_name_for(&mk("", "../../evil", 42));
+        assert_eq!(evil, "carved_000042.____evil"); // 两个 `..` + 两个 `/` 各 → `_`
+        assert!(
+            !evil.contains('/') && !evil.contains(".."),
+            "注入名：{evil}"
+        );
+        let evil2 = file_name_for(&mk("", "a/b\\c\nd", 1));
+        assert_eq!(evil2, "carved_000001.a_b_c_d");
+    }
+
+    /// 计读设备代理：统计设备层读出字节数（单读修复的牙——见 `carved_export_single_read...`）。
+    struct Counting<'a> {
+        inner: &'a dyn BlockDevice,
+        bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl BlockDevice for Counting<'_> {
+        fn info(&self) -> &xd_device::DeviceInfo {
+            self.inner.info()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, xd_device::DeviceError> {
+            let n = self.inner.read_at(offset, buf)?;
+            self.bytes
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    /// 测试侧自造 64MiB exFAT 卷（512B 扇区 / 4KiB 簇 / 16365 簇，起手全空闲）：
+    /// 仅含雕刻回读所经的最小结构——引导区（主/备 + 双 Boot Checksum）、根簇 5 的位图项
+    /// （0x81 → 簇 2 / 2046B）、位图（仅簇 2..=5 已分配）。jpeg 落于簇 6 起（bo=94208）。
+    /// 为什么不用 `xd_fixtures::ExfatImageBuilder`：它是 1MiB 固定几何（规范最小值），装不下
+    /// 需 >4MiB 交付的雕刻件；若将来再需大卷，把它的几何参数化（归 M4/按需）。
+    fn big_exfat_volume(jpeg: &[u8]) -> Vec<u8> {
+        const BPS: usize = 512;
+        const CBS: usize = 4096;
+        const FAT_OFF: u32 = 24;
+        const FAT_LEN: u32 = 128; // ceil((16365+2)*4 / 512)
+        const HEAP: u32 = 152; // FAT_OFF + FAT_LEN
+        const CLUSTERS: u32 = 16365; // (131072 - 152) / 8
+        const ROOT: u32 = 5;
+        const VOL_BYTES: usize = 64 << 20;
+        let mut img = vec![0u8; VOL_BYTES];
+        for region in [0usize, 12] {
+            let b = region * BPS;
+            img[b] = 0xEB; // 跳转指令占位（解析不校验）
+            img[b + 1] = 0x76;
+            img[b + 2] = 0x90;
+            img[b + 3..b + 11].copy_from_slice(b"EXFAT   ");
+            img[b + 72..b + 80].copy_from_slice(&((VOL_BYTES / BPS) as u64).to_le_bytes());
+            img[b + 80..b + 84].copy_from_slice(&FAT_OFF.to_le_bytes());
+            img[b + 84..b + 88].copy_from_slice(&FAT_LEN.to_le_bytes());
+            img[b + 88..b + 92].copy_from_slice(&HEAP.to_le_bytes());
+            img[b + 92..b + 96].copy_from_slice(&CLUSTERS.to_le_bytes());
+            img[b + 96..b + 100].copy_from_slice(&ROOT.to_le_bytes());
+            img[b + 104..b + 106].copy_from_slice(&0x0100u16.to_le_bytes());
+            img[b + 108] = 9; // bps_shift
+            img[b + 109] = 3; // spc_shift
+            img[b + 110] = 1; // number_of_fats
+            img[b + 111] = 0x80;
+            img[b + 112] = 0xFF; // PercentInUse 未知
+            img[b + 510] = 0x55;
+            img[b + 511] = 0xAA;
+            let sum = xd_fixtures::boot_checksum(&img[region * BPS..(region + 11) * BPS]);
+            for k in 0..(BPS / 4) {
+                let o = (region + 11) * BPS + k * 4;
+                img[o..o + 4].copy_from_slice(&sum.to_le_bytes());
+            }
+        }
+        // 根簇：0x81 位图项（FirstCluster@20 / DataLength@24）；SetChecksum 不写（装载不校验）
+        let rb = HEAP as usize * BPS + (ROOT as usize - 2) * CBS;
+        img[rb] = 0x81;
+        img[rb + 20..rb + 24].copy_from_slice(&2u32.to_le_bytes());
+        img[rb + 24..rb + 32].copy_from_slice(&((CLUSTERS as u64).div_ceil(8)).to_le_bytes());
+        // 位图（簇 2）：位下标 = 簇 − 2、LSB 优先；0b1111 = 簇 2,3,4,5 已分配，其余全空闲
+        let bmb = HEAP as usize * BPS;
+        img[bmb] = 0b0000_1111;
+        // jpeg 落于簇 6 起点
+        let bo = HEAP as usize * BPS + 4 * CBS;
+        img[bo..bo + jpeg.len()].copy_from_slice(jpeg);
+        img
+    }
+
+    /// 雕刻件导出**单次全量回读**：>4MiB 交付（近 64MiB 上限）逐字节正确 + 设备读量有界。
+    /// 计量口径：单读路径 = 走链裁决 + `read_prefix_at` 前缀物化**两遍**（现行 carving API
+    /// 固有，≈2×size + 引导/位图/根目录 ~80KB）；逐片 4MiB 路径每片各走一遍链+物化前缀
+    /// （且走到真 EOI 的那片付全额）→ 总读 ∝ size²/4MiB，本件实测 18×（1.13GB / 60MiB）。牙 = 下断言（3× 上界）。
+    #[test]
+    fn carved_export_single_read_delivers_exact_bytes() {
+        let j = xd_fixtures::mini_jpeg(60 << 20);
+        let img = big_exfat_volume(&j);
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), &img).unwrap();
+        let dev = xd_device::image::ImageFileDevice::open(f.path()).unwrap();
+        let counted = Counting {
+            inner: &dev,
+            bytes: std::sync::atomic::AtomicU64::new(0),
+        };
+        let e = ScanEntry {
+            idx: 0,
+            name: String::new(),
+            path: "/".into(),
+            ext: "jpg".into(),
+            size_bytes: j.len() as u64,
+            deleted: false,
+            is_dir: false,
+            quality: "carved".into(),
+            first_cluster: 0,
+            byte_offset: Some(94208), // 簇 6 起点
+            contiguous: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.jpg");
+        let w = export_one(&counted, FsKind::Exfat, &e, &out).unwrap();
+        assert_eq!(w, j.len() as u64, "全量交付");
+        assert_eq!(std::fs::read(&out).unwrap(), j, "逐字节相等");
+        let read = counted.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            read < j.len() as u64 * 3,
+            "设备读量 {read} 应 ≈ 2×size（{}，走链+物化两遍）：逐片重走 ∝ size²/4MiB（本件实测 18×）",
+            j.len()
+        );
     }
 
     #[cfg(target_os = "linux")]

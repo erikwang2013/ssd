@@ -1251,7 +1251,8 @@ mod tests {
                 "Invalid params: length out of range 1..=1048576"
             );
         }
-        // -32009：条目 > 64MiB（预览上限；导出不受此限）
+        // -32009：条目 > 64MiB（预览上限；导出不受此限）。字面量而非 MAX_PREVIEW——契约锚
+        // （qual I2）：常量被改大时本测必红（fs_read 另有常量绝对锚）。
         mgr.store_arc()
             .insert_entries(
                 1,
@@ -1260,7 +1261,7 @@ mod tests {
                     name: "HUGE.BIN".into(),
                     path: "/".into(),
                     ext: "bin".into(),
-                    size_bytes: crate::fs_read::MAX_PREVIEW + 1,
+                    size_bytes: 64 * 1024 * 1024 + 1,
                     deleted: false,
                     is_dir: false,
                     quality: "complete".into(),
@@ -1281,10 +1282,7 @@ mod tests {
             panic!()
         };
         assert_eq!(e.error.code, -32009);
-        assert_eq!(
-            e.error.message,
-            format!("Entry too large: {}", crate::fs_read::MAX_PREVIEW + 1)
-        );
+        assert_eq!(e.error.message, "Entry too large: 67108865");
     }
 
     #[test]

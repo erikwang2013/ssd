@@ -173,7 +173,12 @@ struct Job {
     canceled: AtomicBool,
     /// `Some("canceled"|"completed")` = 终态；`None` = 运行中。
     state: Mutex<Option<&'static str>>,
-    /// 转发线程 reap 时 take；cancel 借同一句柄发 SIGTERM。
+    /// spawn 时定格的子进程 pid：cancel **定向 kill，不借 child 句柄**。cancel 是 RPC 路径，
+    /// 不得耦合转发线程的锁纪律——旧写法要锁 `child` 取 `id()`，一旦转发线程在 reap/wait 期间
+    /// 持锁（worker 卡 D 态即长挂），整个 daemon 的 RPC 随之停摆。stale-pid 窗（reap 完成～
+    /// state 落定之间）见 `cancel` 注释。
+    pid: i32,
+    /// 转发线程 reap 时 take。
     child: Mutex<Option<Child>>,
 }
 
@@ -242,6 +247,7 @@ impl ExportManager {
         let job = Arc::new(Job {
             canceled: AtomicBool::new(false),
             state: Mutex::new(None),
+            pid: child.id() as i32,
             child: Mutex::new(Some(child)),
         });
         self.jobs.lock().unwrap().insert(export_id, job.clone());
@@ -280,11 +286,17 @@ impl ExportManager {
         }
         // 先置标记再杀：转发线程 reap 后读到的必是「已取消」（否则终报会漏掉 canceled 标志）。
         job.canceled.store(true, Ordering::SeqCst);
-        if let Some(child) = job.child.lock().unwrap().as_mut()
-            && let Some(pid) = Pid::from_raw(child.id() as i32)
-            && let Err(e) = rustix::process::kill_process(pid, Signal::TERM)
-        {
-            eprintln!("warn: export {export_id} SIGTERM 失败：{e}");
+        // pid 定向 SIGTERM（不借 child 句柄/锁，见 Job.pid 注释）。
+        // ESRCH 静默：reap 已完成～state 落定之间的 stale-pid 窗内目标可能已不在。
+        match Pid::from_raw(job.pid) {
+            Some(pid) => {
+                if let Err(e) = rustix::process::kill_process(pid, Signal::TERM)
+                    && e != rustix::io::Errno::SRCH
+                {
+                    eprintln!("warn: export {export_id} SIGTERM 失败：{e}");
+                }
+            }
+            None => eprintln!("warn: export {export_id} 无有效子进程 pid：{}", job.pid),
         }
         Ok("canceled")
     }
@@ -687,6 +699,7 @@ mod tests {
         let job = Arc::new(Job {
             canceled: AtomicBool::new(true),
             state: Mutex::new(Some("canceled")),
+            pid: 0,
             child: Mutex::new(None),
         });
         m.jobs.lock().unwrap().insert(1, job);
@@ -701,6 +714,23 @@ mod tests {
             .unwrap()
             .replace("completed");
         assert_eq!(m.cancel(1).unwrap(), "completed");
+    }
+
+    #[test]
+    fn cancel_running_job_kills_by_pid_without_child_handle() {
+        // 运行中作业 + 无 child 句柄（pid=0 非法）：cancel 仍返回 "canceled"、置标记、不 panic
+        // ——pid 定向 kill 不依赖 child mutex（本测的树里 child 恒 None，锁永不参与）。
+        let (_, m) = mgr();
+        let job = Arc::new(Job {
+            canceled: AtomicBool::new(false),
+            state: Mutex::new(None),
+            pid: 0,
+            child: Mutex::new(None),
+        });
+        m.jobs.lock().unwrap().insert(7, job.clone());
+        assert_eq!(m.cancel(7).unwrap(), "canceled");
+        assert!(job.canceled.load(Ordering::SeqCst), "取消标记已置");
+        assert!(job.state.lock().unwrap().is_none(), "终态由转发线程落定");
     }
 
     #[test]

@@ -118,6 +118,16 @@ user namespace（userns 内的 root 无宿主 CAP_DAC_OVERRIDE，读不了宿主
 **这是对 T3 计划「此路径无越权面」断言的偏离**（记为：论断对 RPC 层成立，对库层不成立）。
 非 root 模式与原 `--image` 常规路径同语义（不做属主校验）。
 
+**落盘名净化（qual 硬化 (a)，已修）**：同一条「库文件可被属主改写」的面还有第二个出口——
+条目的 `name`/`ext` 是库里的自由文本。不净化时伪造行 `name = "../../evil"` 会让 worker 在
+**目标目录之外**落物（以普通用户身份写用户自己的文件，不构成提权，但违背「导出只写 `targetDir`」
+的接口承诺，且可在任意用户可写目录覆盖同名文件）。现落盘名一律过 `sanitize`（`..` → `_`；
+`/`、`\`、控制字符 → `_`；净化后空/`.` → `_`），**`ext` 同样过净**——雕刻件的
+`carved_{idx:06}.{ext}` 直接拼 `ext` 会重建同一条穿越串。净化后名内无分隔符，故拼接结果恒在
+`targetDir` 之下；重名走 `{stem}_{N}.{ext}` 去重；`items[].name` 回传实际落盘名。
+注入测试（伪造行 → 导出 → 断言目标目录外无落物、报告名无 `/`/`..`）见
+`crates/xd-daemon/tests/export_ipc.rs::hostile_row_names_and_ext_cannot_escape_target_dir`。
+
 **同盘判定（-32006）两道——盲区①已修（盘级祖先）**：
 1. **精快路径**：`st_dev(target) == st_rdev(source 节点)`（一次 stat 的内核事实）。
    盲区（原明记不修、现已封）：整盘 `/dev/sdb` (8,16) 与其分区 sdb1 (8,17) 不相等 ⇒ 写回源盘
@@ -142,6 +152,10 @@ user namespace（userns 内的 root 无宿主 CAP_DAC_OVERRIDE，读不了宿主
 
 **残留盲区（明记不修）**：父侧校验（同步错误码）与子侧复核之间的目标目录换靶 TOCTOU：子侧复核
 为权威且其在降权前单线程完成，残窗仅文件系统竞争（无外部输入面）。闭合归 M4（fd 化 + `openat2`）。
+**cancel 的 stale-pid 窗（qual I5 本轮记录）**：`Job.pid` 在 spawn 时定格，cancel 据此定向 `kill`；
+reap 完成～state 落定之间的 µs 级窗内该 pid 已被回收，理论上可复用给无关进程而被误发 SIGTERM
+（非 root 时内核按 uid 拒绝，无害；root 时本有 CAP_KILL，属误伤不属提权）。闭合归 M4（`pidfd`
+或子句柄 + `try_wait` 收口）。
 
 **未验证（需真机 root/pkexec）**——本机非 root，集成/单测只覆盖纯决策函数（`drop_plan`）：
 - [ ] 真机 pkexec 拉起后导出：落盘文件属主 == `PKEXEC_UID` 用户（进程未降权时会是 root）。

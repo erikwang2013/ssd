@@ -1,7 +1,9 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! daemon 全链路：scan 落库 → `export.start` → `--export-worker` 子进程逐件写盘 → `export.finished`。
 //! 覆盖：happy 逐字节相等、删除件被复占簇的短交付（degraded/short read）、目标目录 -32007、
-//! cancel 两态竞态容忍（同 scan_ipc 的 pause 先例）。
+//! cancel 两态竞态容忍（同 scan_ipc 的 pause 先例）+ 取消须真终止（qual I1）、
+//! unknown-ext 雕刻件 failed + 无残骸（qual I3）、父死后子 EPIPE 静默退出（qual I4）、
+//! 伪造库行的落盘名净化/穿越拦截（qual 硬化 (a)）。
 //! 铁律（T8/T6 教训）：**每个 spawn 必带 `--db <tempdir>`**——导出的子进程按 `--db` 只读打开同一
 //! 库，内存库降级时 export.start 诚实 -32603；不触真实 $HOME。
 //! -32006/-32010 的**真值**归单测（xd-core::export 的纯函数注入假 statvfs/rdev）；-32006 的真环回
@@ -11,9 +13,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use xd_core::api::ScanEntry;
+use xd_core::store::Store;
 
 /// spawn 返回：子进程 + stdin + 「响应/通知」合流通道 + stderr。
 type Spawned = (
@@ -414,6 +419,13 @@ fn cancel_stops_export_two_state_tolerance() {
     match state {
         "canceled" => {
             assert_eq!(p["canceled"], true, "运行中取消 ⇒ 终报必带 canceled：{exf}");
+            // 真终止断言（qual I1）：cancel 紧随 start（μs 级）发出，子进程还在 exec/开库/盘上写，
+            // 30 件不可能已跑完 ⇒ 必有未跑完的件。残窗：worker 恰在「写完最后一件」与「落定 state」
+            // 之间被取消（µs），此时计数可满——qual 探针 30 次未见此态，故不为此加松弛。
+            assert!(
+                succ + deg < total,
+                "取消须实际终止子进程（qual 探针 0/30 全计数；SIGTERM 未生效？）：{exf}"
+            );
             assert_eq!(
                 succ + deg + fail,
                 total,
@@ -438,5 +450,285 @@ fn cancel_stops_export_two_state_tolerance() {
         "取消后 daemon 仍服务（转发线程/jobs 锁无卡死）"
     );
     drop(stdin);
+    let _ = child.wait();
+}
+
+// ===== qual 硬化（本轮）：failed 件 E2E / 库行注入 / EPIPE 转正 =====
+
+/// 伪造库行：经 `Store::insert_entries`（本仓自己的写入 API，同表同列）直插——等价「sqlite 直插」，
+/// 模拟调用者/外部工具/未来迁移写出引擎不会产出之形。骨架字段按需覆盖。
+fn forged(idx: u64, name: &str, ext: &str, size: u64, quality: &str) -> ScanEntry {
+    ScanEntry {
+        idx,
+        name: name.into(),
+        path: "/".into(),
+        ext: ext.into(),
+        size_bytes: size,
+        deleted: false,
+        is_dir: false,
+        quality: quality.into(),
+        first_cluster: 0,
+        byte_offset: None,
+        contiguous: None,
+    }
+}
+
+fn forge_entries(db: &Path, task_id: i64, rows: &[ScanEntry]) {
+    Store::open(db)
+        .unwrap()
+        .insert_entries(task_id as u64, rows)
+        .unwrap();
+}
+
+/// 1MiB exfat 夹具里簇 `c` 的起始字节偏移 = HEAP_OFFSET(32 扇区)×512 + (c−2)×4096
+/// （xd-fixtures/src/exfat.rs 的常量）。两文件夹具的 LIVE_A/B 占簇 6,7,8 ⇒ 簇 100 必空闲。
+fn cluster_offset(c: u32) -> u64 {
+    32 * 512 + u64::from(c - 2) * 4096
+}
+
+/// 目录内文件名（已排序）。
+fn dir_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// 本测试的 export worker 在场与否（cmdline 含 `--export-worker` + 本测试独有的 db 路径；
+/// 同二进制并跑的其它用例各用各的 tempdir，不会误配）。
+fn find_export_worker(db: &Path) -> Option<i32> {
+    let db = db.to_str().unwrap();
+    let dir = std::fs::read_dir("/proc").ok()?;
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(cmd) = std::fs::read(e.path().join("cmdline")) else {
+            continue; // 他人进程/已退出：权限或竞态
+        };
+        let cmd = String::from_utf8_lossy(&cmd);
+        if cmd.contains("--export-worker") && cmd.contains(db) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn wait_export_worker(db: &Path, timeout: Duration) -> Option<i32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(pid) = find_export_worker(db) {
+            return Some(pid);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 子进程已退出证据：`/proc/<pid>` 消失（已收尸），或 state == 'Z'（已退出待收尸）。
+fn worker_exited(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        // comm 可能含 ')'：取最后一个 ')' 之后才是 state 字段
+        Ok(s) => s
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// 5）雕刻件失败通路 + 半成品清理（qual I3）：直插未知 ext 的雕刻行 → `create_new` 已建文件、
+/// 读取必败（from_ext 不认 "xyz"）⇒ failed 逐字 + **目标目录无残骸**。
+/// 牙：删 `export_one` 里的 `cleanup` → 空文件 `carved_000042.xyz` 留盘 → 本测红。
+#[test]
+fn carved_unknown_ext_reports_failed_and_leaves_no_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let img_path = dir.path().join("vol.img");
+    std::fs::write(&img_path, two_file_image_bytes().0).unwrap();
+    let db = dir.path().join("t.db");
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let (mut child, mut stdin, rx, _err) = spawn_image_daemon(&img_path, &db);
+    let dev_id = first_image_device(&mut stdin, &rx);
+    let task_id = scan_to_completed(&mut stdin, &rx, dev_id);
+
+    let mut row = forged(42, "", "xyz", 4096, "carved");
+    row.byte_offset = Some(cluster_offset(100));
+    forge_entries(&db, task_id, &[row]);
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"export.start",
+               "params":{"taskId":task_id,"idxs":[42],"targetDir":out.to_str().unwrap()}}),
+    );
+    let st = read_response(&rx, 3, Duration::from_secs(10));
+    assert!(
+        st.get("error").is_none(),
+        "伪造行须过父侧校验（条目在场即可）：{st}"
+    );
+    assert_eq!(st["result"]["fileCount"], 1, "{st}");
+    assert_eq!(st["result"]["estimatedBytes"], 4096, "{st}");
+
+    let exf = wait_notification(&rx, "export.finished", Duration::from_secs(30));
+    let p = &exf["params"];
+    assert_eq!(p["succeeded"], 0, "{exf}");
+    assert_eq!(p["degraded"], 0, "{exf}");
+    assert_eq!(p["failed"], 1, "{exf}");
+    let item = &p["items"][0];
+    assert_eq!(item["idx"], 42, "{exf}");
+    assert_eq!(item["name"], "carved_000042.xyz", "{exf}");
+    assert_eq!(item["status"], "failed", "{exf}");
+    assert!(
+        item["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unknown carved ext"),
+        "reason 须言明坏 ext：{exf}"
+    );
+    let left = dir_names(&out);
+    assert!(
+        left.is_empty(),
+        "失败件不得留半成品残骸（cleanup 必删）：{left:?}"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// 6）库行注入（qual 硬化 (a)）：伪造活条目名带 `../`、雕刻件 ext 带 `../`——落盘名一律过
+/// sanitize ⇒ ① 无文件落到目标目录之外；② 报告名不含 `/`、`..`；③ 坏 ext 件 failed 且无残骸。
+/// 牙：去掉 name 的 sanitize → `escaped.bin` 真出现在目标目录**之外** → 红；
+/// 去掉 ext 的 sanitize → 报告名带 `/`+`..`（且 create 抛 ENOENT）→ 红。
+#[test]
+fn hostile_row_names_and_ext_cannot_escape_target_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let img_path = dir.path().join("vol.img");
+    std::fs::write(&img_path, two_file_image_bytes().0).unwrap();
+    let db = dir.path().join("t.db");
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let (mut child, mut stdin, rx, _err) = spawn_image_daemon(&img_path, &db);
+    let dev_id = first_image_device(&mut stdin, &rx);
+    let task_id = scan_to_completed(&mut stdin, &rx, dev_id);
+
+    // ① 活条目：名 "../escaped.bin"，读簇 6（LIVE_A.TXT 首 4096B）必成功 ⇒ 净化不做则真越界落物
+    let mut live = forged(42, "../escaped.bin", "bin", 4096, "complete");
+    live.first_cluster = 6;
+    live.contiguous = Some(true);
+    // ② 雕刻条目：ext "../evil"（名字虽净化，ext 不净化即带穿越串）
+    let mut evil = forged(43, "", "../evil", 4096, "carved");
+    evil.byte_offset = Some(cluster_offset(100));
+    forge_entries(&db, task_id, &[live, evil]);
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"export.start",
+               "params":{"taskId":task_id,"idxs":[42,43],"targetDir":out.to_str().unwrap()}}),
+    );
+    let st = read_response(&rx, 3, Duration::from_secs(10));
+    assert!(st.get("error").is_none(), "{st}");
+
+    let exf = wait_notification(&rx, "export.finished", Duration::from_secs(30));
+    let p = &exf["params"];
+    assert_eq!(p["succeeded"], 1, "活条目按簇读出整件成功：{exf}");
+    assert_eq!(p["degraded"], 0, "{exf}");
+    assert_eq!(p["failed"], 1, "坏 ext 件失败：{exf}");
+    let item = &p["items"][0];
+    assert_eq!(item["idx"], 43, "{exf}");
+    assert_eq!(item["status"], "failed", "{exf}");
+    let n = item["name"].as_str().unwrap();
+    assert!(
+        n.starts_with("carved_") && !n.contains('/') && !n.contains(".."),
+        "ext 必须过 sanitize：{n}"
+    );
+
+    // 越界拦截（名净化的牙）：目标目录之外不得有落物
+    assert!(
+        !dir.path().join("escaped.bin").exists(),
+        "落盘名未净化：文件真逃逸出了目标目录"
+    );
+    let names = dir_names(&out);
+    assert_eq!(
+        names.len(),
+        1,
+        "目标目录恰一件（坏 ext 件已清残骸）：{names:?}"
+    );
+    assert!(!names[0].contains(".."), "落盘名须安全：{names:?}");
+    let want: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(
+        std::fs::read(out.join(&names[0])).unwrap(),
+        want,
+        "伪造活行读到簇 6 首 4096B（LIVE_A.TXT 模式字节），且落在目标目录内"
+    );
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// 7）EPIPE 转正（qual I4）：父（daemon）被 SIGKILL → 子的 stdout 断开 → 子**静默退出**
+/// （run_inner 的 writeln 失败臂 `return Ok(())`），stderr 无 panic 留痕——子 stderr 继承 daemon
+/// 的 stderr（= 本测试管道），父死后仍可读全。
+/// 牙：EPIPE 臂改成 unwrap/panic → 子 panic 落 stderr → 红。
+#[test]
+fn epipe_worker_exits_silently_when_parent_dies() {
+    let dir = tempfile::tempdir().unwrap();
+    let img_path = dir.path().join("bulk.img");
+    std::fs::write(&img_path, bulk_image_bytes()).unwrap();
+    let db = dir.path().join("t.db");
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let (mut child, mut stdin, rx, stderr) = spawn_image_daemon(&img_path, &db);
+    // 持续排空 stderr（防管道满阻塞子进程），事后断言无 panic
+    let tail = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&tail);
+    let drain = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push_str(&line);
+            sink.lock().unwrap().push('\n');
+        }
+    });
+
+    let dev_id = first_image_device(&mut stdin, &rx);
+    let task_id = scan_to_completed(&mut stdin, &rx, dev_id);
+    let entries = collect_named_entries(&mut stdin, &rx, task_id);
+    let idxs: Vec<u64> = entries.iter().map(|e| e.0).collect();
+    assert_eq!(idxs.len(), 30, "夹具条目数");
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"export.start",
+               "params":{"taskId":task_id,"idxs":idxs,"targetDir":out.to_str().unwrap()}}),
+    );
+    let st = read_response(&rx, 3, Duration::from_secs(10));
+    assert!(st.get("error").is_none(), "{st}");
+
+    // 子此刻必在场（export.start 返回 = 子已 spawn；30×32KiB 远未跑完）
+    let worker = wait_export_worker(&db, Duration::from_secs(2))
+        .expect("worker 应在场（响应先于子进程结束）");
+    // 杀父：子的 stdout 读端关闭 ⇒ 下一次 writeln 必 EPIPE
+    child.kill().unwrap();
+    let _ = child.wait();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !worker_exited(worker) {
+        assert!(
+            Instant::now() < deadline,
+            "worker pid={worker} 未随父退出（EPIPE 臂失效？）"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stdin);
+    drain.join().unwrap(); // 写端全关（daemon 死 + 子退出）⇒ 管道 EOF
+    let log = tail.lock().unwrap().clone();
+    assert!(
+        !log.contains("panicked"),
+        "EPIPE 路径不得 panic（子 stderr 留痕）：{log}"
+    );
+
     let _ = child.wait();
 }
