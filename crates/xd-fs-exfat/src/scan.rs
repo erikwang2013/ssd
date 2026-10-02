@@ -7,7 +7,11 @@ use crate::bitmap::Bitmap;
 use crate::boot::{self, ExfatBoot};
 use crate::dirent::{self, ParsedEntry};
 use crate::fattab::Fat32;
+use crate::read::{Resolved, load_bitmap_from_specials, resolve_clusters};
 use xd_device::BlockDevice;
+
+/// `read_file` 原样再导出：保 T7 路径 `xd_fs_exfat::scan::read_file` 不变（实现已迁 `read.rs`）。
+pub use crate::read::read_file;
 
 const MAX_ENTRIES: usize = 200_000;
 const MAX_DEPTH: u32 = 32;
@@ -33,16 +37,6 @@ pub struct ExfatEntry {
     pub ext: String,
 }
 
-/// texFAT 双位图选择：优先活动位图（bitmaps[k].0 == active），缺失则回退任一。
-pub(crate) fn pick_bitmap(bitmaps: &[(bool, u32, u64)], active: u8) -> Option<(u32, u64)> {
-    let want_second = active == 1;
-    bitmaps
-        .iter()
-        .find(|(second, _, _)| *second == want_second)
-        .or_else(|| bitmaps.first())
-        .map(|(_, f, l)| (*f, *l))
-}
-
 pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<ExfatEntry>, ExfatError> {
     let boot = boot::parse(dev)?;
     let fat = Fat32::new(dev, &boot);
@@ -63,28 +57,9 @@ pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<ExfatEntry>, ExfatError> {
     Ok(out)
 }
 
-/// 由已解析的 specials 加载位图（scan 复用根快照；qual-t5 M1）。
-/// 任何失败 → None（分级层即降级，绝不回退 FAT）。
-fn load_bitmap_from_specials(
-    dev: &dyn BlockDevice,
-    boot: &ExfatBoot,
-    fat: &Fat32,
-    specials: &dirent::Specials,
-) -> Option<Bitmap> {
-    let (first, len) = pick_bitmap(&specials.bitmaps, boot.active_fat_index())?;
-    Bitmap::load(dev, boot, fat, first, len).ok()
-}
-
-/// 自读根目录再转发（T6 `read_file` 用——它没有现成 specials）。
-#[allow(dead_code)]
-fn load_bitmap(dev: &dyn BlockDevice, boot: &ExfatBoot, fat: &Fat32) -> Option<Bitmap> {
-    let root_data = read_root_dir(dev, boot, fat).ok()?;
-    let root = dirent::parse_directory_bytes(&root_data, boot.cluster_bytes() as usize);
-    load_bitmap_from_specials(dev, boot, fat, &root.specials)
-}
-
 /// 读根目录全部字节（根恒 FAT 链）。链失败或首读 0 字节 → Err（与空盘 Ok 区分，M1a I2 对等）。
-fn read_root_dir(
+/// `pub(crate)`：`read.rs::load_bitmap` 复用（read_file 无现成 specials）。
+pub(crate) fn read_root_dir(
     dev: &dyn BlockDevice,
     boot: &ExfatBoot,
     fat: &Fat32,
@@ -197,7 +172,8 @@ fn scan_parsed(
     Ok(())
 }
 
-/// 子目录字节：contiguous → 连续读（规范保证）；否则先链、不足退连续；读不满即降级 Err。
+/// 子目录字节：`resolve_clusters` 定位（contiguous 规范保证 / 否则先链、不足退连续）；
+/// 读不满即降级 Err。物化有界（need ≤ MAX_DIR_BYTES/512），与 `read_file` 的流式路径不同。
 fn read_subdir_bytes(
     dev: &dyn BlockDevice,
     boot: &ExfatBoot,
@@ -209,24 +185,14 @@ fn read_subdir_bytes(
     }
     let cb = boot.cluster_bytes();
     let need = e.data_length.div_ceil(cb);
-    let mut clusters: Vec<u32> = Vec::new();
-    if !e.contiguous
-        && let Ok(chain) = fat.chain(e.first_cluster)
-        && chain.len() as u64 >= need
+    let clusters: Vec<u32> = match resolve_clusters(boot, fat, e.first_cluster, need, e.contiguous)
     {
-        clusters = chain[..need as usize].to_vec();
-    }
-    if clusters.is_empty() {
-        let max_cluster = boot.cluster_count as u64 + 1;
-        let mut c = e.first_cluster as u64;
-        while (clusters.len() as u64) < need && c <= max_cluster {
-            clusters.push(c as u32);
-            c += 1;
+        Some(Resolved::Chain(chain)) => chain[..need as usize].to_vec(),
+        Some(Resolved::Contiguous { first, n }) => {
+            (0..n).map(|i| (first as u64 + i) as u32).collect()
         }
-        if (clusters.len() as u64) < need {
-            return Err(ExfatError::InvalidBoot("目录簇越界".into()));
-        }
-    }
+        None => return Err(ExfatError::InvalidBoot("目录簇越界".into())),
+    };
     let mut data = Vec::with_capacity(e.data_length as usize);
     let mut buf = vec![0u8; cb as usize];
     for c in clusters {
@@ -249,7 +215,7 @@ fn read_subdir_bytes(
     Ok(data)
 }
 
-/// 删除项分级：簇定位（contiguous 规范保证 / 链优先）→ 界内 → 位图全空 → Complete。
+/// 删除项分级：`resolve_clusters` 定位（contiguous 规范保证 / 链优先）→ 位图全空 → Complete。
 fn grade_deleted(
     boot: &ExfatBoot,
     fat: &Fat32,
@@ -265,38 +231,29 @@ fn grade_deleted(
     if e.data_length == 0 {
         return RecoverQuality::Complete;
     }
-    if e.first_cluster < 2 {
-        return RecoverQuality::MaybeDamaged; // 不可达（T4 保证 dl>0 ⇒ fc≥2），防御保留
-    }
-    let cb = boot.cluster_bytes();
-    let need = e.data_length.div_ceil(cb);
-    let max_cluster = boot.cluster_count as u64 + 1;
-    if e.first_cluster as u64 > max_cluster {
-        return RecoverQuality::MaybeDamaged; // 起点越界（T4 不保证 fc ≤ max）：兼防 reachable 下溢
-    }
-    let reachable = max_cluster - e.first_cluster as u64 + 1;
-    if need > reachable {
-        return RecoverQuality::MaybeDamaged; // I1 界卫：超出可达簇数，物理不可能 Complete
-    }
+    let need = e.data_length.div_ceil(boot.cluster_bytes());
     let all_free = |c: u32| matches!(bitmap.is_free(c), Ok(true));
-    if !e.contiguous
-        && let Ok(chain) = fat.chain(e.first_cluster)
-        && chain.len() as u64 >= need
-    {
-        return if chain[..need as usize].iter().all(|c| all_free(*c)) {
+    match resolve_clusters(boot, fat, e.first_cluster, need, e.contiguous) {
+        // 起点非法 / need 超出可达簇数（I1 界卫）：物理不可能 Complete
+        None => RecoverQuality::MaybeDamaged,
+        Some(Resolved::Chain(chain)) => {
+            if chain[..need as usize].iter().all(|c| all_free(*c)) {
+                RecoverQuality::Complete
+            } else {
+                RecoverQuality::MaybeDamaged
+            }
+        }
+        // 连续回退：流式判定，不物化（qual-t5 I1：need 可被污染放大，Vec 会爆内存）；
+        // 区间界由 resolve_clusters 保证
+        Some(Resolved::Contiguous { first, n }) => {
+            for i in 0..n {
+                if !all_free((first as u64 + i) as u32) {
+                    return RecoverQuality::MaybeDamaged;
+                }
+            }
             RecoverQuality::Complete
-        } else {
-            RecoverQuality::MaybeDamaged
-        };
-    }
-    // 连续回退：流式判定，不物化（qual-t5 I1：need 可被污染放大，Vec 会爆内存）；
-    // 区间 first_cluster..first_cluster+need 的界由上方两道界卫保证
-    for i in 0..need {
-        if !all_free(e.first_cluster + i as u32) {
-            return RecoverQuality::MaybeDamaged;
         }
     }
-    RecoverQuality::Complete
 }
 
 #[cfg(test)]
@@ -455,21 +412,6 @@ mod tests {
         let entries = scan(&dev).unwrap();
         let e = entries.iter().find(|e| e.deleted).unwrap();
         assert_eq!(e.quality, RecoverQuality::MaybeDamaged);
-    }
-
-    #[test]
-    fn pick_bitmap_prefers_active_and_falls_back() {
-        // 纯函数级：texFAT 双位图选择
-        let both = vec![(false, 2, 32u64), (true, 40, 32u64)];
-        assert_eq!(pick_bitmap(&both, 1), Some((40, 32)));
-        assert_eq!(pick_bitmap(&both, 0), Some((2, 32)));
-        let only_first = vec![(false, 2, 32u64)];
-        assert_eq!(
-            pick_bitmap(&only_first, 1),
-            Some((2, 32)),
-            "缺失活动位图时回退任一可用"
-        );
-        assert_eq!(pick_bitmap(&[], 0), None);
     }
 
     #[test]
