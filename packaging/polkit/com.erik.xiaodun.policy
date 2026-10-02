@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+                              "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>erik.xyz</vendor>
+  <action id="com.erik.xiaodun.daemon.run">
+    <description>小盾数据恢复：以特权只读访问磁盘</description>
+    <message>需要授权以只读方式读取磁盘设备</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+      <!-- 安全注（勿改）：pkexec 不校验参数；一旦改为 auth_admin_keep 或 yes，
+           `pkexec xd-daemon --image /etc/shadow` 即本地任意文件读取。 -->
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/xiaodun/xd-daemon</annotate>
+  </action>
+</policyconfig>

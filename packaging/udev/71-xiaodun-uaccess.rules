@@ -1,0 +1,6 @@
+# 小盾数据恢复：活动会话用户对 USB 存储与 SD 卡免密只读访问。
+# 71- 晚于 60-persistent-storage.rules，此时 ENV{ID_BUS} 已由 blkid 填好。
+# 注意：uaccess 授予的是 **rw**（内核层面没有"只读 ACL"）；只读铁律由
+# 小盾类型系统（BlockDevice 无写方法）+ O_RDONLY 保证，见 docs/security/linux-privilege-model.md。
+ACTION=="add|change", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="mmcblk[0-9]*", TAG+="uaccess"

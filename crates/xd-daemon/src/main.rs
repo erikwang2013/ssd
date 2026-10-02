@@ -1,6 +1,10 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! 小盾桌面特权进程：stdio JSON-RPC 服务（每行一条 JSON，见 proto/v0/README.md）。
-//! 提权归 M4；M1e 起 Linux 支持 --device 注册物理块设备 + 启动时 sysfs 枚举供 device.list。
+//! 提权归 M4；M1e 起 Linux 支持 --device 注册物理块设备 + 启动时 sysfs 枚举供 device.list，
+//! 并在 root（pkexec 兜底）路径做 --image 参数纵深防御（privcheck，见 docs/security/linux-privilege-model.md）。
+
+#[cfg(target_os = "linux")]
+mod privcheck;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -12,6 +16,9 @@ use xd_device::image::ImageFileDevice;
 
 fn main() {
     let mut devices: Vec<Box<dyn BlockDevice>> = Vec::new();
+    // 提权兜底路径（pkexec 以 root 拉起）的准入判定，见 docs/security/linux-privilege-model.md。一次 /proc 读。
+    #[cfg(target_os = "linux")]
+    let euid = privcheck::effective_uid();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -20,6 +27,35 @@ fn main() {
                     eprintln!("error: --image requires a path");
                     std::process::exit(2);
                 };
+                // root 模式（pkexec 兜底）纵深防御：O_NOFOLLOW 打开 + 属主须为 PKEXEC_UID。
+                // 常规路径（uaccess，euid != 0）不做此校验：权限由 udev ACL 与文件属主决定。
+                #[cfg(target_os = "linux")]
+                if euid == Some(0) {
+                    use std::os::unix::fs::MetadataExt;
+                    let file = match privcheck::open_image_no_follow(&PathBuf::from(&path)) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("error: cannot open image {path}: {e}");
+                            std::process::exit(2);
+                        }
+                    };
+                    let md = match file.metadata() {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("error: cannot stat image {path}: {e}");
+                            std::process::exit(2);
+                        }
+                    };
+                    let pkexec_uid = std::env::var("PKEXEC_UID")
+                        .ok()
+                        .and_then(|s| s.parse().ok());
+                    if let Err(reason) =
+                        privcheck::check_image_arg(md.uid(), md.is_file(), pkexec_uid)
+                    {
+                        eprintln!("error: {reason}");
+                        std::process::exit(2);
+                    }
+                }
                 match ImageFileDevice::open(&PathBuf::from(&path)) {
                     Ok(dev) => devices.push(Box::new(dev)),
                     Err(e) => {
