@@ -12,7 +12,9 @@ img=$(mktemp /tmp/xd-loop-$$-XXXX.img)
 tmpdb=$(mktemp /tmp/xd-loop-db-XXXXXX)
 loop=""
 rm -f "$tmpdb"   # 让 sqlite 自建；步骤 2/3 共用——防 sudo 下写 root/真实 HOME 状态库（同增补 1 类纪律）
-trap 'if [ -n "$loop" ]; then sudo losetup -d "$loop"; fi; rm -f "$img"; [ -z "$tmpdb" ] || rm -f "$tmpdb"' EXIT
+# trap 兜底：清理失败不得反噬脚本退出码（set -euo pipefail）——tmpdb 由 root 属主 daemon 建，
+# 非 root 在 sticky /tmp 上 rm -f 会 EPERM，必须 sudo + || true；其余清理同款兜底防中断。
+trap 'if [ -n "$loop" ]; then sudo losetup -d "$loop" || true; fi; rm -f "$img" || true; [ -z "$tmpdb" ] || sudo rm -f "$tmpdb" || true' EXIT
 
 cargo run -q --locked -p xd-fixtures --example gen_fat_image -- "$img"
 cargo build -q --locked -p xd-daemon
