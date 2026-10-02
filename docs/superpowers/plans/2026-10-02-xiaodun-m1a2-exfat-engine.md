@@ -110,10 +110,11 @@ mod tests {
         // 手算：循环右移 1 位累加
         assert_eq!(boot_checksum(&[0x01]), 1);
         assert_eq!(boot_checksum(&[0x80, 0x01]), 0x41);
-        assert_eq!(boot_checksum(&[0x03]), 0x8000_0004); // 奇数触发回绕分支
+        // 回绕看的是**进位前**的 sum → 需要两字节才触发：[0x03,0x03] → 0x8000_0004
+        assert_eq!(boot_checksum(&[0x03, 0x03]), 0x8000_0004);
         assert_eq!(entry_set_checksum(&[0x01]), 1);
         assert_eq!(entry_set_checksum(&[0x80, 0x01]), 0x41);
-        assert_eq!(entry_set_checksum(&[0x03]), 0x8004);
+        assert_eq!(entry_set_checksum(&[0x03, 0x03]), 0x8004);
     }
 
     #[test]
@@ -246,7 +247,7 @@ mod tests {
         let c = |n: usize| 32 * 512 + (n - 2) * 4096;
         assert_eq!(&img[c(7)..c(7) + 4096], &data[..4096]);
         assert_eq!(&img[c(6)..c(6) + 4096], &data[4096..8192]);
-        assert_eq!(&img[c(8)..c(8) + 904], &data[8192..9000]);
+        assert_eq!(&img[c(8)..c(8) + 808], &data[8192..9000]);
         // 位图三簇均置位
         let bm = &img[32 * 512..32 * 512 + 32];
         for cl in [7u32, 6, 8] {
@@ -818,6 +819,25 @@ Expected: 16 passed（13 `#[test]` + 3 `#[should_panic]`）；既有 FAT builder
 git add crates/xd-fixtures
 git commit -m "feat(fixtures): exFAT 合成镜像 builder（几何/checksum/项集/位图/删除语义）"
 ```
+
+**修订轮（执行侧，2026-10-02）**：实施提交 `1e74b91`（分支 m1a2-exfat）。计划字面代码有 5 处被执行侧修正，
+经 spec 审查逐一判定**接受**（均有独立验证）：
+
+- **① 编译性**：fold 字面量类型标注；`paths: Vec<&String>`（借用冲突）→ `Vec<String>`。语义零变化（字符级 diff 穷举）。
+- **② 计划测试硬伤**：`boot_checksum(&[0x03])`/`entry_set_checksum(&[0x03])` 期望值是 `[0x03,0x03]` 的折叠值
+  （单字节恒为 3——回绕分支看进位前的 sum）→ 输入改两字节；`c(8)+904` → `+808`（9000−8192）。本文件已就地修正。
+- **③ ★语义性（必需）**：新增 **`push_dir_unit`**——目录项集**簇对齐**放置，剩余槽以 **0x01**（unused 标记）补齐。
+  原计划的流式拼接会让第 42 个文件的项集跨根目录簇边界：**违反规范"项集不得跨簇"，且该计划的 T4 解析器
+  自己会拒绝它、`root_grows` 测试也与之矛盾**（流式布局下第二根簇首槽为 0xC1 而非 0x85）。独立解析器验证：
+  补齐版 45/45 还原、流式版 44/45（恰好丢 F0041.TXT）。
+  **napkin 记录**：`fsck.exfat` **不强制**"项集不跨簇"（流式镜像 fsck 仍判 clean）——该规则的 oracle 是本计划
+  的解析器规则（`i / cb != (end-1) / cb → 拒绝`），不是 fsck。0x01 补齐的合法性已由 fsck 实证（45 文件全数枚举）。
+- **④ 卫生**：`UPCASE_TABLE_CHECKSUM` 直写 0x82 + `debug_assert_eq!(table_checksum(UPCASE_TABLE), …)`；
+  `decode_upcase` 仅测试使用 → `#[cfg(test)]`。
+- **⑤ rustfmt** 展开。
+
+**下游常量（T4-T7 依赖）**：根目录多簇时项集簇对齐 + 0x01 填充；root_grows 场景文件占簇 6..50、第二根簇 51、
+首集为 `F0041.TXT`。计数：xd-fixtures **28**（16 exfat + 12 FAT）、workspace **104**。
 
 ---
 
