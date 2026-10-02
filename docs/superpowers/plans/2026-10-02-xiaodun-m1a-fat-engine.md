@@ -765,7 +765,7 @@ impl FatImageBuilder {
 fn set_fat12(image: &mut [u8], fat_start: u32, cluster: u32, value: u32) {
     let off = (fat_start * BPS + cluster + cluster / 2) as usize;
     let v = (value & 0x0FFF) as u16;
-    if cluster % 2 == 0 {
+    if cluster.is_multiple_of(2) {
         image[off] = (v & 0xFF) as u8;
         image[off + 1] = (image[off + 1] & 0xF0) | ((v >> 8) as u8 & 0x0F);
     } else {
@@ -1260,11 +1260,11 @@ mod tests {
 
     #[test]
     fn follows_fat12_nibble_packing() {
-        let image = xd_fixtures::FatImageBuilder::fat12().add_file("/", "A.BIN", &[0u8; 1200]).build();
+        let image = xd_fixtures::FatImageBuilder::fat12().add_file("/", "A.BIN", &[0u8; 600]).build();
         let (_f, dev) = dev_for(&image);
         let bpb = bpb::parse(&dev).unwrap();
         let fat = Fat::new(&dev, &bpb);
-        assert_eq!(fat.chain(2).unwrap(), vec![2, 3, 4]); // 1200B → 3 簇
+        assert_eq!(fat.chain(2).unwrap(), vec![2, 3]); // 600B → 2 簇
     }
 
     #[test]
@@ -1319,26 +1319,35 @@ impl<'d> Fat<'d> {
         Self { dev, bpb }
     }
 
-    /// 读取 cluster 的表项原值（已按类型掩码）。
+    /// 读取 cluster 的表项原值（已按类型掩码）。短读（EOF）返回错误而非静默 0。
     pub fn entry(&self, cluster: u32) -> Result<u32, FatError> {
         match self.bpb.fat_type {
             FatType::Fat32 => {
                 let mut b = [0u8; 4];
-                self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
+                let n = self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
+                if n < 4 {
+                    return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
+                }
                 Ok(u32::from_le_bytes(b) & 0x0FFF_FFFF)
             }
             FatType::Fat16 => {
                 let mut b = [0u8; 2];
-                self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
+                let n = self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
+                if n < 2 {
+                    return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
+                }
                 Ok(u16::from_le_bytes(b) as u32)
             }
             FatType::Fat12 => {
                 let off = self.bpb.fat_start_sector as u64 * self.bpb.bytes_per_sector as u64
                     + (cluster + cluster / 2) as u64;
                 let mut b = [0u8; 2];
-                self.dev.read_at(off, &mut b)?;
+                let n = self.dev.read_at(off, &mut b)?;
+                if n < 2 {
+                    return Err(FatError::InvalidBpb(format!("fat entry {cluster} beyond device")));
+                }
                 let pair = u16::from_le_bytes(b) as u32;
-                Ok(if cluster % 2 == 0 { pair & 0x0FFF } else { pair >> 4 })
+                Ok(if cluster.is_multiple_of(2) { pair & 0x0FFF } else { pair >> 4 })
             }
         }
     }
@@ -1365,6 +1374,7 @@ impl<'d> Fat<'d> {
     pub fn chain(&self, start: u32) -> Result<Vec<u32>, FatError> {
         let mut out = vec![start];
         let mut cur = start;
+        // M2：越界守卫 count+2 有一格宽（合法簇上界为 count+1）；面对真实损坏盘时收紧或显式记录破损链。
         let limit = self.bpb.data_cluster_count() + 2;
         while out.len() as u32 <= limit {
             let v = self.entry(cur)?;
