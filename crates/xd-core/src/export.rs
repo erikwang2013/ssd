@@ -9,6 +9,9 @@
 //!
 //! 校验前提：`estimated = Σ size_bytes` 是**上界**（降级短交付件实际更短）——余量按上界判，
 //! 宁严勿松。
+//! 同盘判定（-32006）两道：精快路径 `st_dev(目标) == st_rdev(源)` + 盘级祖先（sysfs 走链，
+//! 封「源=整盘 / 目标=其分区」；解析不到 sysfs 节点时 fail-open + stderr 留痕，见
+//! `check_on_source_at`；残窗 = 父/子校验间换靶 TOCTOU，归 M4）。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -29,6 +32,8 @@ pub const MAX_IDXS: usize = 100_000;
 pub const MAX_REPORT_ITEMS: usize = 1000;
 /// progress 转发节流（同 `scan.progress` 口径：≥250ms 一条）。
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(250);
+/// 盘级祖先判定的 sysfs 根（生产值；测试经 `check_on_source_at` 注入假根）。
+const SYSFS_ROOT: &str = "/sys";
 
 #[derive(Debug)]
 pub enum ExportError {
@@ -68,6 +73,8 @@ pub fn dedupe_idxs(idxs: &[u64]) -> Vec<u64> {
 ///
 /// `source_rdev` = 源为物理块设备时的 `(major, minor)`；镜像源为 `None`——**镜像不做同盘校验**
 /// （目标是普通文件生态，写目标不碰镜像内容；文档注明「恢复目标勿选镜像所在盘的满盘」）。
+/// 同盘判定为两道：精快路径 `st_dev(目标) == st_rdev(源)` + **盘级祖先**（封「源=整盘、
+/// 目标=其分区」盲区，见 `check_on_source_at`）。
 pub fn check_target(
     target: &Path,
     estimated: u64,
@@ -85,16 +92,62 @@ pub fn check_target(
     check_space(vfs.f_bavail.saturating_mul(vfs.f_frsize), estimated)
 }
 
-/// 同盘校验（纯函数：内核事实 `st_dev(目标) == st_rdev(源块设备)`；测试注入假值）。
+/// 同盘校验：① 精快路径（内核事实 `st_dev(目标) == st_rdev(源)`）② 盘级祖先（sysfs 走链，
+/// 封「源=整盘 / 目标=其分区」盲区）。镜像源（None）双道皆免。
 fn check_on_source(
     target_dev: (u64, u64),
     source_rdev: Option<(u64, u64)>,
     dir: &str,
 ) -> Result<(), ExportError> {
-    match source_rdev {
-        Some(rdev) if rdev == target_dev => Err(ExportError::TargetOnSource(dir.to_string())),
-        _ => Ok(()),
+    check_on_source_at(Path::new(SYSFS_ROOT), target_dev, source_rdev, dir)
+}
+
+/// `sysfs_root` 注入版（测试用假根；生产恒 `/sys`，见 `SYSFS_ROOT`）。
+fn check_on_source_at(
+    sysfs_root: &Path,
+    target_dev: (u64, u64),
+    source_rdev: Option<(u64, u64)>,
+    dir: &str,
+) -> Result<(), ExportError> {
+    let Some(src) = source_rdev else {
+        return Ok(()); // 镜像源：不做同盘校验（见 check_target 头注）
+    };
+    if target_dev == src {
+        return Err(ExportError::TargetOnSource(dir.to_string()));
     }
+    match is_descendant_at(sysfs_root, target_dev, src) {
+        Some(true) => Err(ExportError::TargetOnSource(dir.to_string())),
+        // fail-open + 留痕（裁定见 security 文档 §6）：sysfs 节点缺（容器/异常环境）时退回
+        // 精快路径结论。铁律要害是「别写回源盘」，精快路径已拦最常见形态；盘级判定是纵深，
+        // 不让环境差异挡住正常导出。对照行为：改 fail-close 则 inject 测试③翻转。
+        None => {
+            eprintln!(
+                "warn: 同盘盘级判定不可用（sysfs 无 {target_dev:?} 或 {src:?} 节点）——退回 rdev 相等判定"
+            );
+            Ok(())
+        }
+        Some(false) => Ok(()),
+    }
+}
+
+/// 盘级祖先（注入根，纯 I/O 封装便于测试）：`target_dev` 的 sysfs 节点是否位于 `source_dev`
+/// 节点之下（含相等；`Path::starts_with` 按路径分量比较，故 sdb1 是 sdb 的后代、sdb10 不是）。
+/// `None` = 任一节点在 sysfs 解析不到（调用方 fail-open）。
+///
+/// `target_dev` 取 `stat(目标).st_dev` 即**目标所在文件系统的设备号**——与
+/// `/proc/self/mountinfo` 第 3 字段是同一个值（`man proc`：「the value of st_dev for files on
+/// this filesystem」；本机实测 8:22/8:21 两例一致），故不另解析挂载表（最长前缀匹配只会
+/// 复现已有的一次 stat）。分区在 sysfs 里是整盘目录的子路径（`.../block/sdb/sdb1`，实测），
+/// 故「祖先」正是「同盘且源不更细」。
+fn is_descendant_at(
+    sysfs_root: &Path,
+    target_dev: (u64, u64),
+    source_dev: (u64, u64),
+) -> Option<bool> {
+    let canon = |(maj, min): (u64, u64)| {
+        std::fs::canonicalize(sysfs_root.join(format!("dev/block/{maj}:{min}"))).ok()
+    };
+    Some(canon(target_dev)?.starts_with(canon(source_dev)?))
 }
 
 /// 余量校验（纯函数）：`f_bavail * f_frsize < estimated` → -32010（非 root 可用块，不用 f_blocks）。
@@ -386,19 +439,154 @@ mod tests {
 
     #[test]
     fn on_source_is_kernel_fact_equality() {
-        // 同设备 → -32006（带目标目录文案）；异设备/镜像源（None）→ 放行
+        // 精快路径：同设备 → -32006（带目标目录文案）；镜像源（None）→ 放行。
+        // 假根缺节点（/nonexistent）⇒ 盘级判定 fail-open，恰好把本测钉在**精快路径**上。
+        let empty = Path::new("/nonexistent-sysfs-root");
         assert!(matches!(
-            check_on_source((8, 0), Some((8, 0)), "/mnt/usb/Recovered"),
+            check_on_source_at(empty, (8, 0), Some((8, 0)), "/mnt/usb/Recovered"),
             Err(ExportError::TargetOnSource(d)) if d == "/mnt/usb/Recovered"
         ));
         assert!(
-            check_on_source((8, 1), Some((8, 0)), "/x").is_ok(),
-            "异分区放行"
-        );
-        assert!(
-            check_on_source((0, 43), None, "/x").is_ok(),
+            check_on_source_at(empty, (0, 43), None, "/x").is_ok(),
             "镜像源不做同盘校验"
         );
+        assert!(
+            check_on_source_at(empty, (8, 1), Some((8, 0)), "/x").is_ok(),
+            "sysfs 缺节点 ⇒ fail-open（退回精快路径结论）"
+        );
+    }
+
+    /// 假 sysfs 根（照 `xd_device::linux::BlockEnumerator::with_root` 先例）：
+    /// `8:16 → .../block/sdb`（整盘）、`8:17/8:18 → .../block/sdb/sdb{1,2}`（其分区）。
+    /// 生产 `/sys` 的真形态实测同构（sdb→sdb6），此处离线复刻以免依赖真机拓扑。
+    fn fake_sysfs() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let disk = root.path().join("devices/pci0/block/sdb");
+        std::fs::create_dir_all(&disk).unwrap();
+        for (maj, min, rel) in [
+            ("8", "16", "devices/pci0/block/sdb"),
+            ("8", "17", "devices/pci0/block/sdb/sdb1"),
+            ("8", "18", "devices/pci0/block/sdb/sdb2"),
+            ("9", "0", "devices/pci0/block/sdc"),
+        ] {
+            let target = root.path().join(rel);
+            std::fs::create_dir_all(&target).unwrap();
+            let link = root.path().join(format!("dev/block/{maj}:{min}"));
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(Path::new("../../").join(rel), &link).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn partition_of_source_disk_is_rejected_by_ancestor_walk() {
+        // 盲区封堵的牙：源=整盘 sdb(8,16)、目标=其分区 sdb1(8,17)——rdev 不相等，旧判定放行；
+        // 盘级祖先链 .../block/sdb/sdb1 ⊃ .../block/sdb ⇒ 拒。删祖先判定 → 本测必红。
+        let root = fake_sysfs();
+        assert!(matches!(
+            check_on_source_at(root.path(), (8, 17), Some((8, 16)), "/mnt/Recovered"),
+            Err(ExportError::TargetOnSource(d)) if d == "/mnt/Recovered"
+        ));
+        // 方向性 pin（单向包含）：源更细（sdb1）、目标=整盘节点 ⇒ 放行——现实中有分区表的整盘
+        // 挂不上文件系统（「目标=整盘节点」不成立）；此断言只钉「目标是源的后代才拒」的方向。
+        assert!(
+            check_on_source_at(root.path(), (8, 16), Some((8, 17)), "/x").is_ok(),
+            "方向单向：目标须是源的后代"
+        );
+    }
+
+    #[test]
+    fn sibling_and_other_disk_targets_pass() {
+        // 兄弟分区（同盘不同设备：sdb2 vs 源 sdb1）与另一块盘（sdc）都不是祖先 ⇒ 放行。
+        // 语义边界：契约拦的是「写回源设备这条链」，不是「写回同一块物理盘」。
+        let root = fake_sysfs();
+        assert!(
+            check_on_source_at(root.path(), (8, 18), Some((8, 17)), "/x").is_ok(),
+            "兄弟分区放行"
+        );
+        assert!(
+            check_on_source_at(root.path(), (9, 0), Some((8, 16)), "/x").is_ok(),
+            "另一块盘放行"
+        );
+    }
+
+    /// 真机 sysfs 冒烟（本机 `--image` 态即此形态：根 fs 在 /dev/sdb6）：
+    /// 读真 `/sys` 与真 `stat`，断言根 fs 设备既是自身后代、又是其整盘的（分区）后代。
+    /// 环境无 /sys 节点（容器/非 Linux）→ 自跳过并留痕。
+    /// 生产接线冒烟：`check_target` 走真 `/sys`。这是「`SYSFS_ROOT` 接线错/被改悬空假根」的牙——
+    /// 那种错会被 fail-open 静默吞掉，本测必红。目标用真临时目录，源取其所在整盘的节点号
+    /// （由 sysfs 父目录的 `dev` 文件推得）；无 sysfs 节点（容器/匿名设备/整盘无分区）→ 自跳过留痕。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn check_target_uses_real_sysfs_ancestor_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let dev = major_minor(rustix::fs::stat(dir.path()).unwrap().st_dev);
+        // 测试侧独立取真值：**字面 "/sys"**（不用 SYSFS_ROOT——否则接线错会被测试侧同源盲掉，
+        // 该错正是本测要咬的目标）。
+        let canon = match std::fs::canonicalize(
+            PathBuf::from("/sys").join(format!("dev/block/{}:{}", dev.0, dev.1)),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip: 临时目录设备 {dev:?} 无 sysfs 节点（{e}）");
+                return;
+            }
+        };
+        let disk = canon
+            .parent()
+            .and_then(|d| std::fs::read_to_string(d.join("dev")).ok())
+            .and_then(|s| {
+                let (maj, min) = s.trim().split_once(':')?;
+                Some((maj.parse().ok()?, min.parse().ok()?))
+            });
+        let Some(disk) = disk.filter(|d| *d != dev) else {
+            eprintln!("skip: {canon:?} 无整盘父节点（根 fs 直接在整盘上？）");
+            return;
+        };
+        assert!(
+            matches!(
+                check_target(dir.path(), 0, Some(disk)),
+                Err(ExportError::TargetOnSource(d)) if d == dir.path().display().to_string()
+            ),
+            "生产接线须走真 /sys 的盘级祖先：目标 {dev:?} 位于源整盘 {disk:?} 之下"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_sysfs_ancestor_smoke() {
+        let dev = major_minor(rustix::fs::stat("/").unwrap().st_dev);
+        let node = PathBuf::from("/sys").join(format!("dev/block/{}:{}", dev.0, dev.1));
+        let canon = match std::fs::canonicalize(&node) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "skip: {} 不可解析（{e}）——无真 sysfs 拓扑可核",
+                    node.display()
+                );
+                return;
+            }
+        };
+        assert_eq!(
+            is_descendant_at(Path::new(SYSFS_ROOT), dev, dev),
+            Some(true),
+            "设备是自身的后代：{canon:?}"
+        );
+        // 父目录的 `dev` 文件 = 整盘节点号（分区在 sysfs 里是整盘子目录）：真机核祖先链一跳
+        let parent_dev = canon.parent().and_then(|d| {
+            std::fs::read_to_string(d.join("dev")).ok().and_then(|s| {
+                let (maj, min) = s.trim().split_once(':')?;
+                Some((maj.parse().ok()?, min.parse().ok()?))
+            })
+        });
+        match parent_dev {
+            Some(p) => assert_eq!(
+                is_descendant_at(Path::new(SYSFS_ROOT), dev, p),
+                Some(true),
+                "根 fs 设备 {canon:?} 应为其整盘 {p:?} 的后代"
+            ),
+            None => eprintln!("skip: {canon:?} 无父 dev（根 fs 直接在整盘上？）——自后代已过"),
+        }
     }
 
     #[test]

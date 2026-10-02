@@ -103,7 +103,7 @@ v0 字段不变，**新增 `transport`**：
 | -32003 | 任务不存在（`Task not found: <taskId>`） |
 | -32004 | 任务状态不允许该操作（`Task not active: <taskId>`） |
 | -32005 | 空闲空间不可判定（`Cannot determine free space`；`mode:"deep"` 前置：exfat 位图 / FAT 表不可读——「无空闲」是合法空扫，不得与此混同） |
-| -32006 | 恢复目标落在源设备上（`Target is on the source device: <dir>`；`st_dev(目标) == st_rdev(源块设备)`，root 降权前判定；镜像源不适用） |
+| -32006 | 恢复目标落在源设备上（`Target is on the source device: <dir>`；`st_dev(目标) == st_rdev(源块设备)`，或目标所在文件系统设备位于源设备节点之下（盘级祖先，sysfs 走链；解析不到时退回前者 fail-open），root 降权前判定；镜像源不适用） |
 | -32007 | 目标不可写（`Target not writable: <dir>`；不存在/非目录/无权限） |
 | -32008 | 条目不存在（`Entry not found: <idx>`） |
 | -32009 | 条目过大（`Entry too large: <sizeBytes>`；`fs.read` 预览上限 64MiB，**导出不受此限**） |
@@ -141,7 +141,8 @@ v0 字段不变，**新增 `transport`**：
   条目不存在 → `-32008`；条目 `sizeBytes > 64MiB` → `-32009`（**导出不受此限**：导出内部 4MiB 片流式）。
 - `export.start`：`idxs` 去重后非空且 ≤100000（否则 `-32602`）；`targetDir` 必须为绝对路径；
   **目标三重校验**（在 daemon 侧做）：不存在/非目录/不可写 → `-32007`；目标与源为同一设备
-  （`st_dev(目标) == st_rdev(源块设备)`，镜像文件源不做此校验）→ `-32006`；
+  （`st_dev(目标) == st_rdev(源块设备)`，或目标所在文件系统设备位于源设备节点之下——盘级祖先
+  判定，封「源=整盘、目标=其分区」；镜像文件源不做此校验）→ `-32006`；
   余量 < `estimatedBytes` → `-32010`。`estimatedBytes = Σ sizeBytes` 为**上界**（降级件实际可能更短）。
 - `export.cancel`：运行中 → 终止 → `{"state": "canceled"}`；已终态 → 幂等原样返回其终态
   （`"canceled"`/`"completed"`）；未知 `exportId` → `-32602`（重试语义即「已完成/不存在」）。

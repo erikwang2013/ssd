@@ -195,7 +195,8 @@ impl RpcError {
         }
     }
 
-    /// -32006：恢复目标落在源设备上（`st_dev(目标) == st_rdev(源块设备)`，root 降权前判定）。
+    /// -32006：恢复目标落在源设备上（`st_dev(目标) == st_rdev(源块设备)`，或目标所在文件系统
+    /// 设备位于源设备节点之下——盘级祖先判定；root 降权前判定）。
     pub fn target_on_source(dir: &str) -> Self {
         Self {
             code: -32006,
