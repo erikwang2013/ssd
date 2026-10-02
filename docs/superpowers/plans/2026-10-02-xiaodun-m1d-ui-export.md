@@ -684,12 +684,16 @@ Scaffold(appBar: 设备名 + 返回)
 ### Task 6: 结果浏览页（虚拟化分页 / 过滤 / 多选 / 质量徽标）
 
 > **T4 移交铁律（spec-m1d-t4 观察 b）**：`ScanEntry.displayName`（空名→`carved_%06d.%ext`）**仅供展示**——它不做 sanitize、与 worker 落盘名可能不同（ext 注入等）。**本页与 T8 报告页一律以 `ExportReportItem.name` 为实际落盘名**；任何写路径（导出/打开文件/预览另存）不得消费 displayName。
+>
+> **T5 移交（unawaited 陷阱 + 错误文案）**：① broadcast 流订阅的 `await sub.cancel()` 在 flutter_test fake async 下**永不收敛**（Dart null-future）——订阅取消一律 `unawaited(...)`（dispose 中同理），本页/T8 都别 await 它；② 展示层错误文案：`RpcException` 只显示 `message`（契约文案），StateError→「核心服务已退出，请重启应用」、TimeoutException→「核心服务无响应」；③ T5 的桩 `ResultsPage({required int taskId})` 由本页整体替换 body（签名兼容）。
 
 **Files:**
 - Create: `ui/lib/features/results/{results_page.dart, results_controller.dart, entry_tile.dart}`
 - Create: `ui/test/results_page_test.dart`
 
 **ResultsController：** 分页状态机——`pageSize=200`，`loadMore()` 在滚动到 80% 时触发（`ScrollController`）；`total` 来自首页响应；`deletedOnly` 与 `quality` 过滤切换时**重置分页**（offset=0 清列表）；`selected: Set<int>`（idx）多选；服务端排序即 `idx` 序（无本地排序）。
+
+> **qual-m1d-t5 移交（实施前必读）**：① **契约 `scan.results` 只有 `{taskId, offset, limit, deletedOnly?}`——没有 quality 参数**（proto/v1/README:27）；`deletedOnly` 走服务端（重置分页重拉），**`quality` 只能对已加载页做客户端过滤**——必须写清 `loadMore() × 客户端 quality 过滤` 的组合语义（过滤只作用当前已加载集合；继续滚动加载更多，过滤集合增量扩大；`total` 显示语义写明是"已加载/过滤命中"而非全量），**禁止扩 v1.2 契约**（golden 冻结）。② 多选 `selected` 跨"过滤切换/重置分页"的存留语义要显式（建议：过滤切换即清选择）。③ O3 记录（M4/产品）：扫描中返回/切页不打断 daemon 任务（PopScope 二次确认归 M4）；`_confirmCancel` await 后无 mounted 复检（离页即作废意图，M4 裁定）。
 
 - [ ] **Step 1: 页面结构（规范级）**
 ```
@@ -741,13 +745,17 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 ### Task 8: 恢复页（目标选择 / 导出进度 / 报告）
 
 > **T4 移交**：报告页「打开目标文件夹」与任何精确定位落盘文件的动作，一律用 `ExportReportItem.name`（实际落盘名）而非 `displayName`（展示名，见 T6 铁律）；成功件不在 items 里（契约如此）——「打开文件夹」只按目录打开，不按名定位成功件（M5b 注记）。
+>
+> **T5 移交**：通知/进度订阅取消一律 `unawaited(...)`（flutter_test fake async 下 `await sub.cancel()` 不收敛——见 T6 注记）；错误文案映射同 T6（RpcException 只显示 message）。
 
 **Files:**
 - Modify: `ui/pubspec.yaml`（+`file_selector`（官方，desktop 支持））
 - Create: `ui/lib/features/recover/{recover_page.dart, recover_controller.dart, report_view.dart}`
 - Create: `ui/test/recover_page_test.dart`
 
-**RecoverController：** `selectTarget()` 用 `file_selector.getDirectoryPath()`；`start()` → `exportStart(taskId, idxs, dir)`；订阅 `export.progress/finished`（按 exportId 过滤）；状态机 `picking → exporting → done(report)|failed|canceled`。目标目录展示预估大小 = `estimatedBytes`；报告页：`succeeded/degraded/failed` 三计数 + 降级/失败清单（reason 文案）+「打开目标文件夹」按钮（`Process.start('xdg-open', [dir])`——桌面 Linux；其他平台 no-op + 文案）。
+**RecoverController：** `selectTarget()` 用 `file_selector.getDirectoryPath()`；
+
+> **qual-m1d-t5 移交（测试缝，实施前必读）**：`file_selector.getDirectoryPath()` 是平台插件，**widget 测试直接调会挂**——测试缝推荐 `FileSelectorPlatform.instance` 注入 fake（不改页面签名；`TestDefaultBinaryMessenger` 平台通道 mock 为备选）。`start()` → `exportStart(taskId, idxs, dir)`；订阅 `export.progress/finished`（按 exportId 过滤）；状态机 `picking → exporting → done(report)|failed|canceled`。目标目录展示预估大小 = `estimatedBytes`；报告页：`succeeded/degraded/failed` 三计数 + 降级/失败清单（reason 文案）+「打开目标文件夹」按钮（`Process.start('xdg-open', [dir])`——桌面 Linux；其他平台 no-op + 文案）。
 
 - [ ] **Step 1: 页面结构（规范级）**
 ```
@@ -832,6 +840,15 @@ Scaffold('恢复文件')
 - **qual 变异 10 条**：5 KILL；3 缺口补牙（broadcast 多监听/close onDone/Fake 分页 off-by-one——均实测有牙）；等价 1（null-id 行）;接受 1（startPrivileged argv 归真机清单）。**借文件热关 Fake 保真 P1/P2**（limit 1..=1000 校验文案逐字 + idx 升序）；P3/P4 记录。
 - **错误语义修正（qual 实测）**：close 后**新**调用是挂 10s `TimeoutException`（非 StateError）；`StateError(-15)` 仅在途调用——T5 展示层映射已入计划。
 - helper 重复不合并（YAGNI，第 4 个消费文件出现时再提取）；`"id":null` 行入通知流 → 分发器容忍 `method==null`（已入 T5）。
+
+### T5（扫描页）—— impl-m1d-t5。提交沿革：`c654047`（主）→ `1a1b219`（qual 修复）。DONE → spec **PASS** → qual ISSUES → 修复有牙（T5 关闭；49+1 跳过 / 带 daemon 50/0）
+
+- **★ unawaited 陷阱（实施者抓，spec 机制级定位）**：broadcast 订阅 `await sub.cancel()` 在 flutter_test fake async 下永不收敛（`Future._nullFuture`=root-zone 已完成 future，续体在 fake 时区外执行）→ **非 broadcast 专属**；EACCES 重试链曾当场卡死；修 `unawaited(...)`（取消同步生效，安全）。**已移交 T6/T8**。附注：`ipc_transport.close()` 内 `await _sub.cancel()` 是 M1b 既有，真实时区无碍。
+- **接口 `CoreClient.restartPrivileged()`**（注入缝设计，替代三层参数穿透）；spec 以**桩 pkexec 亲测 argv 逐项保持**（`[daemonPath, --image, x.img, --verbose]`）+ 旧进程先死透。
+- **spec 13 场景状态机探针**：通知全丢仅轮询收敛、daemon 死→failed 文案、percent 语义、终态先到先得、8 种畸形通知注入零影响。
+- **qual 变异 12 条 + 2 补**：5 KILL；**O2 实证为真竞态**（在途 scanStatus 过期响应把暂停态拉回 scanning——探针 H 在 HEAD 红）→ 一行守卫修复（`id/state` 双查）；`describeScanError` 的 RpcException 前缀（我那"只显示 message"的裁定此前只在注记里）→ 落码 + 断言；7 有牙（含 D 的 `fresh!` 行为杀修正与"独立删除 dismissElevation=等价"的如实转录）。
+- **裁定**：O1 保持单次失败即终态（容错等真机抖动证据，M5）；O3 记录（离页不打断 daemon / 连点并发窗 / `_confirmCancel` 无 mounted 复检——M4/产品）。
+- **T6/T8 移交（已入计划）**：quality 过滤**只能客户端对已加载页**（契约无 quality 参数，禁扩冻结契约）；`file_selector` 测试缝=`FileSelectorPlatform.instance` fake；取消态无「查看结果」入口=主动收窄（契约可查属实）。
 
 ---
 
