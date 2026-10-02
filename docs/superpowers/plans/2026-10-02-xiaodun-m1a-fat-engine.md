@@ -1532,6 +1532,115 @@ mod tests {
         let slots = vec![mk("0.bin"), mk("my_ph")]; // 物理序：先尾段 "0.bin" 后头段 "my_ph"
         assert_eq!(assemble_lfn(&slots), "my_ph0.bin");
     }
+
+    /// LFN 槽第 k 个 UTF-16 单元在 32B 槽内的字节偏移（三窗口：1←0..4、14←5..10、28←11..12）。
+    fn lfn_char_offset(k: usize) -> usize {
+        match k {
+            0..=4 => 1 + k * 2,
+            5..=10 => 14 + (k - 5) * 2,
+            _ => 28 + (k - 11) * 2,
+        }
+    }
+
+    #[test]
+    fn lowercase_flags_come_from_ntres() {
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(b"README  TXT");
+        raw[11] = 0x20; // attr=archive（bit3/4 不参与小写）
+        raw[12] = 0x18; // NTRes：基名+扩展名小写
+        let Slot::Sfn(s) = parse_slot(&raw) else { panic!() };
+        assert_eq!(s.nt_res, 0x18);
+        assert_eq!(assemble_sfn_name(&s.name83, s.nt_res), "readme.txt");
+        let mut vol = [0u8; 32];
+        vol[..11].copy_from_slice(b"MYDISK     ");
+        vol[11] = 0x08; // 卷标
+        let Slot::Sfn(s) = parse_slot(&vol) else { panic!() };
+        assert_eq!(assemble_sfn_name(&s.name83, s.nt_res), "MYDISK");
+    }
+
+    #[test]
+    fn lfn_slots_parse_from_raw_bytes() {
+        let mut raw = [0u8; 32];
+        raw[0] = 0x41; // seq=1 | 0x40（唯一段）
+        raw[11] = 0x0F;
+        let text: Vec<u16> = "photo_2024.jp".encode_utf16().collect();
+        assert_eq!(text.len(), 13);
+        for (k, &u) in text.iter().enumerate() {
+            let i = lfn_char_offset(k);
+            raw[i..i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let Slot::Lfn(l) = parse_slot(&raw) else { panic!() };
+        assert_eq!(String::from_utf16_lossy(&l.chars), "photo_2024.jp");
+        assert!(!l.deleted);
+    }
+
+    #[test]
+    fn mixed_run_falls_back_to_sfn_name() {
+        let mut lfn = [0u8; 32];
+        lfn[0] = 0xE5; // 删除态孤儿
+        lfn[11] = 0x0F;
+        for (k, u) in "to.jpg".encode_utf16().enumerate() {
+            let i = lfn_char_offset(k);
+            lfn[i..i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let mut sfn = [0u8; 32];
+        sfn[..11].copy_from_slice(b"B       TXT");
+        sfn[11] = 0x20;
+        let mut data = Vec::new();
+        data.extend_from_slice(&lfn);
+        data.extend_from_slice(&sfn);
+        let parsed = parse_directory_bytes(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "B.TXT");
+        assert!(!parsed[0].deleted);
+        assert!(!parsed[0].has_lfn);
+    }
+
+    #[test]
+    fn lfn_run_through_parse_directory_bytes() {
+        // 存活 LFN（seq=1|0x40, "photo.jpg"）+ 存活 SFN → 名字取 LFN
+        let mut lfn = [0u8; 32];
+        lfn[0] = 0x41;
+        lfn[11] = 0x0F;
+        for (k, u) in "photo.jpg".encode_utf16().enumerate() {
+            let i = lfn_char_offset(k);
+            lfn[i..i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let mut sfn = [0u8; 32];
+        sfn[..11].copy_from_slice(b"PHOTO   JPG");
+        sfn[11] = 0x20;
+        let mut data = Vec::new();
+        data.extend_from_slice(&lfn);
+        data.extend_from_slice(&sfn);
+        let parsed = parse_directory_bytes(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "photo.jpg");
+        assert!(parsed[0].has_lfn);
+
+        // 删除孤儿：两删除 LFN 槽（物理尾→头）+ 删除 SFN → 逆序重建
+        let mk_deleted = |text: &str| {
+            let mut s = [0u8; 32];
+            s[0] = 0xE5;
+            s[11] = 0x0F;
+            for (k, u) in text.encode_utf16().enumerate() {
+                let i = lfn_char_offset(k);
+                s[i..i + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            s
+        };
+        let mut dsfn = [0u8; 32];
+        dsfn[..11].copy_from_slice(b"GONE    JPG");
+        dsfn[11] = 0x20;
+        dsfn[0] = 0xE5;
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(&mk_deleted("gone_0"));
+        data2.extend_from_slice(&mk_deleted("old_"));
+        data2.extend_from_slice(&dsfn);
+        let parsed2 = parse_directory_bytes(&data2);
+        assert_eq!(parsed2.len(), 1);
+        assert_eq!(parsed2[0].name, "old_gone_0");
+        assert!(parsed2[0].deleted);
+    }
 }
 ```
 
@@ -1552,6 +1661,7 @@ pub const ATTR_DIRECTORY: u8 = 0x10;
 pub struct Sfn {
     pub name83: [u8; 11],
     pub attr: u8,
+    pub nt_res: u8, // raw[12]：NTRes，bit3=基名小写 / bit4=扩展名小写（attr 的 bit3/4 是卷标/目录属性，勿混用）
     pub first_cluster: u32,
     pub size: u32,
     pub deleted: bool,
@@ -1598,6 +1708,7 @@ pub fn parse_slot(raw: &[u8; 32]) -> Slot {
     Slot::Sfn(Sfn {
         name83,
         attr: raw[11],
+        nt_res: raw[12],
         first_cluster: ((u16::from_le_bytes([raw[20], raw[21]]) as u32) << 16)
             | u16::from_le_bytes([raw[26], raw[27]]) as u32,
         size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
@@ -1605,7 +1716,7 @@ pub fn parse_slot(raw: &[u8; 32]) -> Slot {
     })
 }
 
-/// 组装 8.3 名。`lcase` 为属性字节（bit3=基名小写, bit4=扩展名小写）；删除项首字符不可知 → '?'。
+/// 组装 8.3 名。`lcase` 为 NTRes 字节（raw[12]，bit3=基名小写, bit4=扩展名小写）；删除项首字符不可知 → '?'。
 /// 非 ASCII 字节按 Latin-1（`b as char`）呈现——保留磁盘原始 OEM 字节，0xE5 quirk 无损；
 /// 不依赖 UTF-8（0xE5 单字节经 from_utf8_lossy 会变 U+FFFD）。
 pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
@@ -1639,6 +1750,7 @@ pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
 }
 
 /// 组装 LFN。存活：按 seq 升序（0x40 标志在最后一段）。删除：物理序为尾→头，逆序拼接。
+/// 不做 seq 连续性/0x40 末标/checksum 校验——畸形 run 按低 5 位排序尽力拼接（错名而非 panic）。
 pub fn assemble_lfn(slots: &[LfnSlot]) -> String {
     let mut parts: Vec<String> = Vec::new();
     if slots.iter().all(|s| s.deleted) {
@@ -1683,13 +1795,18 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
             Slot::Free => {}
             Slot::Sfn(s) => {
                 // 连续性校验：LFN run 与 SFN 同为存活或同为删除才配对（简化：仅要求非空）
-                let (name, has_lfn) = if lfn_run.is_empty() {
-                    (assemble_sfn_name(&s.name83, s.attr), false)
+                // 删除态一致才配对：存活文件不得冠删除残留的 LFN 名
+                let pair = !lfn_run.is_empty() && lfn_run.iter().all(|l| l.deleted) == s.deleted;
+                let (name, has_lfn) = if !pair {
+                    (assemble_sfn_name(&s.name83, s.nt_res), false)
                 } else {
                     let joined = assemble_lfn(&lfn_run);
-                    let fallback = assemble_sfn_name(&s.name83, s.attr);
-                    let name = if joined.trim().is_empty() { fallback } else { joined };
-                    (name, true)
+                    let fallback = assemble_sfn_name(&s.name83, s.nt_res);
+                    if joined.trim().is_empty() {
+                        (fallback, false) // 回退时 has_lfn 如实为 false
+                    } else {
+                        (joined, true)
+                    }
                 };
                 lfn_run.clear();
                 out.push(ParsedEntry {
@@ -1711,7 +1828,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 27 passed（21 + 6）。
+Expected: 31 passed（21 + 10）。
 
 - [ ] **Step 5: Commit**
 
@@ -1976,7 +2093,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 32 passed（27 + 5）。
+Expected: 36 passed（31 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -2096,7 +2213,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 36 passed（32 + 4）。
+Expected: 40 passed（36 + 4）。
 
 - [ ] **Step 5: Commit**
 
@@ -2158,7 +2275,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 37 passed（36 + 1，含新 e2e）。
+Expected: 41 passed（40 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
