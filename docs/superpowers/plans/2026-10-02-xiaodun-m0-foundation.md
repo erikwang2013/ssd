@@ -1760,6 +1760,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -1775,8 +1779,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
       - run: bash scripts/e2e.sh
         if: runner.os == 'Linux'
 
@@ -1791,8 +1795,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: subosito/flutter-action@v2
         with:
-          channel: stable
-      - run: cargo build -p xd-daemon
+          flutter-version: 3.47.5
+      - run: cargo build -p xd-daemon --locked
+      - run: dart format --output=none --set-exit-if-changed lib test
       - run: flutter analyze
       - run: flutter test
         env:
