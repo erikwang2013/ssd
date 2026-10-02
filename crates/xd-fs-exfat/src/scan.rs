@@ -131,6 +131,7 @@ fn scan_parsed(
             .unwrap_or_default();
         // live 目录不看 checksum_ok：子项枚举成功已独立验证流扩展；时间戳/名字损坏
         // 不影响可恢复性（qual-t5 M3 裁定）
+        // live 文件不查链拓扑（质量=entry 层 checksum）；链自环由 read 层截断兜底（qual-t4）
         let quality = if e.attr_dir {
             RecoverQuality::Complete
         } else if e.deleted {
@@ -860,6 +861,34 @@ mod tests {
             e.quality,
             RecoverQuality::MaybeDamaged,
             "链越过可达簇数=链在说谎"
+        );
+    }
+
+    #[test]
+    fn deleted_nonrevisit_chain_beyond_reachable_degrades() {
+        // qual-t4 G1：链 253→6→7 无回访但越过可达（253 是末簇，reachable=1 < need=3）
+        // ——只有可达界卫能拦（回访检测不触发）→ MaybeDamaged
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[253], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+        patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3
+        patched[24 * 512 + 253 * 4..24 * 512 + 253 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // FAT[253]=6
+        patched[24 * 512 + 6 * 4..24 * 512 + 6 * 4 + 4].copy_from_slice(&7u32.to_le_bytes()); // FAT[6]=7
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "非回访链越过可达 → 界卫降级"
         );
     }
 

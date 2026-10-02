@@ -5,6 +5,8 @@
 //! 删除项的分配权威是**位图**（FAT 已 stale）。**M1b (a) 裁定**：deleted+NoFatChain=0 → 只沿
 //! stale 链走到首个被占用/断裂簇（诚实短前缀），绝不连续猜读；deleted+NoFatChain=1 → 连续为
 //! 规范保证。碎裂删除场景的正解是 M1c 雕刻。
+//! 链前缀回访（环/回折）**刻意不对称**：deleted 回访即空（stale 链整体是不可信证据，回访=自证伪）；
+//! live 截断到首个回访点（FAT 是权威分配记录，逐跳可信至首次矛盾）。
 
 use crate::ExfatError;
 use crate::bitmap::Bitmap;
@@ -109,6 +111,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
     // (a) 裁定（M1b）：删除项 + 非连续 → **只沿 stale 链**（删除留下的指纹；首个被占用/坏读簇
     // 即止 → 诚实短前缀），绝不回退连续猜读——旧式"链被证伪后退连续"会交付错位数据而无从发现。
     // contiguous=true 的删除项是 NoFatChain 规范保证，不走此分支。
+    // 前缀回访 → 空交付（stale 链整体不可信、回访=自证伪→整链弃；与 live 的截断刻意不对称）。
     if entry.deleted && !entry.contiguous {
         let max_cluster = boot.cluster_count as u64 + 1;
         let fc = entry.first_cluster as u64;
@@ -142,8 +145,12 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
         // 他人数据且无从发现（M1a qual-t7 I1 对等）
         let chain = fat.chain(entry.first_cluster).unwrap_or_default();
         // 前缀回访（环/回折）→ 只交付首个回访点之前的簇（live 的"诚实短前缀"语义，与链短同规则；
-        // 与 deleted 车道的"回访即空"刻意不对称：live 首簇由 dirent 实指、可先行；qual-t4 追加）
-        let end = (0..chain.len())
+        // 与 deleted 车道的"回访即空"刻意不对称：deleted 的 stale 链整体是不可信证据、回访=自证伪→
+        // 整链弃；live 的 FAT 是权威分配记录，逐跳可信至首次矛盾（回访）即止）
+        // ponytail: O(scan_end²) 比较；scan_end ≤ need（原全链扫描在 1M 簇链上 ≈5e11 次比较——
+        // qual-t4 性能项）。need 若未来巨化，改 seen 位图 O(n)。
+        let scan_end = (need as usize).min(chain.len());
+        let end = (0..scan_end)
             .find(|&i| chain[..i].contains(&chain[i]))
             .unwrap_or(chain.len());
         let n = (need as usize).min(end);
@@ -302,6 +309,33 @@ mod tests {
     }
 
     #[test]
+    fn deleted_contiguous_middle_occupied_truncates_prefix() {
+        // qual-t4 G2：连续删除项中段簇被复用（位图置位）→ 逐簇门控截断在 4096B、分级降级
+        // （连续车道的位图把关，与链式车道的 stale 链把关分属两路）
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 239) as u8).collect();
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "G.BIN", &data)
+            .delete("/", "G.BIN")
+            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 100], &[7], true)
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "G.BIN")
+            .unwrap();
+        assert!(e.deleted);
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "中段被占 → 位图门控降级"
+        );
+        let bytes = read_file(&dev, &e).unwrap();
+        assert_eq!(bytes.len(), 4096, "中段被占 → 逐簇门控截断");
+        assert_eq!(bytes, data[..4096]);
+    }
+
+    #[test]
     fn deleted_chained_uses_stale_chain_when_bitmap_free() {
         let data: Vec<u8> = (0..9000u32).map(|i| (i % 241) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
@@ -447,6 +481,33 @@ mod tests {
     }
 
     #[test]
+    fn deleted_nonrevisit_chain_beyond_reachable_delivers_nothing() {
+        // qual-t4 G1：链 253→6→7 无回访但越过可达（253 是末簇，reachable=1 < need=3）
+        // ——只有可达界卫能拦（回访检测不触发）→ 空交付
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[253], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+        patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3
+        patched[24 * 512 + 253 * 4..24 * 512 + 253 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // FAT[253]=6
+        patched[24 * 512 + 6 * 4..24 * 512 + 6 * 4 + 4].copy_from_slice(&7u32.to_le_bytes()); // FAT[6]=7
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert!(
+            read_file(&dev, &e).unwrap().is_empty(),
+            "非回访链越过可达 → 界卫空交付"
+        );
+    }
+
+    #[test]
     fn deleted_loop_prefix_within_reachable_delivers_nothing() {
         // 同 scan 侧构造：无检测时交付 8192B（同一 4096B 簇读两次）——前缀回访必须空交付
         let image = xd_fixtures::ExfatImageBuilder::new()
@@ -554,6 +615,31 @@ mod tests {
         let bytes = read_file(&dev, &e).unwrap();
         assert_eq!(bytes.len(), 4096, "首个回访点之前恰一簇");
         assert_eq!(bytes, data[..4096]);
+    }
+
+    #[test]
+    fn live_polluted_lengths_stay_chain_bounded() {
+        // qual-t4 G3：live 链式单簇 [253]、VDL/DL 均污染成 12288（need=3）→ 交付只来自链上实簇：
+        // 恰 4096B（== 真数据），绝不按 DL 放大或连续猜读（链界住）。live 无 refix → 质量断言略。
+        // （若只污染 DL，VDL=4096 会先行截断，"恰 4096"就丧失判别力——故两条长度一起污染）
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "L.BIN", &data, &[253], false)
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL 污染
+        patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL 污染
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "L.BIN")
+            .unwrap();
+        assert_eq!(e.size_bytes, 12288);
+        let bytes = read_file(&dev, &e).unwrap();
+        assert_eq!(bytes.len(), 4096, "被链界住（单簇），非被 DL 放大");
+        assert_eq!(bytes, data);
     }
 
     #[test]
