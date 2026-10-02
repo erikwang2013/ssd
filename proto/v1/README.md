@@ -3,7 +3,9 @@
 v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`scan.progress`/`scan.finished`
 通知、`ScanEntry`/`ScanProgress` 结果类型、`-32001`/`-32002`/`-32003`/`-32004`/`-32603`
 错误码，以及 `DeviceInfo.transport` 可选字段。**v0 封存**：`proto/v0/**` 不再改动，
-仅作历史快照（v0 golden 里 `protocol` 仍为 0）。**破坏性变更才递增协议号；本版为新增。**
+仅作历史快照（v0 golden 里 `protocol` 仍为 0）；唯一例外：
+`error_method_not_found.response.json` 的示例方法名随 `scan.start` 转正修正（M1b T5），其余不动。
+**破坏性变更才递增协议号；本版为新增。**
 
 - 传输（stdio、每行一条 JSON）、信封（JSON-RPC 2.0）、`id` 原样回显、空行处理、
   `<VERSION>` 占位约定、golden 规则（`examples/*.json` 为唯一事实源，Rust/Dart 双侧
@@ -29,11 +31,12 @@ v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`s
 - `scan.start`：`mode` 缺省 `"quick"`（M1b 仅 quick）。设备无权限（EACCES）→ `-32001`；
   未知或不支持的文件系统 → `-32002`。
 - `scan.status`：`readBytes` 为已扫描字节、`foundCount` 为已发现条目数、`elapsedMs`
-  为任务开始至此刻（暂停期间不计入）。
+  为任务开始至此刻的墙钟（含暂停时间）；净扫描时长 M1c 再议。
 - `scan.results`：`offset`/`limit` 分页；`deletedOnly` 缺省 false，为 true 时只看删除项；
   `total` 为**应用 `deletedOnly` 过滤后**的总数（分页用）。
 - `scan.pause`/`scan.resume`/`scan.cancel`：仅对活动任务有效——任务不存在 → `-32003`；
-  状态不允许该操作（如对已暂停任务再 pause、对终态任务操作）→ `-32004`；取消系持久语义，
+  状态不允许该操作（如对 completed 任务 pause）→ `-32004`；对已暂停任务再 pause → 幂等 Ok；
+  取消系持久语义，
   终态 `canceled` 后结果仍可查。
 
 ## 状态

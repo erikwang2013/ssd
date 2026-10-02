@@ -1,5 +1,6 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
-//! （store）。daemon 只做传输与线程托管（设计 §4.4）。
+//! 扫描任务编排：状态机（暂停/取消）、worker 线程、崩溃隔离（catch_unwind）、进度回调与
+//! 流式落盘（store）。daemon 只做传输与线程托管（设计 §4.4）。
 //! 取消用 `panic_any(ScanCanceled)` 在条目边界 unwind——worker 的 catch_unwind 按类型区分
 //! （取消 ≠ 故障）；daemon 侧 panic hook 对该标记静默。
 //! worker 内部（计数设备 / 进度节流 / 引擎条目适配 / 线程体）见 `crate::scan_worker`。
@@ -114,6 +115,9 @@ pub enum Resume {
 pub type NotifyFn = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// 任务控制位（worker 在条目边界轮询；见 `crate::scan_worker::Progress::checkpoint`）。
+/// 窄窗注记：pause/cancel/resume 的「worker 在场」分支在 worker 置终局 ↔ `running=false`
+/// 窄窗内可能瞬时返回乐观值；store 地面真相一致（`set_state_if_active` 护栏），刻意不改
+/// （不可确定性测试）。
 #[derive(Default)]
 pub(crate) struct Ctrl {
     pub(crate) paused: AtomicBool,
@@ -223,9 +227,7 @@ impl ScanManager {
     }
 
     /// 恢复：worker 在场 → 解除驻停；不在场（daemon 重启）→ NeedsDevice 交由 handlers 重开设备。
-    /// 窄窗注记（qual-t5 参考）：cancel 置态后、worker unwind 前，resume 可能瞬时返回
-    /// InPlace/scanning；store 已被 `set_state_if_active` 护栏固定在 canceled——地面真相一致，
-    /// 窗口极小，刻意不改（不可确定性测试）。
+    /// 窄窗乐观值见 `Ctrl` 注（cancel 置态后、worker unwind 前可能瞬时返回 InPlace/scanning）。
     pub fn resume(&self, id: u64) -> Result<Resume, ScanError> {
         if let Some((ctrl, running, _)) = self.active_of(id)
             && running.load(Ordering::SeqCst)
@@ -245,7 +247,14 @@ impl ScanManager {
     }
 
     /// 重启后重跑（quick scan 重跑成本低；真断点续跑归 M1c）：清旧结果 → 重新入册开跑。
+    /// 仅 handlers 的 `Resume::NeedsDevice` 路径调用；守卫防公开 API 误用（worker 在场所的
+    /// paused 应走 resume，否则同 id 双 worker、旧线程被遗弃）。
     pub fn restart(&self, id: u64, device: Arc<dyn BlockDevice>) -> Result<(), ScanError> {
+        if let Some((_, running, _)) = self.active_of(id)
+            && running.load(Ordering::SeqCst)
+        {
+            return Err(ScanError::TaskNotActive(id));
+        }
         if self.status(id)?.state != ScanState::Paused {
             return Err(ScanError::TaskNotActive(id));
         }
@@ -480,6 +489,26 @@ mod tests {
             3,
             "清后重跑结果完整"
         );
+    }
+
+    #[test]
+    fn restart_rejects_in_place_worker() {
+        // 防呆：worker 在场且 running 的 paused（该走 resume）必须拒绝，否则同 id 双 worker。
+        let m = mgr();
+        let (_f, dev) = exfat_fixture();
+        let slow = crate::testutil::SlowDev::wrap(dev, Duration::from_millis(30));
+        let s = m.start(slow).unwrap();
+        m.pause(s.task_id).unwrap();
+        wait_for_state(&m, s.task_id, ScanState::Paused, Duration::from_secs(5));
+        let (_f2, dev2) = exfat_fixture();
+        assert!(matches!(
+            m.restart(s.task_id, dev2),
+            Err(ScanError::TaskNotActive(_))
+        ));
+        // 拒绝必须无副作用：原 worker 仍可 resume 走完
+        m.resume(s.task_id).unwrap();
+        wait_for_state(&m, s.task_id, ScanState::Completed, Duration::from_secs(20));
+        assert_eq!(m.results(s.task_id, 0, 10, false).unwrap().0, 3);
     }
 
     #[test]
