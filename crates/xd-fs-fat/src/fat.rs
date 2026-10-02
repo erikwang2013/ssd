@@ -17,6 +17,7 @@ impl<'d> Fat<'d> {
     }
 
     /// 读取 cluster 的表项原值（已按类型掩码）。
+    /// 短读（EOF）返回错误而非静默 0。
     pub fn entry(&self, cluster: u32) -> Result<u32, FatError> {
         match self.bpb.fat_type {
             FatType::Fat32 => {
@@ -41,7 +42,8 @@ impl<'d> Fat<'d> {
             }
             FatType::Fat12 => {
                 let off = self.bpb.fat_start_sector as u64 * self.bpb.bytes_per_sector as u64
-                    + (cluster + cluster / 2) as u64;
+                    + cluster as u64
+                    + cluster as u64 / 2;
                 let mut b = [0u8; 2];
                 let n = self.dev.read_at(off, &mut b)?;
                 if n < 2 {
@@ -81,6 +83,7 @@ impl<'d> Fat<'d> {
     pub fn chain(&self, start: u32) -> Result<Vec<u32>, FatError> {
         let mut out = vec![start];
         let mut cur = start;
+        // M2：越界守卫 count+2 有一格宽（合法簇上界为 count+1）；面对真实损坏盘时收紧或显式记录破损链。
         let limit = self.bpb.data_cluster_count() + 2;
         while out.len() as u32 <= limit {
             let v = self.entry(cur)?;
@@ -146,7 +149,18 @@ mod tests {
         let (_f, dev) = dev_for(&image);
         let bpb = bpb::parse(&dev).unwrap();
         let fat = Fat::new(&dev, &bpb);
-        assert_eq!(fat.chain(2).unwrap(), vec![2, 3]);
+        assert_eq!(fat.chain(2).unwrap(), vec![2, 3]); // 600B → 2 簇
+    }
+
+    #[test]
+    fn wild_cluster_on_fat12_does_not_overflow() {
+        // 0xAAAA_AAAB 的 12 位偏移加法曾经 u32 溢出（debug panic）；u64 后为超设备偏移 → Err
+        let image = xd_fixtures::FatImageBuilder::fat12().build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let err = fat.entry(0xAAAA_AAAB).unwrap_err();
+        assert!(matches!(err, FatError::InvalidBpb(m) if m.contains("beyond device")));
     }
 
     #[test]
