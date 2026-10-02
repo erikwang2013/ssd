@@ -404,10 +404,18 @@ mod tests {
             .build();
         let root = root_of(&img);
         let set: Vec<u8> = root[SET_OFF..SET_OFF + 3 * 32].to_vec();
-        // 对照组：偏移 0 处放同一项集 → 可解析（恰在簇尾结束的集亦被接受——spec 探针）
+        // 对照组：偏移 0 处放同一项集 → 可解析
         let mut ok = vec![0u8; 2 * CB];
         ok[..96].copy_from_slice(&set);
         assert_eq!(parse_directory_bytes(&ok, CB).entries.len(), 1);
+        // 边界对照：项集恰好结束于簇尾（end % cb == 0）——必须接受（(end-1) 语义的判别臂）
+        let mut edge = vec![0x01u8; 2 * CB];
+        edge[CB - 96..CB].copy_from_slice(&set);
+        assert_eq!(
+            parse_directory_bytes(&edge, CB).entries.len(),
+            1,
+            "恰在簇尾结束必须接受"
+        );
         // 实验组：0x01 填充 + 槽对齐偏移（4032）——扫描须真正抵达项集，96 字节集必跨界
         let mut bad = vec![0x01u8; 2 * CB];
         let at = CB - 64;
