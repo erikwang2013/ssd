@@ -2678,6 +2678,14 @@ bash scripts/e2e.sh
 - **测试路径改名**：9 条 fat read 测试 `scan::tests::*` → `read::tests::*`（实现真迁移，1:1）——全仓 grep 文档/CI/README 零外部引用 ✓。
 - 四份新文件（fat read.rs/scan_tests.rs、exfat scan_tests/read_tests、linux/enumerate.rs）真水印头 cmp 通过；`apply-copyright.sh` 幂等 stamped 0。
 
+### T8（e2e 集成 + 环回设备）—— impl-m1b-t8。提交沿革：`efb9803`（主：scan_ipc.rs 8 测 + e2e-loop scan 块）→ `b7af460`（e2e-loop 步骤 2 补 --db）→ `28332e6`（EXIT trap 兜底）。DONE → spec **FAIL（1 阻断）** → 修复 → 条件 PASS（T8 关闭，291/0）
+
+- **8 枚测试全员落地**（计划 3 + 增补 2/3/4/5/7；增补 1 由统一 spawn 底盘保证）：全链分页/过滤/重启持久（含 **idx 集合纵深防御**）、image 拒绝、pause 二态、**cancel 严格 canceled + stderr 无 panicked**、--db 降级存活、**SIGKILL 中断→failed + paused 保留**、EACCES 端到端 -32001、XDG 优先。
+- **慢扫镜像**：FAT16 根区 511 条 0xE5 删除项（513 条目）；spec 量化：ext4 ≈3.9-4.0s vs tmpfs ≈56-61ms；**cancel 余量 ≈55ms（测试实际只耗 2-10ms）**、tmpfs 下严格 cancel 20/20 + 全套件 10/10——**不 flake，维持严格断言**（二态/加条目/换盘三方案均不值）。sigkill 守卫诊断性非承重（晚杀必红反证）。EACCES 测本机 uid=1000 真跑（未 skip）。
+- **spec 阻断项（已修）**：e2e-loop EXIT trap 对 root 属主 `$tmpdb` 以用户身份 `rm` EPERM → `set -e` 下**断言全过仍 exit 1**（docker 复现链条；CI 会红、挡 T9）→ `28332e6`：`sudo rm … || true` + 其余清理同款兜底；docker 前后对照 EXIT 1→0 实证。**同一脚本第二处污染（步骤 2 无 --db）由实施者自抓并修（`b7af460`）**——现两个 spawn 点均带 --db。
+- **裁定**：不采纳"先普通 rm 再 sudo"叠层（`sudo -n true` 门在先，无 sudo 时 trap 未设置——现形态对所有可达路径正确，记录备查）。
+- **T9 移交**：真机手测清单已定位（`docs/security/linux-privilege-model.md` §5，:81-92）——T9 在末条后追加「真机扫描/取消/进度条」一条。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
