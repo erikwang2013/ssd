@@ -810,6 +810,15 @@ Scaffold('恢复文件')
 - **裁定/移交**：(a) read_back 两遍 TOCTOU 可接受（源盘只读+确定性重读）；(b) `complete` 与交付长解耦（零消费者，doc 已注）；(c) **雕刻件"完整/截断"信号不落库**（quality 恒 "carved"）——UI 保守文案（"仅雕刻·可能不完整"）已覆盖，持久化列列为 **v1.3 契约候选**。(d) 性能快速路径的 ponytail 建议不成立（坏读/零读/短读三停点都可在窗口前发生——已改注"升级须以差分网格为裁判"）。
 - 过程：实施者误用 `git checkout` 清掉未提交文档改动 → 自查重写并复核（终提交纯文档差异）；"只追加不 amend"本轮遵守。
 
+### T3（恢复导出：降权子进程）—— impl-m1d-t3。提交沿革：`e90a79b`（父侧）→ `bc4a8e6`（worker）→ `4d3e40d`（路由+集成）→ `b041617`（盘级祖先）→ `6725c2d`（qual 八项修复）→ `55924e4`（测试底盘竞序）→ `9d4b5ea`（scan_ipc 同法收敛）。DONE → spec **PASS** → qual **ISSUES** → 修复有牙（T3 关闭，444/0）
+
+- **★ 安全：#2 提权面封堵（实施者抓，计划断言在库层不成立）**：计划"worker 设备 id 来自自家 store、无越权面"对 RPC 层成立、**对库层不成立**（库文件属主即可被改写，伪造 `image:/etc/shadow` → 提权 worker 沦为任意 root 可读文件读取器）→ worker 的 `image:` 分支复用 `--image` 同闸（O_NOFOLLOW + 属主==PKEXEC_UID）；非 root 不加闸（语义正确）。**★ 盲区 #7（lead 裁定本轮修）**：整盘 `/dev/sdb`(8,16) vs 分区 `sdb1`(8,17) rdev 不等 → 同盘判定升 **盘级祖先**（sysfs 走链 + 注入根测试 + 真 /sys 冒烟）；fail-open（解析失败退回 rdev 相等 + stderr）经裁定；mountinfo 不解析有内核事实等价论证（采纳）。
+- **spec 独立核验**：端到端导出逐字节（含删除件/雕刻件）；命名注入 `../evil` 等落盘安全；worker 协议故障矩阵（空数组/坏 JSON/坏目标→fatal exit 2；EPIPE→exit 0；SIGTERM→无 finished、已写保留）；伪造库行（`unix:/etc/shadow` 等）非 root 全拒。
+- **qual 变异 12 条 + 4 测试缺口修复**：cancel 测试**两态恒真**（删 kill 也全绿）→ 补 `succ+deg<total` 真断言；MAX_PREVIEW **自指盲区** → 绝对锚 + 字面量；failed 件 E2E（cleanup+reason+无残骸）；EPIPE 转正。**实现级三修**：cancel 持 child 锁会阻塞全 daemon RPC（worker D 态）→ `Job.pid` 直发 SIGTERM；**雕刻导出 ∝size² 读放大**（峰值≈offset+4MiB）→ 单次全量回读（≤64MiB 上限）+内存切片（预览路径留 ponytail 注归 M4/M2）；`unique_name` O(n²)→name→counter map；**ext 未净化可在成功路径越出目标目录**（伪造行）→ ext 过 sanitize + 注入测试。
+- **★ 测试底盘竞序（teeth 复验抓出）**：`scan.start`/`export.start` 先起后台线程再回响应 → `finished` 通知可抢在响应前（150 次插桩 6 次）；旧读法丢弃通知→永等。**`Wire` 寄存读口**（两序容忍、通知寄存不丢）收敛 export_ipc + scan_ipc 全量；确定性靶 + 变异版 6× 负载 2 FAIL vs 修复版 60/60（真抢跑负载诱发约 3%/跑，集中 cancel 响应侧）。
+- **记录不修**：M6（items>1000 截断无构造）、M5a（--export-id 错值纯诊断）、I1 µs 残窗（终态×计数同锁发布归 M4）、stale-pid（M4 pidfd）、`{stem}_N` 规则已补 README v1.2。
+- **未验证（需真机 root/pkexec）**：降权链与 root-mode `image:` 门；-32006 真环回断言归 T9/scripts。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
