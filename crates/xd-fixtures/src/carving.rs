@@ -21,7 +21,8 @@ pub fn crc32(data: &[u8]) -> u32 {
 }
 
 /// PNG chunk：长度（大端，不含自身）+ 类型 + 数据 + CRC（对 类型+数据 计算）。
-fn chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
+/// （pub 供 xd-carving 的 png 测试构造非常规块：非空 IEND/超限长度字段等。）
+pub fn chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(ty);
     out.extend_from_slice(data);

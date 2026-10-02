@@ -25,7 +25,7 @@
 mod carving;
 mod exfat;
 
-pub use carving::{TINY_PNG, crc32, mini_jpeg, mini_png, plant_in_run};
+pub use carving::{TINY_PNG, chunk, crc32, mini_jpeg, mini_png, plant_in_run};
 pub use exfat::{
     ExfatImageBuilder, UPCASE_TABLE, boot_checksum, entry_set_checksum, refix_deleted_checksum,
 };
