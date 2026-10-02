@@ -11,6 +11,7 @@
 //!   与其 32 字节槽宽矛盾，已由真实产物裁决为 20/24）。
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const BPS_SHIFT: u8 = 9;
 pub const SPC_SHIFT: u8 = 3; // 8 扇区 = 4KB 簇
@@ -74,18 +75,7 @@ pub fn name_hash(upcased_utf16le: &[u8]) -> u16 {
     fold16(upcased_utf16le, &[])
 }
 
-/// 前 128 码元强制映射（§7.2.5 Table 24）：a-z → A-Z，其余恒等。
-pub fn upcase_ascii(c: u16) -> u16 {
-    if (0x61..=0x7A).contains(&c) {
-        c - 0x20
-    } else {
-        c
-    }
-}
-
 /// 解码压缩 up-case 表（§7.2.5：uni==index 恒等；0xFFFF → 下一 u16 为恒等个数）。
-/// 仅测试用于校验资产自洽性（引擎不做全表解码，非 ASCII 名按 §7.2.5 Table 24 恒等处理）。
-#[cfg(test)]
 pub fn decode_upcase(compressed: &[u8]) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::new();
     let mut skip = false;
@@ -107,6 +97,13 @@ pub fn decode_upcase(compressed: &[u8]) -> Vec<u16> {
         }
     }
     out
+}
+
+/// 规范 Up-case 表（解码一次后缓存）：NameHash 必须走上转型（§7.2.5），
+/// 非 ASCII 名（如 é → É）在只做 ASCII 上转型时会算错，fsck 报 name hash wrong。
+fn upcase_table() -> &'static [u16] {
+    static TABLE: OnceLock<Vec<u16>> = OnceLock::new();
+    TABLE.get_or_init(|| decode_upcase(UPCASE_TABLE))
 }
 
 struct FileRec {
@@ -176,12 +173,12 @@ impl ExfatImageBuilder {
 
     /// 追加文件（NoFatChain=1：连续分配，不写 FAT——exFAT 最常见形态）。
     pub fn add_file(&mut self, dir: &str, name: &str, data: &[u8]) -> &mut Self {
-        self.push_file(dir, name, data, data.len() as u64, true, None)
+        self.push_file(dir, name, data, data.len() as u64, true)
     }
 
     /// 追加文件（NoFatChain=0：FAT 链描述分配）。
     pub fn add_file_chained(&mut self, dir: &str, name: &str, data: &[u8]) -> &mut Self {
-        self.push_file(dir, name, data, data.len() as u64, false, None)
+        self.push_file(dir, name, data, data.len() as u64, false)
     }
 
     /// 追加文件到显式簇序列（可乱序 → 碎片化；clusters[i] 存放数据第 i 段）。
@@ -196,6 +193,12 @@ impl ExfatImageBuilder {
         self.check_name(name);
         self.check_dir(dir);
         assert!(!clusters.is_empty(), "clusters 不得为空");
+        assert!(
+            clusters.len() * CBS >= data.len(),
+            "簇数不足：{} 簇容不下 {} 字节",
+            clusters.len(),
+            data.len()
+        );
         for c in clusters {
             assert!((2..=CLUSTER_COUNT + 1).contains(c), "cluster 越界：{c}");
             assert!(!self.allocated.contains(c), "cluster 已占用：{c}");
@@ -217,7 +220,7 @@ impl ExfatImageBuilder {
     /// 追加文件并指定 ValidDataLength（VDL ≤ len；[VDL,DL) 磁盘内容"未定义"——夹具写真实数据）。
     pub fn add_file_with_vdl(&mut self, dir: &str, name: &str, data: &[u8], vdl: u64) -> &mut Self {
         assert!(vdl <= data.len() as u64, "vdl 不得大于数据长度");
-        self.push_file(dir, name, data, vdl, true, None)
+        self.push_file(dir, name, data, vdl, true)
     }
 
     fn push_file(
@@ -227,7 +230,6 @@ impl ExfatImageBuilder {
         data: &[u8],
         vdl: u64,
         contiguous: bool,
-        _pad: Option<()>,
     ) -> &mut Self {
         self.check_name(name);
         self.check_dir(dir);
@@ -490,6 +492,10 @@ impl Default for ExfatImageBuilder {
 /// 追加一个项集到目录缓冲：项集不得跨簇边界（规范）；本簇剩余槽不足时，
 /// 先用 unused 项（0x01——扫描器跳过且不终止目录）补齐，使项集从下一簇首槽开始。
 fn push_dir_unit(buf: &mut Vec<u8>, unit: &[u8]) {
+    debug_assert!(
+        unit.len().is_multiple_of(32) && unit.len() <= CBS,
+        "unit 前提：32 倍数且 ≤ 1 簇"
+    );
     let off = buf.len() % CBS;
     if off != 0 && off + unit.len() > CBS {
         for _ in 0..(CBS - off) / 32 {
@@ -543,7 +549,7 @@ fn build_entry_set(
     // NameHash（上转型后 UTF-16LE 字节）
     let upcased: Vec<u8> = units
         .iter()
-        .flat_map(|c| upcase_ascii(*c).to_le_bytes())
+        .flat_map(|c| upcase_table()[*c as usize].to_le_bytes())
         .collect();
     set[32 + 4..32 + 6].copy_from_slice(&name_hash(&upcased).to_le_bytes());
     // SetChecksum（在"未删除"形态下计算；删除只清 bit7 不重算）
@@ -728,7 +734,7 @@ mod tests {
         assert_eq!(entry_set_checksum(set), u16le(set, 2));
         let upcased: Vec<u8> = "A.TXT"
             .encode_utf16()
-            .flat_map(|c| upcase_ascii(c).to_le_bytes())
+            .flat_map(|c| upcase_table()[c as usize].to_le_bytes())
             .collect();
         assert_eq!(name_hash(&upcased), u16le(set, 32 + 4));
         // NameHash KAT（由 fsck.exfat 实证过的参考值）
@@ -888,6 +894,10 @@ mod tests {
         assert_eq!(img[off], 0x85, "第二根簇应从文件项集开始");
         // 第一根簇的 FAT 链：5→51→EOC
         assert_eq!(u32le(&img, fat + 51 * 4), 0xFFFF_FFFF);
+        // 补齐字节必须是 0x01（unused 标记）——若回归成 0x00，解析器会在半途终止目录
+        let first_root = 32 * 512 + 3 * 4096;
+        assert_eq!(img[first_root + 126 * 32], 0x01);
+        assert_eq!(img[first_root + 127 * 32], 0x01);
     }
 
     #[test]
@@ -912,5 +922,68 @@ mod tests {
         let _ = ExfatImageBuilder::new()
             .add_file("/NOPE", "A.TXT", b"x")
             .build();
+    }
+
+    #[test]
+    fn upcase_hashes_accented_names_via_real_table() {
+        // é(0xE9)→É(0xC9) 经推荐表映射；漏映射会产出 fsck 判损的镜像（name hash wrong）
+        let img = ExfatImageBuilder::new()
+            .add_file("/", "Café.TXT", b"x")
+            .build();
+        let root = &img[32 * 512 + 3 * 4096..32 * 512 + 4 * 4096];
+        let set = &root[96..96 + 3 * 32];
+        assert_eq!(u16le(set, 32 + 4), 0x6C06, "NameHash 必须按表上转型计算");
+    }
+
+    #[test]
+    #[should_panic(expected = "簇数不足")]
+    fn panics_when_explicit_clusters_too_few() {
+        let _ = ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "B.BIN", &[5u8; 4500], &[7], false)
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "占用")]
+    fn panics_on_allocation_conflict() {
+        let _ =
+            ExfatImageBuilder::new().add_file_in_clusters("/", "B.BIN", &[5u8; 100], &[2], false); // 簇 2 是位图
+    }
+
+    #[test]
+    #[should_panic(expected = "vdl")]
+    fn panics_on_vdl_exceeding_data() {
+        let _ = ExfatImageBuilder::new()
+            .add_file_with_vdl("/", "V.BIN", b"abc", 99)
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "子目录")]
+    fn panics_on_subdir_slot_overflow() {
+        let mut b = ExfatImageBuilder::new();
+        b.add_subdir("/", "D");
+        for i in 0..66u32 {
+            b.add_file("/D", &format!("F{i:04}.TXT"), b"x");
+        }
+        let _ = b.build();
+    }
+
+    #[test]
+    fn empty_file_is_valid() {
+        let img = ExfatImageBuilder::new()
+            .add_file("/", "EMPTY.TXT", b"")
+            .build();
+        let root = &img[32 * 512 + 3 * 4096..32 * 512 + 4 * 4096];
+        let set = &root[96..96 + 3 * 32];
+        assert_eq!(set[0], 0x85);
+        assert_eq!(
+            set[32 + 1] & 0x02,
+            0,
+            "FirstCluster=0 → NoFatChain 必须为 0"
+        );
+        assert_eq!(u32le(set, 32 + 20), 0);
+        assert_eq!(u64le(set, 32 + 24), 0);
+        assert_eq!(entry_set_checksum(set), u16le(set, 2));
     }
 }
