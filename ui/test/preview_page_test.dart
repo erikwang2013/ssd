@@ -119,6 +119,21 @@ void main() {
     expect(fake.fsReadQueries, isEmpty, reason: '声明超限即不拉');
     expect(find.text('文件过大，暂不支持预览'), findsOneWidget);
     await unload(tester);
+
+    // 文本大件（> 服务端 64MiB 拒绝线）：-32009 与本地 32MiB 上限同一文案
+    final huge = FakeCoreClient(
+      failWith: (method) => method == 'fsRead'
+          ? const RpcException(-32009, 'Entry too large: 104857601')
+          : null,
+    );
+    await pumpPreview(
+      tester,
+      client: huge,
+      e: entry(name: 'huge.log', ext: 'log', size: 100 * 1024 * 1024),
+    );
+    expect(find.text('文件过大，暂不支持预览'), findsOneWidget);
+    expect(find.textContaining('Entry too large'), findsNothing);
+    await unload(tester);
   });
 
   testWidgets('文本：单次 256KiB 前缀 + utf8(allowMalformed) → SelectableText 中文', (
