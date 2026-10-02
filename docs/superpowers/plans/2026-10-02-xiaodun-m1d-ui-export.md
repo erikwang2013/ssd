@@ -707,7 +707,7 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 └── 点击条目 → PreviewPage(taskId, entry)
 ```
 - [ ] **Step 2: 文案铁律检查表（写进 results_page.dart 头注，widget 测试逐条断言）**
-  1. 删除+**连续**（exFAT）：「已删除 · 簇未被占用（完整性高）」；
+  1. 删除+**连续**（exFAT）**且 `quality == complete`**：「已删除 · 簇未被占用（完整性高）」；**（T6 执行精化/F1：连续但质量非 complete（含未知档）→ 落保守臂「已删除 · 恢复质量见分级」——位图证据不足或簇已被占时徽标已示"可能损坏"，行文案不得称完整性高；`null` 臂改 `_` 满足穷尽性；`(false, complete)` 软冲突 by-design over-warn 记录备查）**
   2. 删除+**非连续**（`contiguous==false`）：「已删除 · 按删除链恢复，可能不完整」；
   3. **任何文案不得出现"连续假设"**（grep 断言测试：源码不含该四字）；
   4. carved → 仅「仅雕刻 · 可能不完整」；
@@ -849,6 +849,14 @@ Scaffold('恢复文件')
 - **qual 变异 12 条 + 2 补**：5 KILL；**O2 实证为真竞态**（在途 scanStatus 过期响应把暂停态拉回 scanning——探针 H 在 HEAD 红）→ 一行守卫修复（`id/state` 双查）；`describeScanError` 的 RpcException 前缀（我那"只显示 message"的裁定此前只在注记里）→ 落码 + 断言；7 有牙（含 D 的 `fresh!` 行为杀修正与"独立删除 dismissElevation=等价"的如实转录）。
 - **裁定**：O1 保持单次失败即终态（容错等真机抖动证据，M5）；O3 记录（离页不打断 daemon / 连点并发窗 / `_confirmCancel` 无 mounted 复检——M4/产品）。
 - **T6/T8 移交（已入计划）**：quality 过滤**只能客户端对已加载页**（契约无 quality 参数，禁扩冻结契约）；`file_selector` 测试缝=`FileSelectorPlatform.instance` fake；取消态无「查看结果」入口=主动收窄（契约可查属实）。
+
+### T6（结果浏览页）—— impl-m1d-t6。提交沿革：`6ebe341`（主）→ `a7dbfbc`（qual 修复）。DONE → spec **PASS** → qual ISSUES → 修复有牙（T6 关闭；65+1 跳过 / 带 daemon 66/0）
+
+- **交付**：结果页 13→16 枚测试；分页 200/页 80% 阈值；`deletedOnly` 服务端 + **quality 客户端过滤**（组合序列 `[(0,f),(0,t),(0,t),(200,t)]`，offset 恒=已加载数）；三层计数语义（AppBar total/已加载/过滤命中+提示行）；`_generation` 过期响应守卫（双向）；total 虚高封口；两下游桩（Preview/Recover，签名兼容 T7/T8）；`util/errors.dart` 上收（T5 的 describeScanError 迁入）。
+- **spec 独立核验**：18 探针（[0,200,400] 零网络尾、79%/82% 双侧阈值、失败序列 [0,200,200]、封口同 offset 不重拉、铁律五组+禁词 lib/** 非空扫 canary、FAT null 三义）；**禁词「连续假设」全仓 0**（Rust 注释中字样属引擎文档，不在断言范围）。
+- **★ F1（spec+qual 双抓，高危真缺口）**：`entry_tile` 的 `true` 臂不看 quality → 删除+连续+`maybeDamaged`（**删后被部分复用=必经场景**）文案「完整性高」与徽标「可能损坏」打架，且与引擎「位图逐簇全空才算 Complete」冲突 → 门控 `true when quality=='complete'` + `null`→`_`（穷尽性，spec 的"一行"实为两处）+ 测试（含未知档前向兼容）。
+- **qual 变异 12 条**：8 KILL；3 缺口补测（G1 `_generation` 仓库零回归网→移植 P8a/P8b 脚本化 client；G2 未知档整记录断言；G3 降序点选）；`false,complete` 软冲突 by-design over-warn（记录）。**FAT 删除文案裁定：维持保守「恢复质量见分级」**——更正后的理由：fat 分级虽逐簇查 FAT 表，但「假设 run 空闲」≠文件真实簇序（碎片化不可考），且 null 混迁移前 exFAT 旧行（链读），无措辞对三义皆成立。
+- 过程趣闻：spec 曾报"并发写者告警"——实为 qual 的变异作业（改-测-还原），确认后已把「qual 变异振荡属正常」记入团队记忆。
 
 ---
 
