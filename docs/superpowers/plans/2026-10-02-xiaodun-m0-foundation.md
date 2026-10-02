@@ -1520,7 +1520,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _reload() {
-    setState(() => _devices = widget.client.listDevices());
+    setState(() {
+      _devices = widget.client.listDevices();
+    });
   }
 
   @override
