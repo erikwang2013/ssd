@@ -381,7 +381,7 @@ git commit -m "feat(fixtures): FAT16 合成镜像构建器（分配/删除/簇�
         assert_eq!(u16::from_le_bytes([image[17], image[18]]), 224); // root entries
         // FAT12 链：簇 2→3，entry(2)=3 与 entry(3)=EOC 的半字节打包
         let fat = 512usize; // reserved=1
-        let e2 = ((image[fat + 3] as u32) << 4) | ((image[fat + 4] as u32) & 0x0F);
+        let e2 = ((image[fat + 3] as u32) & 0xFF) | (((image[fat + 4] as u32) & 0x0F) << 8);
         assert_eq!(e2, 3);
         let e3 = ((image[fat + 4] as u32) >> 4) | ((image[fat + 5] as u32) << 4);
         assert_eq!(e3, 0xFFF);
