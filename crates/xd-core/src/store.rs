@@ -111,6 +111,8 @@ impl Store {
                  is_dir INTEGER NOT NULL,
                  quality TEXT NOT NULL,
                  first_cluster INTEGER NOT NULL,
+                 -- byte_offset 三态：NULL = 未知（迁移前旧行 / FS 条目）；0 是合法雕刻偏移
+                 --（文件恰在未分配区间起点）——不得用 0 表示未知。
                  byte_offset INTEGER,
                  PRIMARY KEY (task_id, idx)
              );",
@@ -517,7 +519,7 @@ mod tests {
 
     #[test]
     fn v1_database_migrates_to_v2() {
-        // 手工造 v1 库（无 byte_offset 列、user_version=1）→ Store::open 迁移后可读写
+        // 手工造 v1 库（无 byte_offset 列、user_version=1，含一条真实旧行）→ Store::open 迁移后可读写
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v1.db");
         {
@@ -529,11 +531,28 @@ mod tests {
                  CREATE TABLE entries (task_id INTEGER NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
                      ext TEXT NOT NULL, size_bytes INTEGER NOT NULL, deleted INTEGER NOT NULL, is_dir INTEGER NOT NULL,
                      quality TEXT NOT NULL, first_cluster INTEGER NOT NULL, PRIMARY KEY (task_id, idx));
+                 INSERT INTO tasks (id, device_id, fs, state, total_bytes)
+                     VALUES (1, 'image:v1.img', 'fat', 'completed', 512);
+                 INSERT INTO entries (task_id, idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster)
+                     VALUES (1, 0, 'OLD_V1.JPG', '/', 'jpg', 111, 1, 0, 'complete', 6);
                  PRAGMA user_version = 1;",
             )
             .unwrap();
         }
         let s = Store::open(&path).unwrap();
+        let ver: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 2, "迁移后版本标记必须前进到 2");
+        // 迁移前已存在的旧行：偏移未知，必须读回 NULL（DEFAULT 0 会把未知伪造成「偏移=0」）
+        let (_, old) = s.entries(1, 0, 10, false).unwrap();
+        assert_eq!(
+            old[0].byte_offset, None,
+            "迁移前旧行未知必须 NULL——DEFAULT 0 伪造「偏移=0」"
+        );
         let id = s.create_task("d", "exfat", 1).unwrap();
         let mut e = entry(0, "OLD.JPG", true);
         e.byte_offset = Some(4096);
