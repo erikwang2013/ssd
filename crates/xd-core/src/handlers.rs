@@ -7,15 +7,33 @@ use crate::api::{PROTOCOL_VERSION, Request, Response, RpcError, err, ok};
 
 pub struct CoreCtx {
     devices: Vec<Box<dyn BlockDevice>>,
+    /// 枚举到但**未打开**的设备（device.list 用；零 open()——M1e 契约要求）。
+    list_only: Vec<DeviceInfo>,
 }
 
 impl CoreCtx {
     pub fn new(devices: Vec<Box<dyn BlockDevice>>) -> Self {
-        Self { devices }
+        Self {
+            devices,
+            list_only: Vec::new(),
+        }
     }
 
+    pub fn with_list_only(mut self, infos: Vec<DeviceInfo>) -> Self {
+        self.list_only = infos;
+        self
+    }
+
+    /// 打开的设备优先；`list_only` 中与已打开 id 重复的条目丢弃——
+    /// 否则 `--device /dev/sda` 会与枚举出的同一块盘在 device.list 里出现两次（qual-t1 I1）。
     pub fn device_infos(&self) -> Vec<DeviceInfo> {
-        self.devices.iter().map(|d| d.info().clone()).collect()
+        let mut v: Vec<DeviceInfo> = self.devices.iter().map(|d| d.info().clone()).collect();
+        for info in &self.list_only {
+            if !v.iter().any(|e| e.id == info.id) {
+                v.push(info.clone());
+            }
+        }
+        v
     }
 }
 
@@ -88,6 +106,59 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0]["kind"], serde_json::json!("image"));
         assert_eq!(devices[0]["sizeBytes"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn device_list_merges_list_only_after_opened() {
+        use xd_device::{DeviceInfo, DeviceKind};
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0u8; 512]).unwrap();
+        let img = ImageFileDevice::open(f.path()).unwrap();
+        let ctx = CoreCtx::new(vec![Box::new(img)]).with_list_only(vec![DeviceInfo {
+            id: "unix:/dev/sda".into(),
+            name: "Disk".into(),
+            kind: DeviceKind::Physical,
+            size_bytes: 1 << 40,
+            removable: false,
+            fs_guess: None,
+        }]);
+        let infos = ctx.device_infos();
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].kind, DeviceKind::Image); // devices 在前（既有顺序不变）
+        assert_eq!(infos[1].id, "unix:/dev/sda");
+    }
+
+    #[test]
+    fn device_list_dedupes_by_id() {
+        use xd_device::{BlockDevice, DeviceError, DeviceInfo, DeviceKind};
+        struct Stub;
+        impl BlockDevice for Stub {
+            fn info(&self) -> &DeviceInfo {
+                static I: std::sync::OnceLock<DeviceInfo> = std::sync::OnceLock::new();
+                I.get_or_init(|| DeviceInfo {
+                    id: "unix:/dev/sda".into(),
+                    name: "opened".into(),
+                    kind: DeviceKind::Physical,
+                    size_bytes: 42,
+                    removable: false,
+                    fs_guess: None,
+                })
+            }
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, DeviceError> {
+                Ok(0)
+            }
+        }
+        let ctx = CoreCtx::new(vec![Box::new(Stub)]).with_list_only(vec![DeviceInfo {
+            id: "unix:/dev/sda".into(), // 与打开项同 id → 必须被去重
+            name: "enumerated".into(),
+            kind: DeviceKind::Physical,
+            size_bytes: 42,
+            removable: false,
+            fs_guess: None,
+        }]);
+        let infos = ctx.device_infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "opened");
     }
 
     #[test]

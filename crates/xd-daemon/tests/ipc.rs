@@ -72,9 +72,13 @@ fn device_list_with_image() {
     let mut d = Daemon::start(&["--image", &path]);
     let resp = d.call(r#"{"jsonrpc":"2.0","id":2,"method":"device.list","params":null}"#);
     let devices = resp["result"]["devices"].as_array().unwrap();
-    assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0]["kind"], "image");
-    assert_eq!(devices[0]["sizeBytes"], 4096);
+    // M1e 起 Linux 启动时枚举物理盘，总数依宿主而异；断言收敛为「镜像设备在列且正确」
+    let imgs: Vec<_> = devices
+        .iter()
+        .filter(|d| d["kind"] == serde_json::json!("image"))
+        .collect();
+    assert_eq!(imgs.len(), 1);
+    assert_eq!(imgs[0]["sizeBytes"], 4096);
 }
 
 #[test]

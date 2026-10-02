@@ -37,6 +37,20 @@ pub struct RawDisk {
     pub kind: DeviceKind,
 }
 
+impl RawDisk {
+    /// 映射为 IPC 契约类型。id 语法 `unix:<节点>` 集中此处（daemon 侧不再格式化）。
+    pub fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: format!("unix:{}", self.node.display()),
+            name: self.name.clone(),
+            kind: self.kind,
+            size_bytes: self.size_bytes,
+            removable: self.removable,
+            fs_guess: None, // device.list 零 open()；FS 探测归 M1b 按需调用
+        }
+    }
+}
+
 pub struct BlockEnumerator {
     sysfs_root: PathBuf,
 }

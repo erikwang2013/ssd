@@ -26,6 +26,8 @@ jobs:
       - run: cargo test --workspace --locked
       - run: bash scripts/e2e.sh
         if: runner.os == 'Linux'
+      - run: bash scripts/e2e-loop.sh
+        if: runner.os == 'Linux'
 
   flutter:
     runs-on: ubuntu-latest
