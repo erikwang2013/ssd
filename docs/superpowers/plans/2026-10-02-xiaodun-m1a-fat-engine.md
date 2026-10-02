@@ -1922,7 +1922,7 @@ mod tests {
 
     #[test]
     fn scans_fat32_and_fat12_images() {
-        for builder in [xd_fixtures::FatImageBuilder::fat32(), xd_fixtures::FatImageBuilder::fat12()] {
+        for mut builder in [xd_fixtures::FatImageBuilder::fat32(), xd_fixtures::FatImageBuilder::fat12()] {
             let image = builder.add_file("/", "K.TXT", b"ok").build();
             let (_f, dev) = dev_for(&image);
             let entries = scan(&dev).unwrap();
@@ -1934,11 +1934,32 @@ mod tests {
     fn skips_volume_label_entries() {
         let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "REAL.TXT", b"x").build();
         let mut patched = image.clone();
-        let slot = 18 * 512; // FAT16 根目录第 1 槽（data_start=50 推导：root_start=18）
+        let slot = 18 * 512; // FAT16 根目录第 1 槽（root_start=18 推导）
         patched[slot + 11] = 0x08; // 把该条目改成卷标属性
-        let (_f, dev) = device_with(&patched);
+        let (_f, dev) = dev_for(&patched);
         let entries = scan(&dev).unwrap();
         assert!(entries.is_empty(), "卷标不应出现在结果中: {entries:?}");
+    }
+
+    #[test]
+    fn bad_subdir_chain_does_not_abort_scan() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_subdir("/", "PHOTOS")
+            .add_file("/PHOTOS", "IMG.JPG", &[3u8; 100])
+            .add_file("/", "ROOT.TXT", b"root")
+            .build();
+        let mut patched = image.clone();
+        let base = 18 * 512; // FAT16 根目录区起点
+        let pos = patched[base..base + 32 * 8]
+            .chunks(32)
+            .position(|c| &c[..5] == b"PHOTO")
+            .unwrap();
+        patched[base + pos * 32 + 26..base + pos * 32 + 28].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        assert!(entries.iter().any(|e| e.name == "ROOT.TXT"), "坏子目录链不得中止全盘");
+        assert!(entries.iter().any(|e| e.name == "PHOTOS"), "坏目录项本身仍应列出");
+        assert!(!entries.iter().any(|e| e.name == "IMG.JPG"), "不可读目录不得产出条目");
     }
 }
 ```
@@ -2088,7 +2109,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
     if first_cluster < 2 {
         return Ok(RecoverQuality::MaybeDamaged); // 无簇信息（如删除后 first_cluster 被清零）
     }
-    let need = (size as u32).div_ceil(bpb.cluster_bytes());
+    let need = size.div_ceil(bpb.cluster_bytes());
     let max_cluster = bpb.data_cluster_count() + 1;
     for i in 0..need {
         let c = first_cluster + i;
@@ -2107,7 +2128,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 37 passed（31 + 6）。
+Expected: 38 passed（31 + 7）。
 
 - [ ] **Step 5: Commit**
 
@@ -2227,7 +2248,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 41 passed（37 + 4）。
+Expected: 42 passed（38 + 4）。
 
 - [ ] **Step 5: Commit**
 
@@ -2289,7 +2310,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 42 passed（41 + 1，含新 e2e）。
+Expected: 43 passed（42 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
