@@ -119,6 +119,12 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
         }
         let chain = fat.chain(entry.first_cluster).unwrap_or_default();
         let n = (need as usize).min(chain.len());
+        // 链前缀不得回访簇：回访=环/回折（如 FAT 自环 → [252,252,…]），交付会重复同一簇字节（伪造序）
+        let mut sorted = chain[..n].to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Ok(Vec::new());
+        }
         read_prefix(
             dev,
             &boot,
@@ -365,7 +371,7 @@ mod tests {
     fn deleted_wiped_stale_chain_delivers_honest_prefix() {
         // (a) 探针 B：碎片化删除项（链序 [6,9,7] ≠ 物理序），删除后 stale 链被清（FAT[6]=0，
         // 如部分工具删除时清链）→ 只沿链走到链断：仅簇 6 可交付（4096B）。旧式"链证伪退连续"
-        // 会交付连续 [6,7,8] 的 12288B——其中 [7][8] 是他人/空闲数据，错位交付且无从发现。
+        // 会读入连续 [6,7,8] 三簇并按 size 截断交付 9000B 错位数据（12288 仅为原始读取量）。
         let data: Vec<u8> = (0..9000u32).map(|i| (i % 223) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
             .add_file_in_clusters("/", "OLD.BIN", &data, &[6, 9, 7], false)
@@ -433,6 +439,53 @@ mod tests {
             read_file(&dev, &e).unwrap().is_empty(),
             "物理不可能的链 → 确定性空（不得重复交付同一簇）"
         );
+    }
+
+    #[test]
+    fn deleted_loop_prefix_within_reachable_delivers_nothing() {
+        // 同 scan 侧构造：无检测时交付 8192B（同一 4096B 簇读两次）——前缀回访必须空交付
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[252], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&8192u64.to_le_bytes());
+        patched[stream + 24..stream + 32].copy_from_slice(&8192u64.to_le_bytes());
+        patched[24 * 512 + 252 * 4..24 * 512 + 252 * 4 + 4].copy_from_slice(&252u32.to_le_bytes());
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert!(
+            read_file(&dev, &e).unwrap().is_empty(),
+            "前缀回访 → 确定性空，不得重复交付同一簇"
+        );
+    }
+
+    #[test]
+    fn deleted_noncontiguous_exact_fit_is_complete_and_delivers_full() {
+        // 边界相等：fc=252、链 252→253、need=2=reachable、无回访 → 界卫与回访检测都不得误拒
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 233) as u8).collect();
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "G.BIN", &data, &[252, 253], false)
+            .delete("/", "G.BIN")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "G.BIN")
+            .unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::Complete,
+            "链足 need 且前缀全空闲 → Complete（边界相等不误拒）"
+        );
+        assert_eq!(read_file(&dev, &e).unwrap(), data, "无回访 → 全量交付");
     }
 
     #[test]

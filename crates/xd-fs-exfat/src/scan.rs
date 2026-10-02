@@ -263,6 +263,12 @@ fn grade_deleted(
         if (chain.len() as u64) < need {
             return RecoverQuality::MaybeDamaged;
         }
+        // 链前缀不得回访簇：回访=环/回折（如 FAT 自环 → [252,252,…]），交付会重复同一簇字节（伪造序）
+        let mut sorted = chain[..need as usize].to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return RecoverQuality::MaybeDamaged; // 前缀回访簇 = 链在说谎
+        }
         return if chain[..need as usize].iter().all(|c| all_free(*c)) {
             RecoverQuality::Complete
         } else {
@@ -854,6 +860,33 @@ mod tests {
             e.quality,
             RecoverQuality::MaybeDamaged,
             "链越过可达簇数=链在说谎"
+        );
+    }
+
+    #[test]
+    fn deleted_loop_prefix_within_reachable_degrades() {
+        // spec-t4 注记 2：fc=252、need=2=reachable、自环 FAT[252]=252 → 前缀 [252,252] 回访
+        // → 交付必重复同一簇 = 伪造序 → MaybeDamaged（旧式与门槛前新式都错判 Complete）
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[252], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&8192u64.to_le_bytes()); // VDL
+        patched[stream + 24..stream + 32].copy_from_slice(&8192u64.to_le_bytes()); // DL：need=2
+        patched[24 * 512 + 252 * 4..24 * 512 + 252 * 4 + 4].copy_from_slice(&252u32.to_le_bytes()); // 自环
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "前缀回访簇 = 链在说谎"
         );
     }
 
