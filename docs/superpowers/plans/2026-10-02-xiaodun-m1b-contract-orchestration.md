@@ -2585,7 +2585,11 @@ bash scripts/e2e.sh
 
 **Step 4 文档同步**：README 项目状态节（M1b 合入如实描述 + 剩余切片）与 daemon CLI（`--db`/scan RPC）；`docs/security/linux-privilege-model.md` §5 手测清单追加「真机扫描全链路长跑」条目（进度节奏/暂停读停/取消静默/XDG 库/真百分比）。
 
-**Step 5 合入与 CI**：`--no-ff` merge 至 main（`090cde5`，65 文件 +8429/−1632；含 v0.2.0 以来全部 M1b 工作与三份后续计划）；push main → workflow_dispatch →（CI 结果见下）
+**Step 5 合入与 CI**：`--no-ff` merge 至 main（`090cde5`，65 文件 +8429/−1632；含 v0.2.0 以来全部 M1b 工作与三份后续计划）；push main → workflow_dispatch。
+
+**CI 首轮红转绿的插曲（矩阵价值实证）**：run 37015789672——ubuntu/flutter/deb 三 job 绿，**windows/macos 红**：`unused import: OpenError`（`OpenError` 仅在 `#[cfg(target_os = "linux")]` 的 DaemonOpener 内使用，非 Linux 编译面悬空）→ `ac5aac5` 一行拆分（cfg 门控 import）+ 全面扫面（main.rs 14 项 import 逐一核对使用面；xd-core 无平台 cfg；全工作区 `cfg(target_os` 仅 main.rs 与 xd-device 模块声明）。修复者以 **cfg 反转探针**（`target_os="linux"`→惰性值）在修复前字节上**逐字复现 CI 报错**、修复后 Finished——本地无 MSVC/交叉工具链的替代复证（局限如实声明）。**run 37016554460 全 5 job 绿**（rust×3 + flutter + package-deb，head=ac5aac5）。
+
+**M1b 验收结论：通过（291 测试 / 80+ 变异 / CI 全矩阵绿 / e2e 含真实环回设备）→ 本切片关闭。** 中间产物：分支 `m1b-contract-orchestration` 已合入 main；provenance 待发版重签。
 
 ---
 
