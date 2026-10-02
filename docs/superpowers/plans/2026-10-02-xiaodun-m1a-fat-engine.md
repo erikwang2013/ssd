@@ -2572,6 +2572,14 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
 5. **ext 的点文件惯例**：`.DS_Store` → `ext == "store"`；UI 按 ext 过滤时注意（M2 或 UI 轮处理）。
 6. **bpb 与 scan 的宽容度落差**：bpb 接受 `root_entry_count == 0` 的 12/16 几何，而此类盘 `scan` 按 I2
    契约必 Err（"无法开始枚举"）——语义自洽，已记入 scan 模块头注释。
+7. **（qual-t6 复审 Minor）** `scan_cluster_dir` 入口检查 `out.len() > MAX_ENTRIES` 在 push 封顶后不可达
+   （改 `>=` 或删半句可省一次浪费读）——M2 一行清理。
+8. **（qual-t6 复审 Minor）** `root_entry_count == 0` 畸形 FAT12/16 现返回 Err（I2 下更诚实）——建议在
+   `bpb.rs:7` 边界注释旁补交叉引用，防 M2 当回归改回。
+9. **（qual-t6 复审 Minor）** 根区读到 1..31 字节残角：`chunks_exact` 丢尾 → 0 条目但 `readable=true` →
+   仍 `Ok([])`。需设备恰好结束在根区起点后 31 字节内，构造性极弱，M1a 接受。
+10. **（qual-t6 复审 Minor）** `InvalidBpb("根目录不可读")` 把设备短读也归入 BPB 错误（`FatError` 为
+    `non_exhaustive`）：M1b 映射 UI 文案时考虑专用变体。
 
 ---
 
