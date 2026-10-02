@@ -599,6 +599,12 @@ git commit -m "feat(carving): xd-carving 骨架（CRC32/签名/Cursor）+ 夹具
 
 ### Task 4: JPEG 重组（marker 走链 + 熵段 EOI）
 
+> **T3 执行后同步（实施前必读）**：
+> 1. 夹具走**根导出**：`xd_fixtures::{mini_jpeg, mini_png}`（`mod carving` 私有；计划 T4 测试片段的 `xd_fixtures::carving::…` 编译不过）。
+> 2. **勿重复建** crc32 对拍测试（已在 T3 以 `crc32_matches_fixtures_copy` 落地，含全字节域样本）。
+> 3. `xd-carving` 的 `signatures`/`Cursor` 已有仓库内测试（T3 qual 补测）；T4 测试直接用 `crate::signatures::{Cursor, Carved}`。
+> 4. T3 落地勘误：`tiny.png` 实为 **70 字节**（计划 68 是算术错）。
+
 **Files:**
 - Create: `crates/xd-carving/src/jpeg.rs`
 - Modify: `crates/xd-carving/src/lib.rs`（`pub use jpeg::carve_jpeg;`）
@@ -790,6 +796,8 @@ git commit -m "feat(carving): JPEG marker 走链重组（熵段转义/RST/多扫
 ---
 
 ### Task 5: PNG 重组（chunk 走链 + CRC + IEND）
+
+> **T3 执行后同步**：夹具 `xd_fixtures::{mini_png, TINY_PNG}` 走根导出（`mod carving` 私有）；`tiny.png` 实为 **70 字节**（计划 68 为笔误）；勿重复建 crc32 对拍（T3 已落地）。
 
 **Files:**
 - Create: `crates/xd-carving/src/png.rs`
@@ -1374,6 +1382,14 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 - **裁定与记录**：两引擎合并循环**不抽公共层**（算法冻结、差异在关键处、抽取成本>收益；复访触发=第三个 fs 后端）；**fat「FAT 全表不可读→Ok(空)」与"全盘已分配"不可区分**——保守方向已被专测钉死，**列为 T6 显式决策点**（计划 T6 已注）；exfat 拒绝加"恒真无牙"的 m=0 断言（诚实，非假覆盖）。
 - **流程教训（实施者自查拦下）**：水印拼装 `tail -n +2` 误吞模块 doc 首行——`git diff` 审阅拦下未入库；建议拼装后必 `diff` 首几行。
 - 遗留（防御性代码，记录）：fat final-flush 守卫冗余；`pub fn unallocated_runs`/`MAX_RUNS` doc 已齐（I2 四项）。
+
+### T3（xd-carving 骨架）—— impl-m1c-t3。提交沿革：`2e53d76`（主）→ `3510bc3`（qual 补测）。DONE → spec **PASS** → qual ISSUES → 补丁有牙（T3 关闭，316/0）
+
+- **计划缺陷 4 处（全部计划侧）**：**tiny.png 实为 70 字节**（计划 68 是算术错，base64 本身正确且经 zlib/CRC/inflate 三验）；Step 4 断言切片差 4（取到 "IEND" 而非长度字段，TDD 首跑即红）；`pub mod signatures`（dead_code 所迫，无 `#[allow]` 偷懒）；去 unused import。另：计划 Step 3 伪码自相矛盾处以裁定文本为准（fixtures 独立位算法 + 对拍）。
+- **spec 独立对照**：22 向量四方全等（一次性/三段增量/夹具副本/python zlib）；find_candidates 12 边界；Cursor 20 探针（越界 pos 不动/短读/BE 序）；独立解析器复核两夹具与 tiny.png。
+- **qual 变异 10 条：5 杀，存活全部在 signatures.rs 与 JPEG 夹具结构（零覆盖区，判别力边界=测试边界）**→ 补测四枚（take 精确界/短读停位/skip+BE/正反例）+ 夹具自测 +2 断言（APP0 长度/总长）→ 四变异全杀（M3 双杀=两处独立断言同语义，加强非意外）；crc32 doc 幽灵指涉清理；对拍扩到全 256 字节域（CRC 表 256 项全被跨副本覆盖）。
+- **下游注记（已入 T4/T5 计划）**：夹具走**根导出** `xd_fixtures::{mini_jpeg, mini_png, TINY_PNG}`（`mod carving` 私有）；勿重复建 crc32 对拍；marker 插桩 YAGNI（mini_jpeg(n)+Vec 拼接够用）。
+- 实施者纪律亮点：未把 lead 在飞的计划文档改动扫进提交。
 
 ---
 
