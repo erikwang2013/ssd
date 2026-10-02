@@ -1756,10 +1756,8 @@ git commit -m "feat(ui): IpcCoreClient 与设备列表页（可对接真实 daem
 ```yaml
 name: CI
 
+# 仅手动触发（Actions 页 "Run workflow"），不随 push / PR 自动执行。
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
