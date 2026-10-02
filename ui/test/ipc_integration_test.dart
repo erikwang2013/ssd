@@ -20,9 +20,10 @@ void main() {
       expect(ping.pong, isTrue);
       expect(ping.protocol, 0);
       final devices = await client.listDevices();
-      expect(devices, hasLength(1));
-      expect(devices.single.kind, 'image');
-      expect(devices.single.sizeBytes, 4096);
+      // M1e 起 Linux 启动时枚举物理盘，总数依宿主而异；断言收敛为「镜像设备在列且正确」
+      final images = devices.where((d) => d.kind == 'image').toList();
+      expect(images, hasLength(1));
+      expect(images.single.sizeBytes, 4096);
     } finally {
       await client.close();
     }
