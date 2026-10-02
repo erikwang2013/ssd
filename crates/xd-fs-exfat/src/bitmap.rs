@@ -128,7 +128,11 @@ mod tests {
         let boot = boot::parse(&dev).unwrap();
         let fat = Fat32::new(&dev, &boot);
         let a = read_allocation(&dev, &boot, &fat, 7, 8192).unwrap();
-        assert_eq!(a, data[..8192], "链覆盖时必须按链序 7→6→8 拼接");
+        assert_eq!(
+            a,
+            data[..8192],
+            "链覆盖时必须按链序 7→6 拼接（dl=8192 只消费前两簇）"
+        );
         // 短链回退：FAT[7]=EOC → 链 [7] 不足 → 物理连续读 7,8
         let mut img2 = img.clone();
         img2[24 * 512 + 7 * 4..24 * 512 + 7 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
