@@ -1340,7 +1340,7 @@ impl<'d> Fat<'d> {
             }
             FatType::Fat12 => {
                 let off = self.bpb.fat_start_sector as u64 * self.bpb.bytes_per_sector as u64
-                    + (cluster + cluster / 2) as u64;
+                    + cluster as u64 + cluster as u64 / 2;
                 let mut b = [0u8; 2];
                 let n = self.dev.read_at(off, &mut b)?;
                 if n < 2 {
