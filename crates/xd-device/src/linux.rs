@@ -13,7 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-/// Linux x86_64 O_NONBLOCK（见 man 2 open）。块设备忽略该位；仅防 `--device <fifo>` 永久阻塞。
+// Linux x86_64 O_NONBLOCK（man 2 open）；块设备忽略该位，仅防 --device <fifo> 卡死在 open。
 const O_NONBLOCK: i32 = 0o4000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +95,8 @@ impl Default for BlockEnumerator {
 /// 解析一个 sysfs 条目；size==0 或读不到 size → None（逐条目容错）。
 pub fn parse_disk_entry(class_dir: &Path, name: &str) -> Option<RawDisk> {
     let dir = class_dir.join(name);
-    let sectors: u64 = std::fs::read_to_string(dir.join("size"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    let s = std::fs::read_to_string(dir.join("size")).ok()?;
+    let sectors: u64 = s.trim().parse().ok()?;
     if sectors == 0 {
         return None;
     }
@@ -229,14 +226,13 @@ impl LinuxBlockDevice {
             .unwrap_or_else(|| canon.display().to_string());
         let size_bytes = block_size_bytes(std::os::unix::fs::MetadataExt::rdev(&md), sysfs_root)?;
         // removable 只存在于 sysfs（块设备 stat 无此信息）；条目缺失 → false
-        let removable = std::fs::read_to_string(
-            sysfs_root
-                .join("block")
-                .join(&kernel_name)
-                .join("removable"),
-        )
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false);
+        let rm_path = sysfs_root
+            .join("block")
+            .join(&kernel_name)
+            .join("removable");
+        let removable = std::fs::read_to_string(&rm_path)
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
         Ok(Self {
             info: DeviceInfo {
                 id: format!("unix:{}", canon.display()),
@@ -277,6 +273,12 @@ mod tests {
 
     /// 假 sysfs 条目：(name, model, size_sectors, removable, vendor?, is_partition)
     type FakeEntry<'a> = (&'a str, &'a str, u64, bool, Option<&'a str>, bool);
+
+    /// 假根枚举出的 kernel_name（list() 已排序）
+    fn listed_names(root: &Path) -> Vec<String> {
+        let disks = BlockEnumerator::with_root(root).list().unwrap();
+        disks.into_iter().map(|d| d.kernel_name).collect()
+    }
 
     /// 造一个假 sysfs 根：class/block/<name>/{size,removable,device/model,partition?}
     fn fake_sysfs(entries: &[FakeEntry]) -> tempfile::TempDir {
@@ -398,9 +400,8 @@ mod tests {
             ("mmcblk0rpmb", "", 14000, false, None, false),
             ("sda1", "Part", 15000, false, None, true), // 分区（volume）
         ]);
-        let disks = BlockEnumerator::with_root(root.path()).list().unwrap();
-        let names: Vec<&str> = disks.iter().map(|d| d.kernel_name.as_str()).collect();
-        assert_eq!(names, vec!["mmcblk0", "nvme0n1", "sda", "sdb", "vda"]); // 排序后
+        let names = listed_names(root.path());
+        assert_eq!(names, ["mmcblk0", "nvme0n1", "sda", "sdb", "vda"]); // 排序后
     }
 
     #[test]
@@ -414,30 +415,19 @@ mod tests {
         let sdb_size = root.path().join("class/block/sdb/size");
         fs::remove_file(&sdb_size).unwrap();
         fs::create_dir(&sdb_size).unwrap();
-        let disks = BlockEnumerator::with_root(root.path()).list().unwrap();
-        assert_eq!(
-            disks
-                .iter()
-                .map(|d| d.kernel_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["sda"]
-        );
+        assert_eq!(listed_names(root.path()), ["sda"]);
     }
 
     #[test]
     fn list_skips_non_utf8_entry_name() {
         use std::os::unix::ffi::OsStrExt;
         let root = fake_sysfs(&[("sda", "A", 1000, false, None, false)]);
-        let class = root.path().join("class/block");
-        fs::create_dir(class.join(std::ffi::OsStr::from_bytes(b"sdc\xff"))).unwrap();
-        let disks = BlockEnumerator::with_root(root.path()).list().unwrap();
-        assert_eq!(
-            disks
-                .iter()
-                .map(|d| d.kernel_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["sda"]
-        );
+        // 非 UTF-8 名字的合法条目（size 可读）→ 必须由名字分支排除，而非靠解析失败兜底
+        let weird: &std::ffi::OsStr = std::ffi::OsStr::from_bytes(b"sdc\xff");
+        let weird_dir = root.path().join("class/block").join(weird);
+        fs::create_dir(&weird_dir).unwrap();
+        fs::write(weird_dir.join("size"), "1000\n").unwrap();
+        assert_eq!(listed_names(root.path()), ["sda"]);
     }
 
     #[test]
@@ -487,7 +477,15 @@ mod tests {
             2000398934016
         );
         // 缺失 → Err
-        assert!(block_size_bytes(makedev(9, 9), root.path()).is_err());
+        assert!(block_size_bytes(makedev(7, 7), root.path()).is_err());
+        // 坏字段 → Io(InvalidData)（不再误报 NotAFile）
+        let bad = root.path().join("dev/block/9:9");
+        fs::create_dir_all(&bad).unwrap();
+        fs::write(bad.join("size"), "abc\n").unwrap();
+        assert!(matches!(
+            block_size_bytes(makedev(9, 9), root.path()),
+            Err(DeviceError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     #[test]
