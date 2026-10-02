@@ -154,7 +154,8 @@ mod tests {
 
     #[test]
     fn wild_cluster_on_fat12_does_not_overflow() {
-        // 0xAAAA_AAAB 的 12 位偏移加法曾经 u32 溢出（debug panic）；u64 后为超设备偏移 → Err
+        // 极端簇号不得 panic：偏移 = 512(fat 起点) + 0xAAAA_AAAB + 0x5555_5555(=0x1_0000_0000)
+        // 远超 512KB 夹具 → read_at 返回 0 → 短读 n<2 → 精确 Err（确定性，非碰运气）
         let image = xd_fixtures::FatImageBuilder::fat12().build();
         let (_f, dev) = dev_for(&image);
         let bpb = bpb::parse(&dev).unwrap();
