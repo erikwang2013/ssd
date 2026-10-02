@@ -811,7 +811,7 @@ fn build_entry_set(name: &str, attr: u16, first_cluster: u32, dl: u64, no_fat_ch
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fixtures`
-Expected: **22 passed（15 `#[test]` + 7 `#[should_panic]`）**——基础 16 之上含修复轮新增 6：`upcase_hashes_accented_names_via_real_table`、`empty_file_is_valid`、`panics_when_explicit_clusters_too_few`、`panics_on_allocation_conflict`、`panics_on_vdl_exceeding_data`、`panics_on_subdir_slot_overflow`（见修订轮）；既有 FAT builder 12 测试不回归。
+Expected: **25 passed（15 `#[test]` + 10 `#[should_panic]`）**——基础 16 之上含修复轮新增 6：`upcase_hashes_accented_names_via_real_table`、`empty_file_is_valid`、`panics_when_explicit_clusters_too_few`、`panics_on_allocation_conflict`、`panics_on_vdl_exceeding_data`、`panics_on_subdir_slot_overflow`（见修订轮）+ 存量硬化 3：`panics_when_contiguous_flag_violates_physical_order`、`panics_on_duplicate_clusters_in_list`、`panics_on_extra_clusters`；既有 FAT builder 12 测试不回归。
 
 - [ ] **Step 5: Commit**
 
@@ -853,7 +853,13 @@ git commit -m "feat(fixtures): exFAT 合成镜像 builder（几何/checksum/项�
   4 个 should_panic + 空文件测试；删 `_pad` 死参；删 `upcase_ascii`（其测试自洽校验改用 `upcase_table()`）。
 - **M5（拆分，不阻塞）**：exfat.rs 916 行 → M1b 欠账（缝：纯 checksum/upcase 函数约 90 行 → exfat_checksum.rs）。
 
-计数：xd-fixtures **34**（22 exfat + 12 FAT）、workspace **110**。
+**存量硬化（`734459b`，qual-t1 复审发现）**：`add_file_in_clusters` 三闸——① 簇数**精确**等于
+`ceil(len/CBS)`（同封"不足/空数据配簇/多余簇"三洞，后者两例修前可产出 fsck 判损镜像）；② `contiguous=true`
+要求簇号连续递增（NoFatChain 读侧按 `FirstCluster..+n` 解释，乱序 + true 会 fsck 报 "cluster is marked as free"）；
+③ 列表去重（`[6,6]` 会写自环）。三例对抗回归：修前产出损坏镜像 → 现在 builder 调用即 panic，不可复现。
+合法调用点（T1 frag 9000/[7,6,8]、T5 4500/[6,7]、T6 4500/[7,8]）fsck 复跑 clean 不变。
+
+计数：xd-fixtures **37**（25 exfat + 12 FAT）、workspace **113**。
 
 ---
 
