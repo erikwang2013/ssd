@@ -1384,6 +1384,20 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 
 ---
 
+## 执行记录：T9 出口验收（lead 执行）
+
+**Step 1 全量门禁（本地）**：`fmt` ✓ / `clippy -D warnings` ✓ / **debug 376 passed / 0 failed** / **release 376 passed / 0 failed** / `scripts/e2e.sh` **E2E OK** / flutter `+19 ~1` + analyze 干净 + dart format 0 changed。
+
+**Step 2 变异抽检（跨层）**：`scan_worker.rs` 的 `quality: "carved"` 改为 `"maybeDamaged"` → `cargo test -p xd-core` **恰 3 枚红**（handlers deep / scan_task deep×2）→ 还原（cmp）。各任务 qual 累计变异：T1 8 + T2 12+4 + T3 10 + T4 10 + T5 10 + T6 12+1 + T7 12+（spec 侧再 ~30 探针） + T8 8 ≈ **80+**。
+
+**Step 3 文档**：README 项目状态（M1c 合入如实 + 两项量化 + 剩余切片）；本计划全部执行记录与裁定归档；M1d 计划接收两条风险记录 + 一条契约候选。
+
+**Step 4 合入与 CI**：`--no-ff` merge 至 main（`1482311`）；CI run **37042063304 全 5 job 绿**（rust×3 + flutter + package-deb，head=1482311）——**ubuntu 的 e2e-loop 首次以真实环回设备跑通 deep 段**（deep start → `"quality":"carved"` + byteOffset + carved 恰 1），M1c 的真设备路径就此落地。
+
+**M1c 验收结论：通过 → 本切片关闭。** 里程碑关键账：计划级缺陷 15+（含 MAX_SEGMENT u16 恒零、tiny.png 68 误算、cut+8 笔误、检查点丢条阻断）；量化两枚（JPEG 预读 20046→2 次读、落库 139→8288-10265 条/秒）；恢复率门禁（100%/0 假阳性）进 CI；provenance 待发版重签。
+
+---
+
 ## 执行记录
 
 ### T1（契约 v1.1 + store v2）—— impl-m1c-t1。提交沿革：`9dacc65`（主）→ `11440ce`（qual 缺口补测）。DONE → spec **PASS** → qual ISSUES → 补丁有牙（T1 关闭，295/0）
