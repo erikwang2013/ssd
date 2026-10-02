@@ -439,8 +439,9 @@ mod tests {
 
     #[test]
     fn polluted_lengths_read_file_stays_bounded_without_panic() {
-        // qual-t6 C1 / 探针 D：DL 污染成 u64::MAX（重算还原校验以过 T4 门槛）→ read_file 不得因
-        // need*cb 乘法溢出（debug panic）或巨分配（release abort），必须确定性 Ok(empty)
+        // qual-t6 C1 / 探针 D 三档（每档各钉一种旧式崩法，重算还原校验以过 T4 门槛）：
+        // (a) DL=u64::MAX → debug 乘法溢出 panic；(b) VDL=DL=(1<<52)+4096 → release 巨分配 abort；
+        // (c) VDL=u64::MAX（直构）→ 越 DL 交付。三档均须 Ok 且长度受 min(VDL,DL)/可达簇数约束
         let image = xd_fixtures::ExfatImageBuilder::new()
             .add_file("/", "PHOTO.JPG", &[1u8; 9000])
             .delete("/", "PHOTO.JPG")
@@ -457,9 +458,10 @@ mod tests {
             "need ≫ 可达簇数 → 确定性空，且不得在容量提示上乘爆"
         );
 
-        // release 半壁：DL=(1<<52)+4096 → need*cb ≈ 4.5PB（乘法不溢出但巨分配；旧式在 release
-        // 直接 Abort）→ 仍须 Ok(empty)
+        // release 半壁：VDL=DL=(1<<52)+4096 → 旧式容量提示 min(size, need*cb) ≈ 4.5PB 巨分配，
+        // release 真 SIGABRT（乘法不溢出，故 debug 档不 panic）；新式三重钳位仍须 Ok(empty)
         let mut patched2 = image.clone();
+        patched2[stream + 8..stream + 16].copy_from_slice(&((1u64 << 52) + 4096).to_le_bytes());
         patched2[stream + 24..stream + 32].copy_from_slice(&((1u64 << 52) + 4096).to_le_bytes());
         refix_deleted_checksum(&mut patched2, SET, 3);
         let (_f2, dev2) = dev_for(&patched2);
@@ -495,10 +497,12 @@ mod tests {
 
     #[test]
     fn deleted_with_unreadable_bitmap_uses_stale_chain() {
-        // 位图不可读（0x81 首簇越界）→ 无从证伪 → 仍沿 stale 链交付全量（钉 `None => true` 分支）
+        // 位图不可读（0x81 首簇越界）→ 无从证伪 → 仍沿 stale 链交付全量（钉 `None => true` 分支）。
+        // 构型刻意碎片化 [6,9,7]（物理序 ≠ 连续序）：add_file_chained 物理连续时退 contiguous 兜底
+        // 字节相同，M4 变异（None => true → false）会逃逸（qual-t6 复审 Minor A）
         let data: Vec<u8> = (0..9000u32).map(|i| (i % 227) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
-            .add_file_chained("/", "G.BIN", &data)
+            .add_file_in_clusters("/", "G.BIN", &data, &[6, 9, 7], false)
             .delete("/", "G.BIN")
             .build();
         let mut patched = image.clone();
