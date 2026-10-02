@@ -946,6 +946,28 @@ mod tests {
         assert_eq!(bpb.total_sectors, 4224);
         assert_eq!(bpb.fat_type, FatType::Fat16);
     }
+
+    #[test]
+    fn rejects_overflowing_fat_geometry() {
+        let image = xd_fixtures::FatImageBuilder::fat32().build();
+        let mut bad = image.clone();
+        bad[16] = 0xFF; // num_fats = 255
+        bad[36..40].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes()); // fat32_size 拉满
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+    }
+
+    #[test]
+    fn fat_entry_byte_offsets() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let (_f, dev) = device_with(&image);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.fat_entry_byte(2), 516); // fat_start=1 → 512 + 2*2
+        let image32 = xd_fixtures::FatImageBuilder::fat32().build();
+        let (_f2, dev32) = device_with(&image32);
+        let bpb32 = parse(&dev32).unwrap();
+        assert_eq!(bpb32.fat_entry_byte(2), 16392); // 32*512 + 2*4
+    }
 }
 ```
 
@@ -990,6 +1012,8 @@ impl Bpb {
         self.bytes_per_sector as u32 * self.sectors_per_cluster as u32
     }
 
+    /// # Panics
+    /// `cluster` 必须满足 `2 <= cluster <= data_cluster_count() + 1`（0/1 为保留簇）。
     pub fn cluster_to_sector(&self, cluster: u32) -> u32 {
         self.data_start_sector + (cluster - 2) * self.sectors_per_cluster as u32
     }
@@ -1002,6 +1026,8 @@ impl Bpb {
         self.data_sectors / self.sectors_per_cluster as u32
     }
 
+    /// # Panics
+    /// FAT12 上调用即 panic（编程错误，非输入错误）。
     pub fn fat_entry_byte(&self, cluster: u32) -> u64 {
         let per_entry: u64 = match self.fat_type {
             FatType::Fat32 => 4,
@@ -1069,13 +1095,19 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<Bpb, FatError> {
     let fat_start_sector = reserved_sectors;
     let root_start_sector = if fat_type == FatType::Fat32 { 0 } else { fat_start_sector + fat_size_sectors * num_fats as u32 };
     let data_start_sector = if fat_type == FatType::Fat32 {
-        fat_start_sector + fat_size_sectors * num_fats as u32
+        // FAT32 的 fat_size 是 28 位，u32 直乘可溢出——u64 计算并顺带完成越界检查
+        let start = fat_start_sector as u64 + fat_size_sectors as u64 * num_fats as u64;
+        if start >= total_sectors as u64 {
+            return Err(FatError::InvalidBpb("data area beyond device".into()));
+        }
+        start as u32
     } else {
-        root_start_sector + root_sectors
+        let start = root_start_sector + root_sectors;
+        if start >= total_sectors {
+            return Err(FatError::InvalidBpb("data area beyond device".into()));
+        }
+        start
     };
-    if data_start_sector >= total_sectors {
-        return Err(FatError::InvalidBpb("data area beyond device".into()));
-    }
     let data_sectors = total_sectors - data_start_sector;
 
     let fat_type = if fat_type == FatType::Fat32 {
@@ -1108,7 +1140,7 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<Bpb, FatError> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 7 passed（含 total16 分支覆盖）。
+Expected: 9 passed（含 total16 分支与溢出防护、fat_entry_byte 覆盖）。
 
 - [ ] **Step 5: Commit**
 
@@ -1292,7 +1324,7 @@ impl<'d> Fat<'d> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 12 passed（7 + 5）。
+Expected: 14 passed（9 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1565,7 +1597,7 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 18 passed（12 + 6）。
+Expected: 20 passed（14 + 6）。
 
 - [ ] **Step 5: Commit**
 
@@ -1823,7 +1855,7 @@ fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 23 passed（18 + 5）。
+Expected: 25 passed（20 + 5）。
 
 - [ ] **Step 5: Commit**
 
@@ -1922,7 +1954,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 26 passed（23 + 3）。
+Expected: 28 passed（25 + 3）。
 
 - [ ] **Step 5: Commit**
 
@@ -1984,7 +2016,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 27 passed（26 + 1，含新 e2e）。
+Expected: 29 passed（28 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
