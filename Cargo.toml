@@ -6,6 +6,7 @@ members = [
     "crates/xd-device",
     "crates/xd-daemon",
     "crates/xd-ffi",
+    "crates/xd-fixtures",
 ]
 
 [workspace.package]
