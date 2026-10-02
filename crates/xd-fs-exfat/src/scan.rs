@@ -351,6 +351,17 @@ mod tests {
         sum
     }
 
+    /// 就地重算删除项集 SetChecksum：先按删除还原语义对每槽类型字节 `|=0x80` 再折叠
+    /// （删除只清 bit7、不重算——这正是 T4 删除门槛的语义）。
+    fn refix_deleted_checksum(img: &mut [u8], set_off: usize, slots: usize) {
+        let mut restored = img[set_off..set_off + slots * 32].to_vec();
+        for k in 0..slots {
+            restored[k * 32] |= 0x80;
+        }
+        let cs = set_checksum(&restored);
+        img[set_off + 2..set_off + 4].copy_from_slice(&cs.to_le_bytes());
+    }
+
     /// 记账设备：记录每次 `read_at` 的起点偏移（qual-t5 M1 根单读证明）。
     /// `Mutex`（非 `RefCell`）——`BlockDevice: Send + Sync` 要求。
     struct CountingDev<'a> {
@@ -776,12 +787,7 @@ mod tests {
         let mut patched = image.clone();
         let stream = SET + 32;
         patched[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes()); // DataLength
-        let mut restored = patched[SET..SET + 96].to_vec();
-        for k in 0..3 {
-            restored[k * 32] |= 0x80; // 还原类型位（删除只清 bit7）
-        }
-        let cs = set_checksum(&restored);
-        patched[SET + 2..SET + 4].copy_from_slice(&cs.to_le_bytes());
+        refix_deleted_checksum(&mut patched, SET, 3);
         let (_f, dev) = dev_for(&patched);
         let entries = scan(&dev).unwrap();
         let e = entries.iter().find(|e| e.name == "PHOTO.JPG").unwrap();
@@ -795,12 +801,7 @@ mod tests {
         // 同构：起点污染（T4 不设 fc 上界）→ 起点界卫兜住，debug 档也不得下溢 panic
         let mut patched2 = image.clone();
         patched2[stream + 20..stream + 24].copy_from_slice(&9999u32.to_le_bytes()); // FirstCluster
-        let mut restored2 = patched2[SET..SET + 96].to_vec();
-        for k in 0..3 {
-            restored2[k * 32] |= 0x80;
-        }
-        let cs2 = set_checksum(&restored2);
-        patched2[SET + 2..SET + 4].copy_from_slice(&cs2.to_le_bytes());
+        refix_deleted_checksum(&mut patched2, SET, 3);
         let (_f2, dev2) = dev_for(&patched2);
         let entries2 = scan(&dev2).unwrap();
         let e2 = entries2.iter().find(|e| e.name == "PHOTO.JPG").unwrap();
@@ -808,6 +809,66 @@ mod tests {
             e2.quality,
             RecoverQuality::MaybeDamaged,
             "fc 越界：起点界卫兜住"
+        );
+    }
+
+    #[test]
+    fn deleted_chain_grades_on_need_prefix_only() {
+        // I2 对齐的 T5 半壁：stale 链 [6,9,7,10]（7→10 已是 NEW.BIN 的链），dl 补成 8192（need=2）
+        // → chain[..2]=[6,9] 全空闲 → Complete（链尾 7/10 被占不牵连）
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 9000], &[6, 9, 7], false)
+            .delete("/", "OLD.BIN")
+            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4600], &[7, 10], false)
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        // VDL 与 DL 同补成 8192：vdl > dl 会被 T4 直接丢弃（夹具 vdl=9000）
+        patched[stream + 8..stream + 16].copy_from_slice(&8192u64.to_le_bytes());
+        patched[stream + 24..stream + 32].copy_from_slice(&8192u64.to_le_bytes());
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "OLD.BIN").unwrap();
+        assert!(e.deleted);
+        assert_eq!(
+            e.quality,
+            RecoverQuality::Complete,
+            "只按 need 前缀判空闲，链尾被占不牵连"
+        );
+    }
+
+    #[test]
+    fn deleted_reachable_exact_fit_is_complete() {
+        // 界卫 off-by-one：need == reachable（首簇 6 到末簇 count+1 全空闲）→ Complete，不得提前降级
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "G.BIN", &[4u8; 512])
+            .delete("/", "G.BIN")
+            .build();
+        let (_f0, dev0) = dev_for(&image);
+        let boot = boot::parse(&dev0).unwrap();
+        let first = scan(&dev0)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "G.BIN")
+            .unwrap()
+            .first_cluster as u64;
+        let reachable = boot.cluster_count as u64 + 1 - first + 1;
+        let dl = reachable * boot.cluster_bytes();
+        let mut patched = image.clone();
+        let dl_off = SET + 32 + 24;
+        patched[dl_off..dl_off + 8].copy_from_slice(&dl.to_le_bytes());
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "G.BIN")
+            .unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::Complete,
+            "need == reachable 须 Complete（界卫严格 >）"
         );
     }
 }
