@@ -988,6 +988,13 @@ docker run --rm -v "$PWD/dist:/pkg:ro" ubuntu:24.04 bash -c '
 
 - [ ] **Step 5: 运行**：本机 `bash scripts/build-deb.sh`（dpkg-deb 可用）产出 dist/*.deb；`bash scripts/e2e-deb.sh` 有 docker 则跑、无则 skip。Commit：`feat(packaging): deb 树与 build/e2e 脚本（daemon 装 /usr/libexec/xiaodun）`
 
+**执行记录（2026-10-02）**：实施提交 `997d897` + SIGPIPE 加固 `00e40f3` + 修复轮 `a674c27`。
+- **超计划验证**：本机 docker 实跑容器装/卸 **DEB E2E OK**（含负控制：stub daemon 无横幅 → 断言按预期失败）；`dpkg-deb -c` 恰计划树 5 文件；payload sha256 == 仓库 == T3 终修版；`--root-owner-group` 反事实实测（无此 flag 则 erik:erik）。
+- **SIGPIPE 竞态（计划原文缺陷，spec 实测）**：`dpkg-deb -I | head -12` 在 pipefail 下并行 3/10 概率 141——修 `|| true`（0/60）。
+- **修复轮（qual-t4，2 Important 无、5 Minor）**：`umask 022`（0002 下曾产 775 root:root 系统目录，修后 755 复测）；`sed -n 1p` 替 `head -1`（同类 SIGPIPE 潜伏，不用 `|| true` 掩盖）；`grep -qx` 全路径 + `dpkg-query 'install ok installed'`（真变异体：改名 `xd-daemon.debug` 被拒、未 configure 被拒）+ 内层"勿加 pipefail"注释；`libc6 (>= 2.34)`（= 本地构建基线；**残余如实**：CI 工具链若更高则下限低估——维护者说明落在 postinst 注释，同时记于此）；ci.yml `apt-get update -qq` / `docker info` 步（堵 CI 假绿 skip）/ `if-no-files-found: error`。
+- **未验证不变**：真机 `dpkg -i` 与 udev/polkit 生效（需真机 root）。
+- **T5 出口项确认**：`.gitignore dist/`（仍开）、`apply-copyright.sh` 幂等（新 `.sh` 已带头将跳过）。
+
 ---
 
 ### Task 5: M1e 出口验收
@@ -996,7 +1003,7 @@ docker run --rm -v "$PWD/dist:/pkg:ro" ubuntu:24.04 bash -c '
 - [ ] `bash scripts/e2e-loop.sh`：本机 skip（无免密 sudo）；**CI（手动触发）必须 LOOP E2E OK**——未过不得关闭 M1e
 - [ ] `bash scripts/build-deb.sh` 产出 deb；`bash scripts/e2e-deb.sh` 本机（有 docker）容器装/卸 OK
 - [ ] `strace -f -e trace=openat ./target/debug/xd-daemon </dev/null 2>&1 | grep -E "openat.*(/dev/(sd|nvme|mmc|vd))" ` → **无输出**（device.list 零 open 的机器断言；手测记录入库）
-- [ ] `bash scripts/apply-copyright.sh` 幂等（新 .rs 已带头；rules/policy/脚本为配置件不加头）
+- [ ] `bash scripts/apply-copyright.sh` 幂等（新 `.rs`/`.sh` 已带头；`packaging/` 下 rules/policy/control/postinst **不在**脚本扫描列表——措辞更正，qual-m1e-t4）
 - [ ] `.gitignore` 补一行 `dist/`（T4 裁量结论：deb 产物不入库；防未来 `git add -A` 吞 250KB 二进制）
 - [ ] **未验证清单（平台专有，交付标注"未验证"，M1 出口真机手测）**：pkexec 真实认证路径（CI 无 tty 必 127）、
       udev uaccess 真机生效（需装包+插盘）、真 U 盘删除照片全链路、`/dev/sdX` 真实介质行为；
