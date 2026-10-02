@@ -1364,6 +1364,25 @@ class FailingCoreClient implements CoreClient {
   Future<void> close() async {}
 }
 
+class FlakyCoreClient implements CoreClient {
+  FlakyCoreClient(this.devices);
+  final List<DeviceInfo> devices;
+  var calls = 0;
+
+  @override
+  Future<PingResult> ping() async => const PingResult(pong: true, version: 'test', protocol: 0);
+
+  @override
+  Future<List<DeviceInfo>> listDevices() async {
+    calls++;
+    if (calls == 1) throw const RpcException(-1, 'boom');
+    return devices;
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
 void main() {
   testWidgets('shows device list from client', (tester) async {
     await tester.pumpWidget(MaterialApp(
@@ -1383,6 +1402,24 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('boom'), findsOneWidget);
     expect(find.text('重试'), findsOneWidget);
+  });
+
+  testWidgets('retry re-invokes the client', (tester) async {
+    final client = FlakyCoreClient(const [
+      DeviceInfo(id: 'image:retry.img', name: 'retry.img', kind: 'image', sizeBytes: 2048, removable: false),
+    ]);
+    await tester.pumpWidget(MaterialApp(home: HomePage(client: client)));
+    await tester.pumpAndSettle();
+    expect(find.text('重试'), findsOneWidget);
+    await tester.tap(find.text('重试'));
+    await tester.pumpAndSettle();
+    expect(find.text('retry.img'), findsOneWidget);
+  });
+
+  testWidgets('shows empty state when no devices', (tester) async {
+    await tester.pumpWidget(MaterialApp(home: HomePage(client: FakeCoreClient(const []))));
+    await tester.pumpAndSettle();
+    expect(find.text('未发现设备'), findsOneWidget);
   });
 }
 ```
@@ -1406,11 +1443,11 @@ import 'protocol.dart';
 class IpcCoreClient implements CoreClient {
   IpcCoreClient._(this._process) {
     _sub = _process.stdout
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen(_onLine);
     _process.stderr
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen((line) => stderrLines.add(line));
     _process.exitCode.then(_onExit);
@@ -1597,20 +1634,25 @@ String formatBytes(int bytes) {
 - [ ] **Step 5: 替换 `ui/lib/main.dart`**
 
 ```dart
+import 'dart:io' show ProcessException;
+
 import 'package:flutter/material.dart';
 
 import 'core_client/core_client.dart';
 import 'core_client/ipc_transport.dart';
+import 'core_client/protocol.dart';
 import 'home_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // M0：真实 daemon 通过 XD_DAEMON_BIN 指定；无 daemon 时 UI 显示错误态。
+  // M0：真实 daemon 通过 XD_DAEMON_BIN 指定；未配置或启动失败时 UI 显示错误态。
   CoreClient client;
   try {
     client = await IpcCoreClient.start();
-  } on StateError {
-    client = _MissingDaemonClient();
+  } on StateError catch (e) {
+    client = _MissingDaemonClient('$e');
+  } on ProcessException catch (e) {
+    client = _MissingDaemonClient('daemon 启动失败：${e.message}');
   }
   runApp(XiaodunApp(client: client));
 }
@@ -1631,19 +1673,20 @@ class XiaodunApp extends StatelessWidget {
 }
 
 class _MissingDaemonClient implements CoreClient {
-  @override
-  Future<PingResult> ping() async => throw StateError('未找到 daemon：请设置 XD_DAEMON_BIN');
+  _MissingDaemonClient(this.reason);
+
+  final String reason;
 
   @override
-  Future<List<DeviceInfo>> listDevices() async =>
-      throw StateError('未找到 daemon：请设置 XD_DAEMON_BIN');
+  Future<PingResult> ping() async => throw StateError(reason);
+
+  @override
+  Future<List<DeviceInfo>> listDevices() async => throw StateError(reason);
 
   @override
   Future<void> close() async {}
 }
 ```
-
-（`_MissingDaemonClient` 用到 `protocol.dart` 的 `PingResult`/`DeviceInfo`，需要 `import 'core_client/protocol.dart';`。）
 
 - [ ] **Step 6: 全量验证**
 
@@ -1651,7 +1694,7 @@ Run:
 ```bash
 cd ui && flutter analyze && flutter test
 ```
-Expected: analyze 无 error；protocol_test 5 passed、home_page_test 2 passed。
+Expected: analyze 无 error；protocol_test 5 passed、home_page_test 4 passed。
 
 - [ ] **Step 7: 真实 daemon 集成测试 `ui/test/ipc_integration_test.dart`**
 
@@ -1667,6 +1710,7 @@ void main() {
     'handshake with real daemon (ping + device.list)',
     () async {
       final dir = Directory.systemTemp.createTempSync('xd_ui_it');
+      addTearDown(() => dir.deleteSync(recursive: true));
       final image = File('${dir.path}/test.img')..writeAsBytesSync(List<int>.filled(4096, 0));
       final client = await IpcCoreClient.start(daemonPath: bin, extraArgs: ['--image', image.path]);
       try {
@@ -1791,4 +1835,4 @@ git commit -m "ci: Rust 三平台矩阵与 Flutter job"
 
 - M1 起点：`xd-fs-fat`（FAT/exFAT 快速扫描）、carving v1（JPEG/PNG）、扫描三页 UI、Windows 提权打包。届时按需新增 crate 成员与 proto 方法（`scan.start`/`scan.progress` 事件流）。
 - M0 未做但已为此预留的形状：BlockDevice trait（物理设备后端直接实现它）、RpcError 错误码表、golden 契约流程（新方法 = 新 golden + 两侧测试）。
-- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）；⑤ M1 设计输入（Task 6 审查）：daemon 是同步阻塞单线程——`scan.start` 类长任务会阻塞 ping/device.list；进度事件与响应共写 stdout 需要单写者串行化（writer 线程或互斥保证行原子性）；⑥ e2e.sh 无超时（M1 scan 阻塞前需加 timeout，注意 macOS 无 GNU timeout 需探测）。
+- 质量审查登记（不阻塞 M0）：① M1 动工前给 `BlockDevice::read_at` 补一行 doc「M0 支持任意偏移；M1+ 真实设备可能要求扇区对齐」；② 顺手补 3 个浅测试：`read_at` 空 buf 分支、`open` 不存在路径、`info().name` 字段断言；③ `DeviceError::source()` 可选实现；④ M4 xd-ffi 在 Rust 侧消费 Response 前，评估 untagged 判别的 Err 优先改造（result+error 并存目前会被 Ok 静默吞掉）；⑤ M1 设计输入（Task 6 审查）：daemon 是同步阻塞单线程——`scan.start` 类长任务会阻塞 ping/device.list；进度事件与响应共写 stdout 需要单写者串行化（writer 线程或互斥保证行原子性）；⑥ e2e.sh 无超时（M1 scan 阻塞前需加 timeout，注意 macOS 无 GNU timeout 需探测）；⑦ IPC 层 M1 输入（Task 9 审查）：`_call` 加 `_dead` 守卫（daemon 死后重试会白等 10s）、`stderrLines` 加上限、`close()` 加 kill 超时 + SIGKILL 兜底。
