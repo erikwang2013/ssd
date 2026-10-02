@@ -2415,7 +2415,7 @@ git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
 
     #[test]
     fn read_file_terminates_on_chain_loop() {
-        // 活文件自环链：必须终止且不超读（chain() 自身有 len 上界）
+        // 活文件自环链：不挂起、不越读；按链读到 need（内容为簇 2 自重复——FAT 所指如此，非他人数据）
         let data: Vec<u8> = (0..1200u32).map(|i| (i % 241) as u8).collect();
         let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "LOOP.BIN", &data).build();
         let mut patched = image.clone();
@@ -2424,7 +2424,9 @@ git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
         let entries = scan(&dev).unwrap();
         let e = entries.iter().find(|e| e.name == "LOOP.BIN").unwrap();
         let bytes = read_file(&dev, e).unwrap();
-        assert!(bytes.len() <= 1200);
+        assert_eq!(bytes.len(), 1200); // 环链长 count+2 ≥ need → 全尺寸（非短前缀）
+        assert_eq!(&bytes[..512], &data[..512]);
+        assert_eq!(&bytes[512..1024], &data[..512]); // 簇 2 自重复：锁定"按链读"语义
     }
 
     #[test]
@@ -2456,7 +2458,7 @@ Expected: 编译失败（`read_file` 未定义）。
 
 ```rust
 /// 读取文件内容（恰好 size 字节；设备边界/坏读早停 → 返回短于 size 的前缀，不伪造）。
-/// 策略：存活文件只信 FAT 链（链短/坏/环 → 诚实短前缀，绝不连续猜测）；删除项
+/// 策略：存活文件只信 FAT 链（链短/坏 → 诚实短前缀；环 → 按链读到 need，内容可能自重复）；删除项
 /// （M1a 语义：删除即清 FAT，链属他人）按连续簇回退。
 /// 注意：返回值只有字节——"是否走了连续假设"由 `entry.deleted` 推断（M1d UI 文案据此）。
 pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, FatError> {
@@ -2478,8 +2480,8 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
         }
         v
     } else {
-        // 只信链：坏 FAT 上连续猜读会全尺寸交付他人数据且质量恒 Complete，调用方无从发现
-        // ——宁可漏报不可错报（qual-t7 I1）。
+        // 只信链：坏 FAT 上连续猜读会交付他人数据且质量恒 Complete，调用方无从发现——宁可漏报不可错报；
+        // 环链只按链读不猜测、不挂起（qual-t7 复审）。
         let fat = Fat::new(dev, &bpb);
         let chain = fat.chain(entry.first_cluster).unwrap_or_default();
         chain[..need.min(chain.len())].to_vec()
@@ -2520,7 +2522,8 @@ git commit -m "feat(fs-fat): 文件读取（链读 + 连续回退，精确 size�
 （"fix(fs-fat): 回退仅限删除项（live 坏链诚实短前缀）、删除侧免链走与容量收敛（qual-t7）"）：
 
 - **I1（规格变更，定案方案 a）**：**连续假设 ⟺ deleted**——回退仅限删除项；存活文件只信 FAT 链，
-  链短/坏/环 → 诚实短前缀（`chain[..need.min(len)]`）。缺陷原状：坏 FAT 上活文件被静默连续猜读，
+  链短/坏 → 诚实短前缀（`chain[..need.min(len)]`）、环 → 按链读到 need（内容可能自重复，环链长恒
+  count+2 ≥ need）。缺陷原状：坏 FAT 上活文件被静默连续猜读，
   **全尺寸交付他人数据且 quality 恒 Complete**，长度校验无从发现（qual 探针实证）。代价：坏 FAT 上
   物理连续的活文件少读一段——宁可漏报。`looped` 变量随旧回退逻辑一并删除。
 - **I2**：删除项不再先走 `fat.chain()`（自环时白读 4178 次）；`Fat::new` 移入 live 分支。
@@ -2641,7 +2644,8 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
    （无 LFN 时不可重建）、内容不枚举（M1a 版图）、quality 仍 Complete（is_dir 分支在先）——**不得把
    Complete 读成"目录内容可恢复"**。M1d 文案与过滤逻辑据此。
 2. **read_file 的连续假设 ⟺ deleted（qual-t7 I1 定案）**：删除项 = 连续假设恢复（M1d UI 据此标注）；
-   存活文件只信链，链短/坏/环 → 诚实短前缀（**绝不猜读**）、不再有"全尺寸交付他人数据"路径。
+   存活文件只信链：链短/坏 → 诚实短前缀，环 → 按链读到 need（内容可能自重复，非他人数据）——
+   **绝不猜读**、不再有"全尺寸交付他人数据"路径。
    live 的 quality 在 scan 层仍恒 Complete（未删未覆盖语义），**读侧诚实靠长度对比**
    （返回值可能短于 `size_bytes`：设备边界/坏读早停/坏链），UI 以长度呈现完整度。
 3. **grade_deleted 的 CPU 面**：无 FAT 缓存，每删除条目最坏 `count` 次 `read_at`（敌意镜像 × 条目数
@@ -2667,6 +2671,9 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
     短读不 panic（truncate 空操作）。M4：`RecoverQuality::Complete` 文档（scan.rs:14）仅述删除项语义，
     活文件 Complete（未删/未覆盖）含义不同——M1b 补一句。T7 测试注释算术 512/513 off-by-one
     （计划原文，实施者照抄正确）——M1b 拆分时顺手修正。
+13. **（qual-t7 复审 Minor 1 选项②，转 M2）**：live×环 现为"按链读到 need、内容自重复"（全尺寸）——
+    可选严格版：首重复扫描取真实前缀，把"live ⟹ 返回必为真实前缀"升为硬不变量。M2 评估
+    （可与 M1b 拆 read.rs 同批）。
 
 ---
 
