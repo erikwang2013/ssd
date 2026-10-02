@@ -561,6 +561,54 @@ mod tests {
     }
 
     #[test]
+    fn scan_start_rejects_unsupported_mode() {
+        // M1b 仅支持 quick；"deep" 在 M1c 转正后本断言由 M1c 计划改为合法路径。
+        let (_f, ctx) = ctx_with_fixture();
+        let dev_id = ctx.devices[0].info().id.clone();
+        let Response::Err(e) = handle_request(
+            &ctx,
+            &req_with(
+                3,
+                "scan.start",
+                serde_json::json!({"device": dev_id, "mode": "deep"}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(e.error.code, -32602);
+        assert_eq!(e.error.message, "Invalid params: unsupported mode");
+    }
+
+    #[test]
+    fn resolve_device_prefers_already_open_over_opener() {
+        struct Denied;
+        impl crate::scan_task::DeviceOpener for Denied {
+            fn open(&self, _id: &str) -> Result<Arc<dyn BlockDevice>, crate::scan_task::OpenError> {
+                Err(crate::scan_task::OpenError::PermissionDenied)
+            }
+        }
+        let (_f, dev) = crate::testutil::exfat_fixture();
+        let dev_id = dev.info().id.clone();
+        let ctx = CoreCtx::new(vec![dev]).with_scan(
+            Arc::new(ScanManager::new(
+                crate::store::Store::open_memory().unwrap(),
+                Arc::new(|_| {}),
+            )),
+            Arc::new(Denied),
+        );
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(3, "scan.start", serde_json::json!({"device": dev_id})),
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            o.result["fs"], "exfat",
+            "已打开设备优先：不得落入 opener 的 -32001"
+        );
+    }
+
+    #[test]
     fn scan_start_unsupported_and_unknown_device() {
         let (_f, zeros) = crate::testutil::dev_from_bytes(&[0u8; 4096]);
         let ctx = CoreCtx::new(vec![zeros]);

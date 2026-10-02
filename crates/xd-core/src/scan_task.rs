@@ -180,10 +180,13 @@ impl ScanManager {
         );
         let store = self.store.clone();
         let notify = self.notify.clone();
-        std::thread::spawn(move || {
-            crate::scan_worker::run_worker(id, device, ctrl, store, notify);
-            running.store(false, Ordering::SeqCst);
-        });
+        std::thread::Builder::new()
+            .name(format!("scan-{id}"))
+            .spawn(move || {
+                crate::scan_worker::run_worker(id, device, ctrl, store, notify);
+                running.store(false, Ordering::SeqCst);
+            })
+            .expect("spawn scan worker");
     }
 
     fn active_of(&self, id: u64) -> Option<ActiveHandle> {
@@ -352,7 +355,7 @@ mod tests {
         let slow = crate::testutil::SlowDev::wrap(dev, Duration::from_millis(30));
         let s = m.start(slow).unwrap();
         m.pause(s.task_id).unwrap();
-        let row = wait_for_state(&m, s.task_id, ScanState::Paused, Duration::from_secs(5));
+        wait_for_state(&m, s.task_id, ScanState::Paused, Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(250)); // 驻停稳定窗口
         let a = m.status(s.task_id).unwrap().read_bytes;
         std::thread::sleep(Duration::from_millis(200));
@@ -360,10 +363,8 @@ mod tests {
         assert_eq!(a, b, "驻停后读量冻结（worker 在条目边界不再前进）");
         m.resume(s.task_id).unwrap();
         wait_for_state(&m, s.task_id, ScanState::Completed, Duration::from_secs(20));
-        // 注意：row 的 read/found 可能为 0（暂停早于首条）——此处只断言终态与条目完整性
         let (total, _) = m.results(s.task_id, 0, 10, false).unwrap();
         assert_eq!(total, 3);
-        let _ = row;
     }
 
     #[test]
