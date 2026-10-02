@@ -1,0 +1,1799 @@
+<!-- © 2026 erik · https://erik.xyz · erik@erik.xyz -->
+
+# 小盾 M1a 实施计划：FAT/exFAT 引擎地基（xd-fs-fat + 合成镜像工具）
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 交付 `xd-fs-fat` 引擎（FAT12/16/32 快速扫描 + 删除文件找回 + 字节级读取）与 `xd-fixtures` 合成镜像构建器——「镜像里删掉的文件 → 扫出来 → 原样读回」在测试中字节级成立。
+
+**Architecture:** `xd-fixtures` 纯内存构建合法 FAT 镜像（BPB/FAT 表/目录项严格按规范布局，删除=首字节 0xE5 + FAT 链释放、后续分配优先复用释放簇——模拟真实删除后覆盖）。`xd-fs-fat` 只依赖 `xd-device::BlockDevice`（任意偏移只读），零平台耦合：BPB 解析（结构判定 FAT32）→ FAT 表访问（FAT12 半字节寻址/16/32 掩码）→ 目录项解析（SFN 0x05 quirk、小写标志、LFN 组含被删孤儿）→ 递归扫描 + 质量分级 → 链读/连续回退读文件。引擎自持结果类型，M1b 的协议层再做映射（引擎零依赖 xd-core，避免循环依赖）。
+
+**Tech Stack:** Rust（edition 2024）、仅 workspace 既有依赖（serde/serde_json/tempfile），无新增第三方 crate。
+
+**边界（本计划明确不做，各自有后续计划）：** exFAT（独立格式解析，M1a2）；雕刻 carving（M1c）；契约 v1/daemon 并发/任务状态机（M1b）；UI 三页（M1d）；设备枚举/提权/打包（M1e）。**FAT32 判定采用"结构优先"**（`root_entry_count==0 && fat16_size==0 && root_cluster>=2` → FAT32；否则按簇数 4085/65525 分 12/16）——与 fatfs 等主流实现一致，使小型 FAT32 测试镜像可行，Microsoft 规范的纯簇数判定仅在病态镜像上不同。
+
+**依赖关系：** T1 → T2 → {T3→T4→T5→T6→T7} → T8。T3 起与 T2 无耦合后可并行，但按单写者规范串行执行。
+
+---
+
+## File Structure（M1a 结束时）
+
+```
+Cargo.toml                          # + members: crates/xd-fixtures, crates/xd-fs-fat
+crates/xd-fixtures/
+  Cargo.toml                        # publish = false
+  src/lib.rs                        # FatImageBuilder（BPB/FAT/目录/文件布局/删除/覆盖复用）
+crates/xd-fs-fat/
+  Cargo.toml                        # 依赖 xd-device；dev-dep xd-fixtures + tempfile
+  src/lib.rs                        # pub mod bpb/fat/dirent/scan; 错误类型 FatError
+  src/bpb.rs                        # 引导扇区解析 + 几何计算 + FAT 类型判定
+  src/fat.rs                        # FAT 表访问：entry/chain/is_free（12/16/32）
+  src/dirent.rs                     # 目录项解析：SFN/LFN/槽分类/名称组装
+  src/scan.rs                       # scan()/read_file()/FatEntry/RecoverQuality
+  tests/roundtrip.rs                # 端到端：镜像 → 扫描 → 读回字节
+fixtures/gen_fat_image.rs           # 由 builder 输出镜像文件的示例（供后续 e2e/手工用）
+```
+
+---
+
+### Task 1: xd-fixtures —— FAT16 合成镜像构建器
+
+**Files:**
+- Modify: `Cargo.toml`（members + 空行分隔）
+- Create: `crates/xd-fixtures/Cargo.toml`、`crates/xd-fixtures/src/lib.rs`
+
+- [ ] **Step 1: 挂入 workspace**
+
+`Cargo.toml` members 追加两行（本任务只需 xd-fixtures，xd-fs-fat 在 Task 3 再加）：
+
+```toml
+members = [
+    "crates/xd-core",
+    "crates/xd-device",
+    "crates/xd-daemon",
+    "crates/xd-ffi",
+    "crates/xd-fixtures",
+]
+```
+
+`crates/xd-fixtures/Cargo.toml`：
+
+```toml
+[package]
+name = "xd-fixtures"
+version.workspace = true
+edition.workspace = true
+publish = false
+```
+
+- [ ] **Step 2: 写失败的测试（`crates/xd-fixtures/src/lib.rs` 末尾测试模块）**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fat16_layout_bytes_are_sane() {
+        let image = FatImageBuilder::fat16().add_file("/", "HELLO.TXT", b"hello world").build();
+        // 引导扇区
+        assert_eq!(image[510], 0x55);
+        assert_eq!(image[511], 0xAA);
+        assert_eq!(u16::from_le_bytes([image[11], image[12]]), 512); // bytes/sector
+        assert_eq!(image[13], 1); // sectors/cluster
+        assert_eq!(u16::from_le_bytes([image[17], image[18]]), 512); // root entries
+        assert_eq!(image[16], 1); // num fats
+        // 文件内容落盘（数据从 data_start 之后的簇 2 开始）
+        let pos = image.windows(11).position(|w| w == b"hello world").unwrap();
+        assert!(pos > 512);
+        // 目录项：存活文件首字节 'H'，属性 0x20
+        let de = image.windows(32).position(|w| &w[..11] == b"HELLO   TXT").unwrap();
+        assert_eq!(image[de + 11], 0x20);
+    }
+
+    #[test]
+    fn deleted_file_has_0xE5_and_freed_fat() {
+        let image = FatImageBuilder::fat16()
+            .add_file("/", "A.BIN", &[1u8; 1000])
+            .delete("/", "A.BIN")
+            .build();
+        let de = image.windows(32).position(|w| w[0] == 0xE5 && &w[8..11] == b"BIN").unwrap();
+        assert_eq!(image[de], 0xE5);
+        // FAT 里原文件两簇已被释放（entry(2)=0, entry(3)=0）
+        let fat_start = 512usize; // reserved=1 → FAT 在第 2 个扇区
+        assert_eq!(u16::from_le_bytes([image[fat_start + 4], image[fat_start + 5]]), 0);
+        assert_eq!(u16::from_le_bytes([image[fat_start + 6], image[fat_start + 7]]), 0);
+    }
+
+    #[test]
+    fn reuse_of_freed_clusters_overlaps() {
+        let image = FatImageBuilder::fat16()
+            .add_file("/", "OLD.BIN", &[7u8; 1024]) // 簇 2..3
+            .delete("/", "OLD.BIN")
+            .add_file("/", "NEW.BIN", &[9u8; 1024]) // 复用 2..3
+            .build();
+        let old = image.windows(32).position(|w| &w[1..5] == b"LD.B").unwrap();
+        assert_eq!(image[old], 0xE5);
+        // 第一个数据簇现在属于 NEW.BIN：NEW 目录项 first_cluster == 2
+        let new = image.windows(32).position(|w| &w[..7] == b"NEW    ").unwrap();
+        assert_eq!(u16::from_le_bytes([image[new + 26], image[new + 27]]), 2);
+    }
+}
+```
+
+- [ ] **Step 3: 运行确认失败**
+
+Run: `cargo test -p xd-fixtures`
+Expected: 编译失败（`FatImageBuilder` 未定义）。
+
+- [ ] **Step 4: 实现 FAT16 构建器**
+
+```rust
+//! 合成 FAT 镜像构建器：测试与 e2e 的全部输入来源（脱开真实硬件）。
+//! 参数固定（T1 只支持 FAT16；T2 扩展 FAT12/32）：bps=512、spc=1、reserved=1、
+//! fats=1、root_entries=512、fat_size=4 扇区、total=4096 扇区（2 MiB）。
+
+pub const BPS: u32 = 512; // bytes per sector
+pub const TOTAL_SECTORS: u32 = 4096;
+
+#[derive(Clone)]
+struct BuildFile {
+    dir: String,          // "/" 或 "/SUB"（T1 仅 "/"）
+    name: [u8; 11],       // 8.3 原始名（大写、空格填充）
+    data: Vec<u8>,
+    deleted: bool,
+    first_cluster: u32,   // build() 时分配
+}
+
+pub struct FatImageBuilder {
+    files: Vec<BuildFile>,
+}
+
+impl FatImageBuilder {
+    pub fn fat16() -> Self {
+        Self { files: Vec::new() }
+    }
+
+    pub fn add_file(&mut self, dir: &str, name: &str, data: &[u8]) -> &mut Self {
+        self.files.push(BuildFile {
+            dir: dir.to_string(),
+            name: encode_sfn(name),
+            data: data.to_vec(),
+            deleted: false,
+            first_cluster: 0,
+        });
+        self
+    }
+
+    pub fn delete(&mut self, dir: &str, name: &str) -> &mut Self {
+        let target = encode_sfn(name);
+        let f = self
+            .files
+            .iter_mut()
+            .find(|f| !f.deleted && f.dir == dir && f.name == target)
+            .expect("delete: file not found");
+        f.deleted = true;
+        self
+    }
+
+    pub fn build(&self) -> Vec<u8> {
+        // 布局（扇区）：
+        //  0        reserved / 引导扇区
+        //  1..5     FAT#1（4 扇区）
+        //  5..37    根目录（512 项 × 32B = 32 扇区）
+        //  37..    数据区（簇 N → 扇区 37 + (N-2)）
+        const FAT_START: u32 = 1;
+        const FAT_SIZE: u32 = 4;
+        const ROOT_START: u32 = FAT_START + FAT_SIZE; // 5
+        const ROOT_SECTORS: u32 = 32;
+        const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 37
+        const MAX_CLUSTER: u32 = 2 + (TOTAL_SECTORS - DATA_START) / 1; // spc=1
+
+        let mut image = vec![0u8; (TOTAL_SECTORS * BPS) as usize];
+
+        // ---- 分配簇（最低空闲优先；删除释放后会被后续文件复用）----
+        let mut next_free: Vec<u32> = (2..MAX_CLUSTER).collect();
+        let mut placed: Vec<(u32, u32, bool, Vec<u8>, usize)> = Vec::new(); // (first,count,deleted,data,file_idx)
+        for (i, f) in self.files.iter().enumerate() {
+            let count = ((f.data.len() as u32) + BPS - 1).max(1) / BPS;
+            let take: Vec<u32> = next_free.drain(..count as usize).collect();
+            let first = take[0];
+            if !f.deleted {
+                // 存活文件写 FAT 链（末簇 EOC=0xFFFF）；删除文件不写链（已释放）
+                for (j, &c) in take.iter().enumerate() {
+                    let entry_off = (FAT_START * BPS + c * 2) as usize;
+                    let value: u16 = if j + 1 == take.len() { 0xFFFF } else { take[j + 1] as u16 };
+                    image[entry_off..entry_off + 2].copy_from_slice(&value.to_le_bytes());
+                }
+            } else {
+                // 释放：把簇还回空闲池（插回列表低端以模拟"优先复用"）
+                for c in take.iter().rev() {
+                    next_free.insert(0, *c);
+                }
+            }
+            placed.push((first, count, f.deleted, f.data.clone(), i));
+        }
+
+        // ---- 写数据 ----
+        for (first, count, _, data, _) in &placed {
+            let start = (DATA_START * BPS + (first - 2) * BPS) as usize;
+            let _ = count;
+            image[start..start + data.len()].copy_from_slice(data);
+        }
+
+        // ---- 根目录项（32B 槽；删除项首字节 0xE5）----
+        let mut slot = ROOT_START * BPS;
+        for (first, _count, deleted, data, idx) in &placed {
+            let f = &self.files[*idx];
+            let mut entry = [0u8; 32];
+            entry[..11].copy_from_slice(&f.name);
+            if *deleted {
+                entry[0] = 0xE5;
+            }
+            entry[11] = 0x20; // ATTR_ARCHIVE
+            entry[26..28].copy_from_slice(&(*first as u16).to_le_bytes());
+            entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            image[slot as usize..slot as usize + 32].copy_from_slice(&entry);
+            slot += 32;
+        }
+
+        // ---- 引导扇区 ----
+        let mut bs = [0u8; 512];
+        bs[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        bs[3..11].copy_from_slice(b"MSDOS5.0");
+        bs[11..13].copy_from_slice(&(BPS as u16).to_le_bytes());
+        bs[13] = 1; // sectors per cluster
+        bs[14..16].copy_from_slice(&1u16.to_le_bytes()); // reserved
+        bs[16] = 1; // num fats
+        bs[17..19].copy_from_slice(&512u16.to_le_bytes()); // root entries
+        bs[19..21].copy_from_slice(&0u16.to_le_bytes()); // total16 = 0（用 total32）
+        bs[21] = 0xF8; // media descriptor
+        bs[22..24].copy_from_slice(&(FAT_SIZE as u16).to_le_bytes());
+        bs[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track（惯例值）
+        bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
+        bs[28..32].copy_from_slice(&37u32.to_le_bytes()); // hidden sectors（惯例）
+        bs[32..36].copy_from_slice(&TOTAL_SECTORS.to_le_bytes());
+        bs[36] = 0x80; // drive number
+        bs[38] = 0x29; // boot signature
+        bs[39..43].copy_from_slice(&0x1234_5678u32.to_le_bytes()); // volume id
+        bs[43..54].copy_from_slice(b"XIAODUN    ");
+        bs[54..62].copy_from_slice(b"FAT16   ");
+        bs[510] = 0x55;
+        bs[511] = 0xAA;
+        image[..512].copy_from_slice(&bs);
+
+        image
+    }
+}
+
+/// "HELLO.TXT" → b"HELLO   TXT"（大写、空格填充、无扩展名时全空格）
+pub fn encode_sfn(name: &str) -> [u8; 11] {
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((b, e)) => (b, e),
+        None => (name, ""),
+    };
+    let mut out = [b' '; 11];
+    for (i, c) in base.bytes().take(8).enumerate() {
+        out[i] = c.to_ascii_uppercase();
+    }
+    for (i, c) in ext.bytes().take(3).enumerate() {
+        out[8 + i] = c.to_ascii_uppercase();
+    }
+    out
+}
+```
+
+（`placed` 的 `count` 与 `idx` 字段在 T1 未全用到是允许的；`let _ = count;` 防未用告警。）
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cargo test -p xd-fixtures`
+Expected: 3 passed。
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock crates/xd-fixtures
+git commit -m "feat(fixtures): FAT16 合成镜像构建器（分配/删除/簇复用）"
+```
+
+---
+
+### Task 2: xd-fixtures —— FAT12 / FAT32 / 子目录支持
+
+**Files:**
+- Modify: `crates/xd-fixtures/src/lib.rs`
+
+- [ ] **Step 1: 写失败的测试（追加到测试模块）**
+
+```rust
+    #[test]
+    fn fat32_structural_fields() {
+        let image = FatImageBuilder::fat32().add_file("/", "A.TXT", b"abc").build();
+        assert_eq!(u16::from_le_bytes([image[17], image[18]]), 0); // root_entries = 0
+        assert_eq!(u16::from_le_bytes([image[22], image[23]]), 0); // fat16_size = 0
+        assert_eq!(u32::from_le_bytes([image[36], image[37], image[38], image[39]]), 64); // fat32_size
+        assert_eq!(u32::from_le_bytes([image[44], image[45], image[46], image[47]]), 2); // root_cluster
+    }
+
+    #[test]
+    fn fat12_boot_sector_and_packing() {
+        let image = FatImageBuilder::fat12().add_file("/", "A.BIN", &[5u8; 600]).build();
+        assert_eq!(u16::from_le_bytes([image[11], image[12]]), 512);
+        assert_eq!(u16::from_le_bytes([image[17], image[18]]), 224); // root entries
+        // FAT12 链：簇 2→3，entry(2)=3 与 entry(3)=EOC 的半字节打包
+        let fat = 512usize; // reserved=1
+        let e2 = ((image[fat + 3] as u32) << 4) | ((image[fat + 4] as u32) & 0x0F);
+        assert_eq!(e2, 3);
+        let e3 = ((image[fat + 4] as u32) >> 4) | ((image[fat + 5] as u32) << 4);
+        assert_eq!(e3, 0xFFF);
+    }
+
+    #[test]
+    fn subdir_has_dot_entries_and_files() {
+        let image = FatImageBuilder::fat16()
+            .add_subdir("/", "DIR")
+            .add_file("/DIR", "IN.TXT", b"inner")
+            .build();
+        // 根下有 DIR 目录项（ATTR_DIRECTORY=0x10，first_cluster ≥ 2）
+        let de = image.windows(32).position(|w| &w[..3] == b"DIR").unwrap();
+        assert_eq!(image[de + 11] & 0x10, 0x10);
+        // 子目录内容区含 "." 与 ".."，以及 IN.TXT；内容可定位
+        assert!(image.windows(11).any(|w| w == b".          "));
+        assert!(image.windows(11).any(|w| w == b"..         "));
+        assert!(image.windows(11).any(|w| w == b"IN      TXT"));
+    }
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test -p xd-fixtures`
+Expected: 编译失败（`fat32`/`fat12`/`add_subdir` 未定义）。
+
+- [ ] **Step 3: 实现三类型布局 + 子目录**
+
+将 `FatImageBuilder` 重构为带布局参数的版本（替换 Task 1 的同名项，测试模块保留）：
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FatType { Fat12, Fat16, Fat32 }
+
+impl FatType {
+    /// (root_entries, fat_size_sectors, reserved, root_cluster, total_sectors)
+    fn layout(self) -> (u16, u32, u32, u32, u32) {
+        match self {
+            FatType::Fat12 => (224, 2, 1, 0, 1024),
+            FatType::Fat16 => (512, 4, 1, 0, 4096),
+            FatType::Fat32 => (0, 64, 32, 2, 2048),
+        }
+    }
+}
+
+pub struct FatImageBuilder {
+    fat_type: FatType,
+    files: Vec<BuildFile>,
+    subdirs: Vec<String>, // 形如 "DIR"
+}
+
+impl FatImageBuilder {
+    pub fn fat12() -> Self { Self { fat_type: FatType::Fat12, files: Vec::new(), subdirs: Vec::new() } }
+    pub fn fat16() -> Self { Self { fat_type: FatType::Fat16, files: Vec::new(), subdirs: Vec::new() } }
+    pub fn fat32() -> Self { Self { fat_type: FatType::Fat32, files: Vec::new(), subdirs: Vec::new() } }
+
+    pub fn add_subdir(&mut self, dir: &str, name: &str) -> &mut Self {
+        assert_eq!(dir, "/", "M1a 构建器仅支持一级子目录");
+        self.subdirs.push(name.to_string());
+        self
+    }
+
+    pub fn add_file(&mut self, dir: &str, name: &str, data: &[u8]) -> &mut Self {
+        self.files.push(BuildFile { dir: dir.to_string(), name: encode_sfn(name), data: data.to_vec(), deleted: false, first_cluster: 0 });
+        self
+    }
+
+    pub fn delete(&mut self, dir: &str, name: &str) -> &mut Self {
+        let target = encode_sfn(name);
+        let f = self.files.iter_mut().find(|f| !f.deleted && f.dir == dir && f.name == target).expect("delete: file not found");
+        f.deleted = true;
+        self
+    }
+```
+
+`build()` 改为通用算法（替换原实现；注释保留布局推导）：
+
+```rust
+    pub fn build(&self) -> Vec<u8> {
+        let (root_entries, fat_size, reserved, root_cluster, total_sectors) = self.fat_type.layout();
+        let root_sectors = ((root_entries as u32) * 32).div_ceil(BPS);
+        let fat_start = reserved;
+        let root_start = fat_start + fat_size;                     // FAT12/16 固定根目录区起点
+        let data_start = root_start + if root_entries > 0 { root_sectors } else { 0 };
+        let max_cluster = 2 + (total_sectors - data_start);
+        let mut image = vec![0u8; (total_sectors * BPS) as usize];
+
+        // 空闲簇池（最低优先）。FAT32 的根目录占簇 2，先从池中划走。
+        let mut next_free: Vec<u32> = (2..max_cluster).collect();
+        let root_cluster_actual = if root_cluster >= 2 { next_free.remove(0) } else { 0 };
+        // 子目录各占一簇
+        let mut dir_clusters: Vec<(String, u32)> = Vec::new();
+        for d in &self.subdirs {
+            dir_clusters.push((d.clone(), next_free.remove(0)));
+        }
+
+        // 分配文件簇（最低空闲优先：删除释放的簇会被后续文件复用）
+        let mut placed: Vec<(u32, u32, bool, Vec<u8>, usize)> = Vec::new();
+        for (i, f) in self.files.iter().enumerate() {
+            let count = ((f.data.len() as u32) + BPS - 1).max(1) / BPS;
+            let take: Vec<u32> = next_free.drain(..count as usize).collect();
+            if !f.deleted {
+                for (j, &c) in take.iter().enumerate() {
+                    if self.fat_type == FatType::Fat12 {
+                        let value: u32 = if j + 1 == take.len() { 0xFFF } else { take[j + 1] };
+                        set_fat12(&mut image, fat_start, c, value);
+                    } else {
+                        let width = if self.fat_type == FatType::Fat32 { 4 } else { 2 };
+                        let off = (fat_start * BPS + c * width) as usize;
+                        let value: u32 = if j + 1 == take.len() {
+                            if width == 4 { 0x0FFF_FFFF } else { 0xFFFF }
+                        } else { take[j + 1] };
+                        if width == 4 {
+                            image[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                        } else {
+                            image[off..off + 2].copy_from_slice(&(value as u16).to_le_bytes());
+                        }
+                    }
+                }
+            } else {
+                for c in take.iter().rev() { next_free.insert(0, *c); }
+            }
+            placed.push((take[0], count, f.deleted, f.data.clone(), i));
+        }
+
+        // 写文件数据
+        for (first, _, _, data, _) in &placed {
+            let start = (data_start * BPS + (first - 2) * BPS) as usize;
+            image[start..start + data.len()].copy_from_slice(data);
+        }
+
+        // 根目录槽
+        let mut slot = (root_start * BPS) as usize;
+        for (dir, cluster) in &dir_clusters {
+            let mut e = [0u8; 32];
+            e[..11].copy_from_slice(&encode_sfn(dir));
+            e[11] = 0x10;
+            e[26..28].copy_from_slice(&(*cluster as u16).to_le_bytes());
+            image[slot..slot + 32].copy_from_slice(&e);
+            slot += 32;
+        }
+        for (first, _, deleted, data, idx) in &placed {
+            if self.files[*idx].dir != "/" { continue; }
+            let mut e = [0u8; 32];
+            e[..11].copy_from_slice(&self.files[*idx].name);
+            if *deleted { e[0] = 0xE5; }
+            e[11] = 0x20;
+            e[26..28].copy_from_slice(&(*first as u16).to_le_bytes());
+            e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            image[slot..slot + 32].copy_from_slice(&e);
+            slot += 32;
+        }
+
+        // 子目录内容区（每个一簇）："." ".." + 成员项
+        for (idx, (dir, cluster)) in dir_clusters.iter().enumerate() {
+            let base = (data_start * BPS + (cluster - 2) * BPS) as usize;
+            let parent_cluster = if root_cluster_actual >= 2 { root_cluster_actual } else { 0 };
+            let mut e = [0u8; 32];
+            e[..11].copy_from_slice(b".          ");
+            e[11] = 0x10;
+            e[26..28].copy_from_slice(&(*cluster as u16).to_le_bytes());
+            image[base..base + 32].copy_from_slice(&e);
+            let mut e = [0u8; 32];
+            e[..11].copy_from_slice(b"..         ");
+            e[11] = 0x10;
+            e[26..28].copy_from_slice(&(parent_cluster as u16).to_le_bytes());
+            image[base + 32..base + 64].copy_from_slice(&e);
+            let mut off = base + 64;
+            for (first, _, deleted, data, fi) in &placed {
+                if self.files[*fi].dir != format!("/{dir}") { continue; }
+                let mut e = [0u8; 32];
+                e[..11].copy_from_slice(&self.files[*fi].name);
+                if *deleted { e[0] = 0xE5; }
+                e[11] = 0x20;
+                e[26..28].copy_from_slice(&(*first as u16).to_le_bytes());
+                e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                image[off..off + 32].copy_from_slice(&e);
+                off += 32;
+            }
+            let _ = idx;
+        }
+
+        // 引导扇区（按类型）
+        let mut bs = [0u8; 512];
+        bs[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        bs[3..11].copy_from_slice(b"MSDOS5.0");
+        bs[11..13].copy_from_slice(&(BPS as u16).to_le_bytes());
+        bs[13] = 1;
+        bs[14..16].copy_from_slice(&(reserved as u16).to_le_bytes());
+        bs[16] = 1;
+        bs[17..19].copy_from_slice(&root_entries.to_le_bytes());
+        bs[19..21].copy_from_slice(&0u16.to_le_bytes());
+        bs[21] = 0xF8;
+        bs[22..24].copy_from_slice(&(if root_entries > 0 { fat_size as u16 } else { 0 }).to_le_bytes());
+        bs[24..26].copy_from_slice(&63u16.to_le_bytes());
+        bs[26..28].copy_from_slice(&255u16.to_le_bytes());
+        bs[28..32].copy_from_slice(&(root_start as u32).to_le_bytes());
+        bs[32..36].copy_from_slice(&total_sectors.to_le_bytes());
+        bs[36] = 0x80;
+        bs[38] = 0x29;
+        bs[39..43].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        bs[43..54].copy_from_slice(b"XIAODUN    ");
+        bs[54..62].copy_from_slice(b"FAT16   ");
+        if root_cluster_actual >= 2 {
+            bs[36..40].copy_from_slice(&(fat_size).to_le_bytes()); // FAT32: fat size 在 36
+            bs[44..48].copy_from_slice(&root_cluster_actual.to_le_bytes());
+            bs[48..50].copy_from_slice(&1u16.to_le_bytes()); // fsinfo sector（声明性质，M1a 不写 fsinfo）
+            bs[54..62].copy_from_slice(b"FAT32   ");
+        }
+        bs[510] = 0x55;
+        bs[511] = 0xAA;
+        image[..512].copy_from_slice(&bs);
+        image
+    }
+```
+
+```rust
+fn set_fat12(image: &mut [u8], fat_start: u32, cluster: u32, value: u32) {
+    let off = (fat_start * BPS + cluster + cluster / 2) as usize;
+    let v = (value & 0x0FFF) as u16;
+    if cluster % 2 == 0 {
+        image[off] = (v & 0xFF) as u8;
+        image[off + 1] = (image[off + 1] & 0xF0) | ((v >> 8) as u8 & 0x0F);
+    } else {
+        image[off] = (image[off] & 0x0F) | (((v << 4) & 0xF0) as u8);
+        image[off + 1] = ((v >> 4) & 0xFF) as u8;
+    }
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test -p xd-fixtures`
+Expected: 6 passed。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xd-fixtures
+git commit -m "feat(fixtures): FAT12/32 布局与子目录支持"
+```
+
+---
+
+### Task 3: xd-fs-fat —— 引导扇区解析（BPB）
+
+**Files:**
+- Modify: `Cargo.toml`（members + `crates/xd-fs-fat`）
+- Create: `crates/xd-fs-fat/Cargo.toml`、`crates/xd-fs-fat/src/lib.rs`、`crates/xd-fs-fat/src/bpb.rs`
+
+- [ ] **Step 1: 创建 crate 骨架**
+
+`Cargo.toml` members 追加 `"crates/xd-fs-fat",`。
+
+`crates/xd-fs-fat/Cargo.toml`：
+
+```toml
+[package]
+name = "xd-fs-fat"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xd-device = { path = "../xd-device" }
+
+[dev-dependencies]
+xd-fixtures = { path = "../xd-fixtures" }
+tempfile = { workspace = true }
+```
+
+`crates/xd-fs-fat/src/lib.rs`：
+
+```rust
+//! FAT12/16/32 只读解析：快速扫描（删除文件找回）与文件读取。
+//! 全部输入经 `xd_device::BlockDevice`（任意偏移只读），零平台耦合。
+
+pub mod bpb;
+pub mod fat;
+pub mod dirent;
+pub mod scan;
+
+/// 引擎统一错误类型。
+#[derive(Debug)]
+pub enum FatError {
+    Device(xd_device::DeviceError),
+    InvalidBpb(String),
+}
+
+impl std::fmt::Display for FatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FatError::Device(e) => write!(f, "device error: {e}"),
+            FatError::InvalidBpb(m) => write!(f, "invalid fat bpb: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for FatError {}
+
+impl From<xd_device::DeviceError> for FatError {
+    fn from(e: xd_device::DeviceError) -> Self {
+        FatError::Device(e)
+    }
+}
+```
+
+（`fat`/`dirent`/`scan` 模块先在 Step 3 建空文件 `// T4/T5/T6 填充` 以便编译；或本步只声明 `pub mod bpb;`，后续任务逐步加行——**采用后者**，避免空文件。）
+
+- [ ] **Step 2: 写失败的测试（`crates/xd-fs-fat/src/bpb.rs` 末尾）**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xd_device::image::ImageFileDevice;
+
+    fn device_with(bytes: &[u8]) -> (tempfile::NamedTempFile, ImageFileDevice) {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        let dev = ImageFileDevice::open(f.path()).unwrap();
+        (f, dev)
+    }
+
+    #[test]
+    fn parses_fat16_builder_image() {
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "A.TXT", b"x").build();
+        let (_f, dev) = device_with(&image);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.fat_type, FatType::Fat16);
+        assert_eq!(bpb.bytes_per_sector, 512);
+        assert_eq!(bpb.root_entry_count, 512);
+        assert_eq!(bpb.root_cluster, 0);
+        // data_start = 1 + 1*4 + 32 = 37 扇区
+        assert_eq!(bpb.data_start_sector, 37);
+        assert_eq!(bpb.total_sectors, 4096);
+    }
+
+    #[test]
+    fn parses_fat32_structurally() {
+        let image = xd_fixtures::FatImageBuilder::fat32().add_file("/", "A.TXT", b"x").build();
+        let (_f, dev) = device_with(&image);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.fat_type, FatType::Fat32);
+        assert_eq!(bpb.root_entry_count, 0);
+        assert_eq!(bpb.root_cluster, 2);
+        // reserved=32, fats=1, fat_size=64 → data_start = 32 + 64 = 96
+        assert_eq!(bpb.data_start_sector, 96);
+    }
+
+    #[test]
+    fn parses_fat12_by_cluster_count() {
+        let image = xd_fixtures::FatImageBuilder::fat12().add_file("/", "A.TXT", b"x").build();
+        let (_f, dev) = device_with(&image);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.fat_type, FatType::Fat12);
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut bad = image.clone();
+        bad[510] = 0;
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+    }
+
+    #[test]
+    fn rejects_bad_bytes_per_sector() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut bad = image.clone();
+        bad[11] = 0;
+        bad[12] = 1; // 256，非法
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+    }
+
+    #[test]
+    fn cluster_and_byte_math() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let (_f, dev) = device_with(&image);
+        let bpb = parse(&dev).unwrap();
+        assert_eq!(bpb.cluster_to_sector(2), 37);
+        assert_eq!(bpb.cluster_to_sector(3), 38);
+        assert_eq!(bpb.cluster_bytes(), 512);
+        assert_eq!(bpb.data_cluster_count(), 4059);
+    }
+}
+```
+
+- [ ] **Step 3: 实现 `crates/xd-fs-fat/src/bpb.rs`**
+
+```rust
+//! 引导扇区（BPB）解析与几何计算。
+//! FAT32 判定：结构优先（root_entry_count == 0 && fat16_size == 0 && root_cluster >= 2），
+//! 否则按数据区簇数 4085/65525 区分 FAT12/16——与 fatfs 等主流实现一致。
+
+use crate::FatError;
+use xd_device::BlockDevice;
+
+pub const SECTOR0_LEN: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatType {
+    Fat12,
+    Fat16,
+    Fat32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bpb {
+    pub fat_type: FatType,
+    pub bytes_per_sector: u16,
+    pub sectors_per_cluster: u8,
+    pub reserved_sectors: u32,
+    pub num_fats: u8,
+    pub root_entry_count: u16,
+    pub total_sectors: u32,
+    pub fat_size_sectors: u32,
+    pub root_cluster: u32,
+    pub fat_start_sector: u32,
+    pub root_start_sector: u32, // FAT12/16 专用；FAT32 为 0
+    pub data_start_sector: u32,
+    pub data_sectors: u32,
+}
+
+impl Bpb {
+    pub fn cluster_bytes(&self) -> u32 {
+        self.bytes_per_sector as u32 * self.sectors_per_cluster as u32
+    }
+
+    pub fn cluster_to_sector(&self, cluster: u32) -> u32 {
+        self.data_start_sector + (cluster - 2) * self.sectors_per_cluster as u32
+    }
+
+    pub fn cluster_to_byte(&self, cluster: u32) -> u64 {
+        self.cluster_to_sector(cluster) as u64 * self.bytes_per_sector as u64
+    }
+
+    pub fn data_cluster_count(&self) -> u32 {
+        self.data_sectors / self.sectors_per_cluster as u32
+    }
+
+    pub fn fat_entry_byte(&self, cluster: u32) -> u64 {
+        let per_entry: u64 = match self.fat_type {
+            FatType::Fat32 => 4,
+            FatType::Fat16 => 2,
+            FatType::Fat12 => u64::MAX, // FAT12 特例，调用方不走此路径
+        };
+        self.fat_start_sector as u64 * self.bytes_per_sector as u64 + cluster as u64 * per_entry
+    }
+}
+
+pub fn parse(dev: &dyn BlockDevice) -> Result<Bpb, FatError> {
+    let mut sector0 = [0u8; SECTOR0_LEN];
+    let n = dev.read_at(0, &mut sector0)?;
+    if n < SECTOR0_LEN {
+        return Err(FatError::InvalidBpb("image smaller than 512 bytes".into()));
+    }
+    if sector0[510] != 0x55 || sector0[511] != 0xAA {
+        return Err(FatError::InvalidBpb("missing 0x55AA boot signature".into()));
+    }
+    let bytes_per_sector = u16::from_le_bytes([sector0[11], sector0[12]]);
+    if ![512u16, 1024, 2048, 4096].contains(&bytes_per_sector) {
+        return Err(FatError::InvalidBpb(format!("bad bytes per sector: {bytes_per_sector}")));
+    }
+    let sectors_per_cluster = sector0[13];
+    if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() || sectors_per_cluster > 128 {
+        return Err(FatError::InvalidBpb(format!("bad sectors per cluster: {sectors_per_cluster}")));
+    }
+    let reserved_sectors = u16::from_le_bytes([sector0[14], sector0[15]]) as u32;
+    let num_fats = sector0[16];
+    if num_fats == 0 {
+        return Err(FatError::InvalidBpb("zero fat count".into()));
+    }
+    let root_entry_count = u16::from_le_bytes([sector0[17], sector0[18]]);
+    let total_sectors = {
+        let t16 = u16::from_le_bytes([sector0[19], sector0[20]]) as u32;
+        let t32 = u32::from_le_bytes([sector0[32], sector0[33], sector0[34], sector0[35]]);
+        if t16 != 0 { t16 } else { t32 }
+    };
+    if total_sectors == 0 {
+        return Err(FatError::InvalidBpb("zero total sectors".into()));
+    }
+    let fat16_size = u16::from_le_bytes([sector0[22], sector0[23]]) as u32;
+    let fat32_size = u32::from_le_bytes([sector0[36], sector0[37], sector0[38], sector0[39]]) & 0x0FFF_FFFF;
+    let root_cluster = u32::from_le_bytes([sector0[44], sector0[45], sector0[46], sector0[47]]) & 0x0FFF_FFFF;
+
+    let (fat_type, fat_size_sectors) = if root_entry_count == 0 && fat16_size == 0 {
+        if root_cluster < 2 {
+            return Err(FatError::InvalidBpb("fat32 without root cluster".into()));
+        }
+        if fat32_size == 0 {
+            return Err(FatError::InvalidBpb("fat32 without fat size".into()));
+        }
+        (FatType::Fat32, fat32_size)
+    } else {
+        if fat16_size == 0 {
+            return Err(FatError::InvalidBpb("no fat size".into()));
+        }
+        (FatType::Fat16, fat16_size) // 先按 16 占位，下面按簇数改为 12
+    };
+
+    let root_sectors = ((root_entry_count as u32) * 32).div_ceil(bytes_per_sector as u32);
+    let fat_start_sector = reserved_sectors;
+    let root_start_sector = if fat_type == FatType::Fat32 { 0 } else { fat_start_sector + fat_size_sectors * num_fats as u32 };
+    let data_start_sector = if fat_type == FatType::Fat32 {
+        fat_start_sector + fat_size_sectors * num_fats as u32
+    } else {
+        root_start_sector + root_sectors
+    };
+    if data_start_sector >= total_sectors {
+        return Err(FatError::InvalidBpb("data area beyond device".into()));
+    }
+    let data_sectors = total_sectors - data_start_sector;
+
+    let fat_type = if fat_type == FatType::Fat32 {
+        FatType::Fat32
+    } else {
+        let clusters = data_sectors / sectors_per_cluster as u32;
+        if clusters < 4085 { FatType::Fat12 } else { FatType::Fat16 }
+    };
+
+    Ok(Bpb {
+        fat_type,
+        bytes_per_sector,
+        sectors_per_cluster,
+        reserved_sectors,
+        num_fats,
+        root_entry_count,
+        total_sectors,
+        fat_size_sectors,
+        root_cluster,
+        fat_start_sector,
+        root_start_sector,
+        data_start_sector,
+        data_sectors,
+    })
+}
+```
+
+`lib.rs` 更新为 `pub mod bpb;`（加 `pub mod fat;` 等在各任务中逐步加）。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 6 passed。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Cargo.toml Cargo.lock crates/xd-fs-fat
+git commit -m "feat(fs-fat): BPB 解析与几何计算（结构优先判型）"
+```
+
+---
+
+### Task 4: xd-fs-fat —— FAT 表访问（12/16/32）
+
+**Files:**
+- Modify: `crates/xd-fs-fat/src/lib.rs`（+`pub mod fat;`）
+- Create: `crates/xd-fs-fat/src/fat.rs`
+
+- [ ] **Step 1: 写失败的测试（`fat.rs` 末尾）**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bpb;
+    use xd_device::image::ImageFileDevice;
+
+    fn dev_for(image: &[u8]) -> (tempfile::NamedTempFile, ImageFileDevice) {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(image).unwrap();
+        f.flush().unwrap();
+        let dev = ImageFileDevice::open(f.path()).unwrap();
+        (f, dev)
+    }
+
+    #[test]
+    fn follows_fat16_chain_and_reports_eoc() {
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "A.BIN", &[0u8; 1200]).build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        assert_eq!(fat.entry(2).unwrap(), 3);
+        assert!(fat.is_eoc_reachable(4).unwrap()); // 1200B → 3 簇：2→3→4(EOC)
+        assert_eq!(fat.chain(2).unwrap(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn follows_fat32_chain_with_mask() {
+        let image = xd_fixtures::FatImageBuilder::fat32().add_file("/", "A.BIN", &[0u8; 1200]).build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        // 根目录占簇 2，文件从簇 3 起：1200B → 3 簇 3→4→5(EOC)
+        assert_eq!(fat.chain(3).unwrap(), vec![3, 4, 5]);
+        assert!(fat.is_eoc_reachable(5).unwrap());
+    }
+
+    #[test]
+    fn follows_fat12_nibble_packing() {
+        let image = xd_fixtures::FatImageBuilder::fat12().add_file("/", "A.BIN", &[0u8; 1200]).build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        assert_eq!(fat.chain(2).unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn is_free_reports_freed_clusters() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &[0u8; 1024])
+            .delete("/", "GONE.BIN")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        assert!(fat.is_free(2).unwrap());
+        assert!(fat.is_free(3).unwrap());
+    }
+
+    #[test]
+    fn broken_chain_for_deleted_file_yields_short_chain() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &[0u8; 1024])
+            .delete("/", "GONE.BIN")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        assert_eq!(fat.chain(2).unwrap(), vec![2]); // 首跳即断（0=free）
+    }
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 编译失败（`fat` 模块未定义）。
+
+- [ ] **Step 3: 实现 `crates/xd-fs-fat/src/fat.rs`**
+
+```rust
+//! FAT 表访问：按需读取单个表项（不整表载入——32GB 卡的 FAT 可达 128MB）。
+//! ponytail: 每次查询一次 read_at；如需扫描吞吐再引入扇区缓存/预读。
+
+use crate::bpb::{Bpb, FatType};
+use crate::FatError;
+use xd_device::BlockDevice;
+
+pub struct Fat<'d> {
+    dev: &'d dyn BlockDevice,
+    bpb: &'d Bpb,
+}
+
+impl<'d> Fat<'d> {
+    pub fn new(dev: &'d dyn BlockDevice, bpb: &'d Bpb) -> Self {
+        Self { dev, bpb }
+    }
+
+    /// 读取 cluster 的表项原值（已按类型掩码）。
+    pub fn entry(&self, cluster: u32) -> Result<u32, FatError> {
+        match self.bpb.fat_type {
+            FatType::Fat32 => {
+                let mut b = [0u8; 4];
+                self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
+                Ok(u32::from_le_bytes(b) & 0x0FFF_FFFF)
+            }
+            FatType::Fat16 => {
+                let mut b = [0u8; 2];
+                self.dev.read_at(self.bpb.fat_entry_byte(cluster), &mut b)?;
+                Ok(u16::from_le_bytes(b) as u32)
+            }
+            FatType::Fat12 => {
+                let off = self.bpb.fat_start_sector as u64 * self.bpb.bytes_per_sector as u64
+                    + (cluster + cluster / 2) as u64;
+                let mut b = [0u8; 2];
+                self.dev.read_at(off, &mut b)?;
+                let pair = u16::from_le_bytes(b) as u32;
+                Ok(if cluster % 2 == 0 { pair & 0x0FFF } else { pair >> 4 })
+            }
+        }
+    }
+
+    pub fn is_free(&self, cluster: u32) -> Result<bool, FatError> {
+        Ok(self.entry(cluster)? == 0)
+    }
+
+    fn is_eoc(&self, value: u32) -> bool {
+        match self.bpb.fat_type {
+            FatType::Fat12 => value >= 0x0FF8,
+            FatType::Fat16 => value >= 0xFFF8,
+            FatType::Fat32 => value >= 0x0FFF_FFF8,
+        }
+    }
+
+    /// `entry` 指向链尾（含 EOC/**保留值/坏簇**——都视为不可继续）。
+    pub fn is_eoc_reachable(&self, cluster: u32) -> Result<bool, FatError> {
+        let v = self.entry(cluster)?;
+        Ok(self.is_eoc(v) || v == 1) // 1 = 保留值（坏簇标记亦按链尾处理）
+    }
+
+    /// 从 start 顺链读取簇号序列（含 start）。守卫：环/超长链（≤ 全盘簇数 + 2）。
+    pub fn chain(&self, start: u32) -> Result<Vec<u32>, FatError> {
+        let mut out = vec![start];
+        let mut cur = start;
+        let limit = self.bpb.data_cluster_count() + 2;
+        while out.len() as u32 <= limit {
+            let v = self.entry(cur)?;
+            if v == 0 || self.is_eoc(v) || v == 1 {
+                break;
+            }
+            if v < 2 || v > limit {
+                break; // 越界值按断链处理
+            }
+            out.push(v);
+            cur = v;
+        }
+        Ok(out)
+    }
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 11 passed（6 + 5）。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xd-fs-fat
+git commit -m "feat(fs-fat): FAT 表访问（12 半字节/16/32 掩码、链与 EOC）"
+```
+
+---
+
+### Task 5: xd-fs-fat —— 目录项解析（SFN / LFN / 槽分类）
+
+**Files:**
+- Modify: `crates/xd-fs-fat/src/lib.rs`（+`pub mod dirent;`）
+- Create: `crates/xd-fs-fat/src/dirent.rs`
+
+- [ ] **Step 1: 写失败的测试（`dirent.rs` 末尾）**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_plain_sfn() {
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(b"HELLO   TXT");
+        raw[11] = 0x20;
+        let e = parse_slot(&raw);
+        assert_eq!(e, Slot::Sfn(Sfn { name83: *b"HELLO   TXT", attr: 0x20, first_cluster: 0, size: 0, deleted: false }));
+    }
+
+    #[test]
+    fn decodes_deleted_sfn_first_byte_05_quirk() {
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(b"\x05EVIL  TXT"); // 真实名以 0xE5 开头时磁盘上写 0x05
+        raw[11] = 0x20;
+        let e = parse_slot(&raw);
+        let Slot::Sfn(s) = e else { panic!() };
+        assert_eq!(assemble_sfn_name(&s.name83, 0), "\u{E5}EVIL.TXT");
+    }
+
+    #[test]
+    fn deleted_sfn_is_marked_and_name_loses_first_char() {
+        let mut raw = [0u8; 32];
+        raw[..11].copy_from_slice(b"\xE5HOTO   JPG");
+        raw[11] = 0x20;
+        let Slot::Sfn(s) = parse_slot(&raw) else { panic!() };
+        assert!(s.deleted);
+        assert_eq!(assemble_sfn_name(&s.name83, 0), "?HOTO.JPG"); // 首字符不可知
+    }
+
+    fn lfn_chars_to_slot(seq: u8, last: bool, text: &str) -> LfnSlot {
+        LfnSlot {
+            seq_raw: if last { seq | 0x40 } else { seq },
+            chars: text.encode_utf16().collect(),
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn lfn_assembly_alive_uses_seq_order() {
+        // 物理序：先末段（seq=2|0x40）后首段（seq=1）；组装按 seq 升序还原
+        let a = lfn_chars_to_slot(2, true, "ng_na");
+        let b = lfn_chars_to_slot(1, false, "my_lO");
+        assert_eq!(assemble_lfn(&[a, b]), "my_lOng_na");
+    }
+
+    #[test]
+    fn lfn_assembly_deleted_orphan_reverses_physical_run() {
+        // 删除后 seq 字节全丢（0xE5）：按物理逆序拼接（run 内物理顺序是尾→头）
+        let mk = |text: &str| LfnSlot { seq_raw: 0xE5, chars: text.encode_utf16().collect(), deleted: true };
+        let slots = vec![mk("0.bin"), mk("my_ph")]; // 物理序：先尾段 "0.bin" 后头段 "my_ph"
+        assert_eq!(assemble_lfn(&slots), "my_ph0.bin");
+    }
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 编译失败。
+
+- [ ] **Step 3: 实现 `crates/xd-fs-fat/src/dirent.rs`**
+
+```rust
+//! 目录项解析：32 字节槽 → Sfn / Lfn / End / Free；名称组装（含删除项重建）。
+
+pub const ATTR_LFN: u8 = 0x0F;
+pub const ATTR_DIRECTORY: u8 = 0x10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sfn {
+    pub name83: [u8; 11],
+    pub attr: u8,
+    pub first_cluster: u32,
+    pub size: u32,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfnSlot {
+    /// 原始 seq 字节：存活项含顺序与 0x40 末标；删除项恒为 0xE5（序信息已丢）。
+    pub seq_raw: u8,
+    pub chars: Vec<u16>,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    Sfn(Sfn),
+    Lfn(LfnSlot),
+    End, // 0x00：目录结束（其后均为空闲区）
+}
+
+/// 分类一个 32 字节槽。
+pub fn parse_slot(raw: &[u8; 32]) -> Slot {
+    if raw[0] == 0x00 {
+        return Slot::End;
+    }
+    let deleted = raw[0] == 0xE5;
+    if raw[11] == ATTR_LFN {
+        let mut chars = Vec::with_capacity(13);
+        for &(a, b) in &[(1usize, 10usize), (14, 25), (28, 31)] {
+            let mut i = a;
+            while i < b + 1 && i + 1 <= 31 {
+                let u = u16::from_le_bytes([raw[i], raw[i + 1]]);
+                if u == 0x0000 || u == 0xFFFF {
+                    break;
+                }
+                chars.push(u);
+                i += 2;
+            }
+        }
+        return Slot::Lfn(LfnSlot { seq_raw: raw[0], chars, deleted });
+    }
+    let mut name83 = [0u8; 11];
+    name83.copy_from_slice(&raw[..11]);
+    Slot::Sfn(Sfn {
+        name83,
+        attr: raw[11],
+        first_cluster: ((u16::from_le_bytes([raw[20], raw[21]]) as u32) << 16)
+            | u16::from_le_bytes([raw[26], raw[27]]) as u32,
+        size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+        deleted,
+    })
+}
+
+/// 组装 8.3 名。`lcase` 为属性字节（bit3=基名小写, bit4=扩展名小写）；删除项首字符不可知 → '?'。
+pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
+    let mut base: Vec<u8> = name83[..8].iter().copied().take_while(|&c| c != b' ').collect();
+    let ext: Vec<u8> = name83[8..].iter().copied().take_while(|&c| c != b' ').collect();
+    let first_deleted = base.first() == Some(&0xE5);
+    if let Some(f) = base.first_mut() {
+        if *f == 0x05 {
+            *f = 0xE5; // 0x05 → 真实的 0xE5 首字节（非删除）
+        } else if *f == 0xE5 {
+            *f = b'?'; // 删除项首字符丢失
+        }
+    }
+    let _ = first_deleted;
+    let apply = |bytes: &mut [u8], lower: bool| {
+        if lower {
+            for b in bytes.iter_mut() {
+                *b = b.to_ascii_lowercase();
+            }
+        }
+    };
+    apply(&mut base, lcase & 0x08 != 0);
+    let mut ext = ext;
+    apply(&mut ext, lcase & 0x10 != 0);
+    let mut out = String::from_utf8_lossy(&base).into_owned();
+    if !ext.is_empty() {
+        out.push('.');
+        out.push_str(&String::from_utf8_lossy(&ext));
+    }
+    out
+}
+
+/// 组装 LFN。存活：按 seq 升序（0x40 标志在最后一段）。删除：物理序为尾→头，逆序拼接。
+pub fn assemble_lfn(slots: &[LfnSlot]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if slots.iter().all(|s| s.deleted) {
+        for s in slots.iter().rev() {
+            parts.push(String::from_utf16_lossy(&s.chars));
+        }
+    } else {
+        let mut ordered: Vec<&LfnSlot> = slots.iter().filter(|s| !s.deleted).collect();
+        ordered.sort_by_key(|s| s.seq_raw & 0x1F);
+        for s in ordered {
+            parts.push(String::from_utf16_lossy(&s.chars));
+        }
+    }
+    parts.concat()
+}
+
+/// 解析一整块目录数据（bps 对齐扇区的连续字节）为合并后的条目序列。
+/// 规则：紧邻 SFN 之前、连续的 LFN 槽组归属该 SFN；End 槽终止解析。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedEntry {
+    pub name: String,
+    pub attr: u8,
+    pub first_cluster: u32,
+    pub size: u32,
+    pub deleted: bool,
+    pub is_dir: bool,
+    pub has_lfn: bool,
+}
+
+pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
+    let mut out = Vec::new();
+    let mut lfn_run: Vec<LfnSlot> = Vec::new();
+    for chunk in data.chunks_exact(32) {
+        let raw: &[u8; 32] = chunk.try_into().expect("chunks_exact(32)");
+        match parse_slot(raw) {
+            Slot::End => break,
+            Slot::Lfn(l) => lfn_run.push(l),
+            Slot::Free => {}
+            Slot::Sfn(s) => {
+                // 连续性校验：LFN run 与 SFN 同为存活或同为删除才配对（简化：仅要求非空）
+                let (name, has_lfn) = if lfn_run.is_empty() {
+                    (assemble_sfn_name(&s.name83, s.attr), false)
+                } else {
+                    let joined = assemble_lfn(&lfn_run);
+                    let fallback = assemble_sfn_name(&s.name83, s.attr);
+                    let name = if joined.trim().is_empty() { fallback } else { joined };
+                    (name, true)
+                };
+                lfn_run.clear();
+                out.push(ParsedEntry {
+                    name,
+                    attr: s.attr,
+                    first_cluster: s.first_cluster,
+                    size: s.size,
+                    deleted: s.deleted,
+                    is_dir: s.attr & ATTR_DIRECTORY != 0 && !s.deleted,
+                    has_lfn,
+                });
+            }
+        }
+    }
+    out
+}
+```
+
+（测试辅助随之实现：`lfn_chars_to_slot(seq, last, text) -> LfnSlot` 把 `text` 的 UTF-16 码元填入 `chars`，`seq_raw = if last { seq | 0x40 } else { seq }`（`last=false` 且 seq=0 的删除用例传 `seq_raw: 0xE5, deleted: true` 由测试直接构造 `LfnSlot`）。为消除测试歧义：**测试模块的辅助函数完整写法**——实现者照做：
+
+```rust
+    fn lfn_chars_to_slot(seq: u8, last: bool, text: &str) -> LfnSlot {
+        LfnSlot { seq_raw: if last { seq | 0x40 } else { seq }, chars: text.encode_utf16().collect(), deleted: false }
+    }
+```
+并把 `lfn_assembly_deleted_orphan_reverses_physical_run` 用例改为直接构造删除槽：
+
+```rust
+    #[test]
+    fn lfn_assembly_deleted_orphan_reverses_physical_run() {
+        let mk = |text: &str| LfnSlot { seq_raw: 0xE5, chars: text.encode_utf16().collect(), deleted: true };
+        let slots = vec![mk("0.bin"), mk("my_ph")];
+        assert_eq!(assemble_lfn(&slots), "my_ph0.bin");
+    }
+```
+）
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 16 passed（11 + 5）。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xd-fs-fat
+git commit -m "feat(fs-fat): 目录项解析（SFN/LFN、0x05 与 0xE5 quirk、删除孤儿重建）"
+```
+
+---
+
+### Task 6: xd-fs-fat —— 扫描（递归 + 质量分级）
+
+**Files:**
+- Modify: `crates/xd-fs-fat/src/lib.rs`（+`pub mod scan;`）
+- Create: `crates/xd-fs-fat/src/scan.rs`
+
+- [ ] **Step 1: 写失败的测试（`scan.rs` 末尾）**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xd_device::image::ImageFileDevice;
+
+    fn dev_for(image: &[u8]) -> (tempfile::NamedTempFile, ImageFileDevice) {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(image).unwrap();
+        f.flush().unwrap();
+        let dev = ImageFileDevice::open(f.path()).unwrap();
+        (f, dev)
+    }
+
+    #[test]
+    fn finds_live_and_deleted_files() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "LIVE.TXT", b"alive")
+            .add_file("/", "GONE.JPG", &[9u8; 700])
+            .delete("/", "GONE.JPG")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let live = entries.iter().find(|e| e.name == "LIVE.TXT").unwrap();
+        assert!(!live.deleted);
+        assert_eq!(live.quality, RecoverQuality::Complete);
+        let gone = entries.iter().find(|e| e.deleted).unwrap();
+        assert!(gone.deleted);
+        assert_eq!(gone.size_bytes, 700);
+        assert_eq!(gone.quality, RecoverQuality::Complete); // 全簇空闲
+    }
+
+    #[test]
+    fn deleted_name_loses_first_char_or_uses_lfn() {
+        // SFN 删除名首字符丢失 → "?ONE.JPG"
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.JPG", &[1u8; 300])
+            .delete("/", "GONE.JPG")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let d = entries.iter().find(|e| e.deleted).unwrap();
+        assert!(d.name.starts_with('?'), "expected '?ONE.JPG', got {}", d.name);
+    }
+
+    #[test]
+    fn overwritten_clusters_grade_maybe_damaged() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "OLD.BIN", &[7u8; 1024])
+            .delete("/", "OLD.BIN")
+            .add_file("/", "NEW.BIN", &[9u8; 1024]) // 复用簇
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let old = entries.iter().find(|e| e.deleted).unwrap();
+        assert_eq!(old.quality, RecoverQuality::MaybeDamaged);
+    }
+
+    #[test]
+    fn recurses_subdirectories() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_subdir("/", "PHOTOS")
+            .add_file("/PHOTOS", "IMG.JPG", &[3u8; 100])
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let img = entries.iter().find(|e| e.name == "IMG.JPG").unwrap();
+        assert_eq!(img.path, "/PHOTOS");
+        // 目录项本身也在结果里
+        assert!(entries.iter().any(|e| e.name == "PHOTOS" && e.is_dir));
+    }
+
+    #[test]
+    fn scans_fat32_and_fat12_images() {
+        for builder in [xd_fixtures::FatImageBuilder::fat32(), xd_fixtures::FatImageBuilder::fat12()] {
+            let image = builder.add_file("/", "K.TXT", b"ok").build();
+            let (_f, dev) = dev_for(&image);
+            let entries = scan(&dev).unwrap();
+            assert!(entries.iter().any(|e| e.name == "K.TXT"), "scan failed for {:?}", entries);
+        }
+    }
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 编译失败（`scan` 未定义）。
+
+- [ ] **Step 3: 实现 `crates/xd-fs-fat/src/scan.rs`**
+
+```rust
+//! 快速扫描：目录遍历（根 + 子目录）+ 删除文件找回 + 质量分级 + 文件读取。
+
+use crate::bpb::{self, Bpb, FatType};
+use crate::dirent::{self, ParsedEntry};
+use crate::fat::Fat;
+use crate::FatError;
+use xd_device::BlockDevice;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverQuality {
+    /// 数据簇全部空闲，且长度按连续假设可得
+    Complete,
+    /// 有簇已被重新分配（覆盖风险），或簇信息缺失
+    MaybeDamaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FatEntry {
+    pub name: String,
+    pub path: String, // "/" 或 "/DIR"
+    pub size_bytes: u64,
+    pub first_cluster: u32,
+    pub deleted: bool,
+    pub is_dir: bool,
+    pub quality: RecoverQuality,
+    pub ext: String, // 小写，无扩展名 = ""
+}
+
+const MAX_ENTRIES: usize = 200_000;
+const MAX_DEPTH: u32 = 32;
+
+pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<FatEntry>, FatError> {
+    let bpb = bpb::parse(dev)?;
+    let fat = Fat::new(dev, &bpb);
+    let mut out = Vec::new();
+    if bpb.fat_type == FatType::Fat32 {
+        scan_cluster_dir(dev, &bpb, &fat, bpb.root_cluster, "/", 0, &mut out)?;
+    } else {
+        scan_fixed_root(dev, &bpb, &fat, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// FAT12/16 固定根目录。
+fn scan_fixed_root(dev: &dyn BlockDevice, bpb: &Bpb, fat: &Fat, out: &mut Vec<FatEntry>) -> Result<(), FatError> {
+    let root_bytes = ((bpb.root_entry_count as u32) * 32) as usize;
+    let mut buf = vec![0u8; root_bytes];
+    let start = bpb.root_start_sector as u64 * bpb.bytes_per_sector as u64;
+    dev.read_at(start, &mut buf)?;
+    let parsed = dirent::parse_directory_bytes(&buf);
+    append_parsed(dev, bpb, fat, parsed, "/", 0, out)
+}
+
+/// 簇链目录（FAT32 根与所有子目录）。
+fn scan_cluster_dir(
+    dev: &dyn BlockDevice,
+    bpb: &Bpb,
+    fat: &Fat,
+    start_cluster: u32,
+    path: &str,
+    depth: u32,
+    out: &mut Vec<FatEntry>,
+) -> Result<(), FatError> {
+    if depth > MAX_DEPTH || out.len() > MAX_ENTRIES {
+        return Ok(());
+    }
+    let mut data = Vec::new();
+    let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
+    for c in fat.chain(start_cluster)? {
+        let n = dev.read_at(bpb.cluster_to_byte(c), &mut buf)?;
+        if n < buf.len() {
+            break;
+        }
+        data.extend_from_slice(&buf);
+        if data.len() > 64 * 1024 * 1024 {
+            break; // 防御：目录不可能这么大
+        }
+        // 提前终止：已含 End 槽则不再读后续簇（性能优化可选，M1a 保留全读）
+    }
+    let parsed = dirent::parse_directory_bytes(&data);
+    append_parsed(dev, bpb, fat, parsed, path, depth, out)
+}
+
+fn append_parsed(
+    dev: &dyn BlockDevice,
+    bpb: &Bpb,
+    fat: &Fat,
+    parsed: Vec<ParsedEntry>,
+    path: &str,
+    depth: u32,
+    out: &mut Vec<FatEntry>,
+) -> Result<(), FatError> {
+    for e in parsed {
+        let ext = e.name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).unwrap_or_default();
+        let quality = if e.is_dir {
+            RecoverQuality::Complete
+        } else if e.deleted {
+            grade_deleted(fat, bpb, e.first_cluster, e.size)?
+        } else {
+            RecoverQuality::Complete
+        };
+        out.push(FatEntry {
+            name: e.name.clone(),
+            path: path.to_string(),
+            size_bytes: e.size as u64,
+            first_cluster: e.first_cluster,
+            deleted: e.deleted,
+            is_dir: e.is_dir,
+            quality,
+            ext,
+        });
+        // 只递归存活目录（已删除目录的簇可能被再分配，M1a 不深入）
+        if e.is_dir && !e.deleted && e.first_cluster >= 2 {
+            let child_path = if path == "/" { format!("/{}", e.name) } else { format!("{path}/{}", e.name) };
+            scan_cluster_dir(dev, bpb, fat, e.first_cluster, &child_path, depth + 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// 删除文件质量分级：按连续簇假设检查每个簇是否空闲。
+fn grade_deleted(fat: &Fat, bpb: &Bpb, first_cluster: u32, size: u32) -> Result<RecoverQuality, FatError> {
+    if size == 0 {
+        return Ok(RecoverQuality::Complete);
+    }
+    if first_cluster < 2 {
+        return Ok(RecoverQuality::MaybeDamaged); // 无簇信息（如删除后 first_cluster 被清零）
+    }
+    let need = (size as u32).div_ceil(bpb.cluster_bytes());
+    let max_cluster = bpb.data_cluster_count() + 1;
+    for i in 0..need {
+        let c = first_cluster + i;
+        if c > max_cluster {
+            return Ok(RecoverQuality::MaybeDamaged); // 越界：表项不可信
+        }
+        if !fat.is_free(c)? {
+            return Ok(RecoverQuality::MaybeDamaged);
+        }
+    }
+    Ok(RecoverQuality::Complete)
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 21 passed（16 + 5）。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xd-fs-fat
+git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
+```
+
+---
+
+### Task 7: xd-fs-fat —— 文件读取（链读 + 连续回退）
+
+**Files:**
+- Modify: `crates/xd-fs-fat/src/scan.rs`
+
+- [ ] **Step 1: 写失败的测试（追加到 `scan.rs` 测试模块）**
+
+```rust
+    #[test]
+    fn reads_live_file_exactly() {
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "DATA.BIN", &data).build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "DATA.BIN").unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes, data);
+    }
+
+    #[test]
+    fn reads_deleted_file_via_contiguous_fallback() {
+        let data: Vec<u8> = (0..1200u32).map(|i| (i % 253) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "GONE.BIN", &data)
+            .delete("/", "GONE.BIN")
+            .build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.deleted).unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes, data); // 删除后 FAT 链已清 → 连续回退精确还原
+    }
+
+    #[test]
+    fn reads_exact_size_not_full_cluster() {
+        let data = b"short".to_vec(); // 5 字节 < 1 簇
+        let image = xd_fixtures::FatImageBuilder::fat32().add_file("/", "S.TXT", &data).build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "S.TXT").unwrap();
+        assert_eq!(read_file(&dev, e).unwrap(), data);
+    }
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 编译失败（`read_file` 未定义）。
+
+- [ ] **Step 3: 实现（追加到 `scan.rs`）**
+
+```rust
+/// 读取文件内容（恰好 size 字节）。
+/// 策略：先顺 FAT 链读；链长不足（删除后 FAT 已清）→ 按连续簇回退。
+pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, FatError> {
+    if entry.size_bytes == 0 || entry.first_cluster < 2 {
+        return Ok(Vec::new());
+    }
+    let bpb = bpb::parse(dev)?;
+    let fat = Fat::new(dev, &bpb);
+    let size = entry.size_bytes as usize;
+    let need = (size as u32).div_ceil(bpb.cluster_bytes()) as usize;
+    let chain = fat.chain(entry.first_cluster)?;
+    let clusters: Vec<u32> = if chain.len() >= need {
+        chain[..need].to_vec()
+    } else {
+        (0..need as u32).map(|i| entry.first_cluster + i).collect() // 连续假设
+    };
+    let mut out = Vec::with_capacity(size);
+    let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
+    for c in clusters {
+        let n = dev.read_at(bpb.cluster_to_byte(c), &mut buf)?;
+        if n < buf.len() {
+            break;
+        }
+        out.extend_from_slice(&buf);
+        if out.len() >= size {
+            break;
+        }
+    }
+    out.truncate(size);
+    Ok(out)
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 24 passed（21 + 3）。
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/xd-fs-fat
+git commit -m "feat(fs-fat): 文件读取（链读 + 连续回退，精确 size）"
+```
+
+---
+
+### Task 8: 端到端 —— 镜像文件 → 扫描 → 字节级找回
+
+**Files:**
+- Create: `crates/xd-fs-fat/tests/roundtrip.rs`、`fixtures/gen_fat_image.rs`
+
+- [ ] **Step 1: 写端到端测试 `crates/xd-fs-fat/tests/roundtrip.rs`**
+
+```rust
+//! M1a 出口标准：合成镜像落盘 → BlockDevice 打开 → 扫描 → 读回删除文件
+//! 的字节与原始数据完全一致（「U 盘删照片」的镜像版）。
+
+use xd_device::image::ImageFileDevice;
+
+#[test]
+fn deleted_photo_recovered_byte_exact_from_image_file() {
+    // 造一张"相机卡"：500 字节的"照片"（内容确定），删掉它
+    let photo: Vec<u8> = (0..500u32).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+    let image_bytes = xd_fixtures::FatImageBuilder::fat16()
+        .add_subdir("/", "DCIM")
+        .add_file("/DCIM", "IMG_0001.JPG", &photo)
+        .add_file("/", "READ_ME.TXT", b"keep me")
+        .delete("/DCIM", "IMG_0001.JPG")
+        .build();
+
+    // 落盘为镜像文件，走真实 BlockDevice 通路
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    use std::io::Write;
+    f.write_all(&image_bytes).unwrap();
+    f.flush().unwrap();
+    let dev = ImageFileDevice::open(f.path()).unwrap();
+
+    // 扫描
+    let entries = xd_fs_fat::scan::scan(&dev).unwrap();
+    let photo_entry = entries
+        .iter()
+        .find(|e| e.deleted && e.ext == "jpg")
+        .expect("deleted jpg not found");
+    assert_eq!(photo_entry.size_bytes, 500);
+
+    // 字节级找回
+    let recovered = xd_fs_fat::scan::read_file(&dev, photo_entry).unwrap();
+    assert_eq!(recovered, photo, "recovered bytes differ from original");
+
+    // 存活文件不受影响
+    assert!(entries.iter().any(|e| e.name == "READ_ME.TXT" && !e.deleted));
+}
+```
+
+- [ ] **Step 2: 运行确认通过（全 crate 测试）**
+
+Run: `cargo test -p xd-fs-fat`
+Expected: 25 passed（24 + 1，含新 e2e）。
+
+（若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
+
+- [ ] **Step 3: 写镜像生成示例 `fixtures/gen_fat_image.rs`（供后续 M1b e2e 与手工调试）**
+
+```rust
+// 生成一张含"已删除照片"的 FAT16 镜像到文件：
+//   cargo run -p xd-fixtures --example gen_fat_image -- /tmp/xd-fat.img
+fn main() {
+    let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/xd-fat.img".into());
+    let photo: Vec<u8> = (0..65_536u32).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+    let image = xd_fixtures::FatImageBuilder::fat16()
+        .add_subdir("/", "DCIM")
+        .add_file("/DCIM", "IMG_0001.JPG", &photo)
+        .delete("/DCIM", "IMG_0001.JPG")
+        .build();
+    std::fs::write(&path, &image).unwrap();
+    println!("wrote {} ({} bytes)", path, image.len());
+}
+```
+
+放在 `crates/xd-fixtures/examples/gen_fat_image.rs`（Cargo example 机制），运行验证：
+
+Run: `cargo run -p xd-fixtures --example gen_fat_image -- /tmp/xd-fat.img`
+Expected: `wrote /tmp/xd-fat.img (2097152 bytes)`
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/xd-fs-fat/tests crates/xd-fixtures/examples
+git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
+```
+
+---
+
+## M1a 出口验收
+
+- [ ] `cargo test --workspace --locked` 全绿；`cargo clippy --workspace --all-targets --locked -- -D warnings` 零告警
+- [ ] `cargo fmt --all --check` 干净
+- [ ] 端到端测试 `deleted_photo_recovered_byte_exact_from_image_file` 通过（字节级）
+- [ ] `cargo run -p xd-fixtures --example gen_fat_image` 能产出可被 `xd-daemon` 后续切片直接挂载的镜像
+- [ ] `bash scripts/apply-copyright.sh` 对新文件补版权头（幂等）；`provenance.sha256` 重生成（若本计划作为发布前工作）
+
+## 后续切片（各自独立计划）
+
+- **M1a2**：exFAT 解析（目录项集 0x85/0xC0/0xC1、簇位图、删除位）
+- **M1b**：契约 v1（`scan.start`/`scan.progress`/`scan.results` 事件流）+ daemon 并发（writer 串行化 + 扫描任务线程）+ 任务状态机 + xd-core 编排（把 `xd-fs-fat` 的结果映射为协议消息）
+- **M1c**：`xd-carving`（JPEG/PNG 签名雕刻 v1）
+- **M1d**：UI 三页（扫描控制/结果浏览/预览）+ 恢复导出（异设备校验 + 报告）
+- **M1e**：物理设备枚举（Linux `/dev/sdX` 先行）+ 提权（Linux polkit）+ Linux 打包；Windows/macOS 平台层单独排期
+
+---
+
+© 2026 erik · https://erik.xyz · erik@erik.xyz
