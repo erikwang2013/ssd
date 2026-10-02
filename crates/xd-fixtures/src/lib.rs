@@ -162,6 +162,11 @@ impl FatImageBuilder {
             }
             next_free.sort_unstable();
             let count = (f.data.len() as u32).div_ceil(BPS).max(1);
+            assert!(
+                next_free.len() >= count as usize,
+                "簇池不足：需要 {count} 簇，仅剩 {}（夹具卷太小）",
+                next_free.len()
+            );
             let take: Vec<u32> = next_free.drain(..count as usize).collect();
             if f.deleted_at.is_none() {
                 // 存活文件写 FAT 链（末簇 EOC）；删除文件不写链（已释放）
@@ -211,6 +216,23 @@ impl FatImageBuilder {
         }
 
         // ---- 根目录槽（FAT32 时 root_start 字节地址恰好落在簇 2 = 根目录簇）----
+        // 槽位容量 fail-fast（静默溢出会覆盖活文件数据簇）
+        let root_file_count = placed
+            .iter()
+            .filter(|(_, _, fi)| self.files[*fi].dir == "/")
+            .count();
+        if root_entries == 0 {
+            assert!(
+                dir_clusters.len() + root_file_count <= BPS as usize / 32,
+                "FAT32 根目录单簇容量不足（最多 {} 项）",
+                BPS as usize / 32
+            );
+        } else {
+            assert!(
+                dir_clusters.len() + root_file_count <= root_entries as usize,
+                "根目录项超出 root_entries={root_entries}"
+            );
+        }
         let mut slot = (root_start * BPS) as usize;
         for (dir, cluster) in &dir_clusters {
             let mut e = [0u8; 32];
@@ -238,6 +260,15 @@ impl FatImageBuilder {
 
         // ---- 子目录内容区（每个一簇）："." ".." + 成员项 ----
         for (dir, cluster) in &dir_clusters {
+            let members = placed
+                .iter()
+                .filter(|(_, _, fi)| self.files[*fi].dir == format!("/{dir}"))
+                .count();
+            assert!(
+                members + 2 <= BPS as usize / 32,
+                "子目录 {dir} 成员超出单簇容量（最多 {} + 2）",
+                BPS as usize / 32 - 2
+            );
             let base = (data_start * BPS + (cluster - 2) * BPS) as usize;
             let parent_cluster = root_cluster_actual; // FAT12/16 为 0
             let mut e = [0u8; 32];
