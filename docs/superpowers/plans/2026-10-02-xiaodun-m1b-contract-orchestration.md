@@ -230,7 +230,7 @@ cargo add rusqlite -p xd-core --features bundled
 ```
 （随后把生成的 `rusqlite = "x.y"` 提为 workspace 依赖、xd-core 引 `workspace = true`——与仓库既有依赖风格一致。）
 
-> **执行后同步（T2）**：定版为 rusqlite **0.40.2**（bundled，libsqlite3-sys 0.38.2）。本任务正文代码**非 rustfmt-clean**——`store.rs` 以 rustfmt 后形态为准（语义经 token 级比对：7 处非空白差异全为尾逗号/let-else 展开，68/68 字符串常量逐字相同）。测试清单执行后为 **12 个**（计划 8 + `reinsert_same_key_replaces_row`〔INSERT OR REPLACE 同键替换〕/ `set_progress_roundtrips` / `unknown_state_reads_as_failed` / `entries_and_clear_are_task_scoped`——后三者为 qual 缺口补测，代码以 `store.rs` 为准）。
+> **执行后同步（T2）**：定版为 rusqlite **0.40.2**（bundled，libsqlite3-sys 0.38.2）。本任务正文代码**非 rustfmt-clean**——`store.rs` 以 rustfmt 后形态为准（语义经 token 级比对：7 处非空白差异全为尾逗号/let-else 展开，68/68 字符串常量逐字相同）。测试清单执行后为 **12 个**（计划 8 + `reinsert_same_key_replaces_row`〔INSERT OR REPLACE 同键替换〕/ `set_progress_roundtrips` / `unknown_state_reads_as_failed` / `entries_and_clear_are_task_scoped`——后三者为 qual 缺口补测，代码以 `store.rs` 为准）。**后续变更注**：M1c T7 起改为 **WAL + `synchronous=NORMAL`**（513 条目 139→**8288-10265 条/秒**〔spec 独立复测口径〕，「进程崩溃零丢失」限定为**已提交事务**层面；见 M1c 计划 T7 与 `store.rs` 头注）——本任务正文「不开 WAL」为历史记录。
 
 - [ ] **Step 1: 写 store.rs（完整代码；新文件首行带水印头）**
 

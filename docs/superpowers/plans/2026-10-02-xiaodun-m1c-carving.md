@@ -1229,6 +1229,12 @@ git commit -m "feat(carving): 顺序块扫描器 + 深扫编排（mode:deep/-320
 
 ### Task 7: 深扫检查点与断点续跑（设计 §4.4 约束 3 的真实兑现）
 
+> **执行后同步（实现以仓库为规格；本节正文为旧稿，三处已被裁定修正）**：
+> 1. **检查点必须配对写**：`set_carved_offset(id, offset, found)` → 单条 `UPDATE tasks SET carved_offset=?2, found_count=?3`；**不变量真口径**：「凡 `idx < found_count` 的已落库条目，其 `byte_offset < carved_offset`」（旧稿 `carved_offset = self.scanned` 的 session 口径错误；旧测试断言 `carved_offset ≥ 已落库条目 byte_offset` 被证伪——条目侧无此保证）。检查点**不节流**（节流致断点滞后且测试不确定）——但必须与 found 同帧，否则续跑以滞后 idx 重编号、`INSERT OR REPLACE` 静默覆盖检查点前的旧行（**spec-t7 阻断缺陷，daemon 级丢 128/358 条实证**）。
+> 2. **续跑点 = `carved_offset` 原值，不做回退**：`at ≥ buf_end−7` 恒成立（重叠已在窗口推进）；自 at 续扫经每个真 Scanned 事件逐点穷举**无损无重**；回退 7 字节会重报已雕容器尾部的嵌入签名（幻影实锤 extra=[4195331]）。原先 lead 的 -7 回退裁定被实施者探针**否证并撤回**。
+> 3. **Step 2 的 deep-over-IPC 测试已真实落地**（`deep_scan_sigkill_resume_matches_uninterrupted_run_pointwise`：真 SIGKILL → 同 --db 重启 → 与不中断参照逐点相等；定位器用 `scan.results.total` 而非 `status.foundCount`——后者依赖配对写，旧实现下恒 0 会钝化牙口）——旧稿的「允许降级并说明」条款作废。
+> 4. **库错路径（裁定）**：配对写与 insert 都保持 `let _ =`（既有「库错不中断扫描」健壮性设计）；README 已加限定——**库写错误（磁盘满/IO）时结果可能缺行**，请保证 `--db` 盘空间。备选「库错置 Failed」待 Store trait 化（M1d/M2）时复议。**属已知限制，非阻断**。
+
 > **前置性能账（qual-m1b-t6 移交）**：`insert_entries` 现为**每条目独立事务 + `synchronous=FULL`** ≈ **6.9ms/条目 fsync**（513 条目 ext4 3.5s vs tmpfs 59ms）。深扫的条目频次与快扫同量级、且 carving 的 I/O 更重——**本任务须评估并落地其一**：(a) worker 侧小批量缓冲提交（如每 64 条或每 250ms 事务批量，崩溃语义=丢末批≤64 条 vs "崩溃保部分结果"的诚实边界，文档写明）；(b) WAL + `synchronous=NORMAL`（单进程 daemon 崩溃安全与性能权衡）。选型要有量化探针（ext4 实测前后条目/秒）与语义声明，写进本任务提交信息。
 >
 > **Cursor 预读缓冲（qual-m1c-t6 移交，本任务落地）**：量化实证——JPEG 熵段逐字节 `cur.u8()` ⇒ **每字节一次 `read_at`**（20KB JPEG=20,014 次调用、avg 2.00B；PNG 仅 13 次）。外推 64MiB JPEG ≈ **6.7×10⁷ 次 1B pread**（对 4MiB 窗口扫描放大 ~4×10⁶）。判定：M1c 可接受，**M1d 真机性能门阻塞项**。最小改法：`signatures.rs` 的 `Cursor` 加内部预读缓冲（64KiB，按绝对 offset 命中；注意 jpeg.rs 会直改 `cur.pos` 回退 1/2，缓存 miss 即重填），语义保持（take 仍精确读满；refill Err/0 → None）；**配 CountingDev 不变量测试**（20KB JPEG carve 的 read_at 调用数 < 字节数/1024 + C）。
@@ -1432,6 +1438,15 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 - **设计偏差记录**：`ScanKind`/`Active.kind` 改为 boxed `WorkerFn` + 持久化 `scan_mode` 承载 T7 分派（功能等价）——T7 需按 mode 分派 + 断点续跑重解 freespace（闭包内 runs 不可从库恢复）。
 - **T8 携带项**：decoy 必须用**空壳形**（`FFD8 FFFF D9` 零上报）；`FFD8FF+垃圾` 会如实上报 4 字节 stub（`garbage_after_soi_reports_stub` 已记录）。
 - **doc nits（已清）**：exfat freespace 头注分层说明；deep `CarveProgress` 补「库错不中断」注释（found/idx 照进、库内可缺行——T7 断点设计知情）。
+
+### T7（断点续跑 + Cursor 预读 + insert 批量）—— impl-m1c-t7。提交沿革：`4149e29` → `fb5d266` → `d9c0d0d` → **`185d34e`（阻断修复）**。DONE → spec **FAIL（阻断：静默丢条）** → 修复 → 增量复审 **PASS（关闭）**（373/0；355→373）
+
+- **阶段一（续跑/schema v4）**：`carve_runs_from`；**事件拆 `Scanned { scanned, at }`**（session 口径 vs 绝对续扫点——计划 `carved_offset=self.scanned` 是错的，实施者改对）；restart 按 `scan_mode` 分派（deep 保留结果/idx 续号/重解 runs；quick 清表）；spawn_carve 抽取；restart 守卫保留。schema v4 探针：列集精确、Some(0)≠NULL、幂等。
+- **阶段二（Cursor 预读）**：20KB JPEG 雕刻 `read_at` **20,046 → 2**（5 变体 PREFETCH=0/1/3/64KiB 的 p3-dump 全文 sha256 全等——语义保持最强形式）；调用预算 `bytes/1024+6` 对旧实现 1000× 牙口。
+- **阶段三（insert 批量）**：**选型 WAL+`synchronous=NORMAL`**（513 条目 DELETE+FULL 3839ms → Store 真实路径 61.9ms = **8288 条/秒**〔spec 独立复测〕；进程崩溃零丢失限定「已提交事务」层面）。**daemon 测试窗口依赖**：cancel/SIGKILL 测原隐式靠 fsync 撑窗（3.5s→46-62ms，仍 ~590-900× IPC 往返）——已改注记 + 转 M1d 风险记录（第 8 条）。
+- **★ spec-t7 阻断缺陷（本轮最大价值）**：**检查点（carved_offset 不节流写绝对 `at`）与 found_count（节流落库）跨帧不一致** → 续跑以滞后 idx 重编号、`INSERT OR REPLACE` 覆盖检查点前**永不重扫**的旧行 → **静默丢条**（daemon 真 SIGKILL 复现：358→230 丢 128 条〔run0 全灭〕；另一形状丢 64 + 重复 58）。触发面=Scanned 步长 <1MiB 且上次进度 <250ms（**非极端时序**）；既有夹具（≥1MiB 整窗对齐）与实施者测试形状（B=0 立即暂停）**结构性失明**——只有独立探针 + 真进程 kill 照出。**修复 `185d34e`**：配对写（`carved_offset+found_count` 单条 UPDATE 同帧）+ 真不变量句改写 + **两处真回归**（manager 级 run1 暂停 + daemon 级 SIGKILL 逐点比对，1600 条；定位器用 `results.total` 防旧实现钝化）+ README #5/store 头注/性能数纠偏。变异实证：单写旧形态三级全红（guard `0/8` → 丢条 `8/11` → daemon `1200≠1600`）。
+- **-7 回退裁定被否证并撤回（流程亮点）**：lead 裁定「续跑点回退 7 字节」补反方向漏点；实施者以可执行探针否证——`at ≥ buf_end−7` 恒成立（重叠已在窗口推进）、自 at 续扫对每个真 Scanned 事件**逐点无损无重**、回退会重报已雕容器尾部嵌入签名（幻影 extra=[4195331]，spec 独立几何复现逐位相同）→ **采纳反证，裁定撤回**；零重叠变异（`advance_to = buf_end`）k=1..7 静默丢失被协议测杀红（pin 住重叠边界）。
+- **残留（非阻断，已裁定/记录）**：(a) 库错路径（配对写/insert 的 `let _ =`）→ 维持「库错不中断」+ README 限定「库错时可能缺行」；备选「库错置 Failed」待 Store trait 化复议。(b) `wal_normal_crash_semantics_declared` 后半段 `mem::forget` 形状零判别力（已改「形态演示」措辞）；`scan.status` 不暴露 carvedOffset → M1d 排障项（已入 M1d 第 9 条）。
 
 ---
 
