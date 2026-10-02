@@ -912,6 +912,13 @@ git commit -m "feat(carving): PNG chunk 走链重组（CRC 逐块验证/IEND 收
 - [ ] **Step 1: carver.rs（全代码）**
 
 > **T2 移交决策点（qual-m1c-t2 裁定）**：fat `unallocated_runs` 在 **FAT 全表不可读**时退化为 `Ok(空)`，与"全盘已分配"**不可区分**（exfat 位图不可读则 `Err`——有意不对称，保守方向=绝不虚报空闲，已被专测钉死）。**本任务（T6 深扫接线）需显式裁定**：深扫对 fat 空 runs 的 UX 是照常"扫到 0 个"还是需要区分信号？若需要，最小改法 = `runs_from_fat` 记录 `saw_err`，`Err` 场景返回 `Err`（T2 注释已留此路径）；若不需要，在 `unallocated_runs_of` 处加注释记录该取舍。二选一必须显式落纸。
+>
+> **T5 移交清单（qual-m1c-t5，实施前必读；含一条需 T6 裁定的不对称）**：
+> 1. **退化条目上报不对称（需显式裁定）**：PNG 最小非 cap 返回 = **8 = 签名长**（如首块 CRC 坏）→ 走 `Some(e) if e.size >= sig.len()` 生效臂被**当条目上报**（8 字节垃圾条目）；JPEG 退化 len=0/2 < 3 被 `_` 臂静默过滤。**建议裁定**：把生效臂改为 `e.size > sig.len()`（严格大于），退化件仍走 `_` 臂按签名长推进；裁定必须落纸+测试。
+> 2. **PNG 截断欠报语义**：交付到**最后一个完整读取轮**（take 失败不推进游标；欠报 ≤ CRC_BUF-1，绝不过报）→ `pos = offset + size` 会落回断块内部，断块尾部重扫**可能报出嵌在残段里的签名**（符合雕刻语义，但「内嵌不重报」的实现须知情——若此路径产生 < 签名长的残余扫描区，按 `_` 臂推进）。
+> 3. PNG 的 None 只来自首块裁决 → `_` 臂 advance 8 ✓；JPEG None → advance 3 ✓（`Signature::len()` 已分派）。
+> 4. cap 交互：出口归一保证 `size ≤ max_file_bytes` **恒成立**，T6 无需再钳；MAX_CHUNK/MAX_SEGMENT 是 carver 内门。
+> 5. 每候选自建 Cursor、**返回后不读 `cur.pos`**（None → `pos = abs + sig.len()`；Some 且过生效臂 → `pos = offset + size`）——两 carver 的头注契约段已就绪。
 
 ```rust
 // © 2026 erik · https://erik.xyz · erik@erik.xyz
@@ -1403,6 +1410,15 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 - **spec 独立探针**：段长边界 2/65535 过、0/1 截；熵段四分支逐字节（含 8 枚 RST 全查、FF FF 四型）；回退不丢字节（**RecordingDevice 证明读 offset 永不 < start**）；20k FF 终止；60k 随机流零违例；消费契约三分语义完备（T6 不依赖 None 的 pos 终值）。
 - **qual 缺口四枚（全部补测落地）**：(a) cap 恰=完整长度仍 complete（`>` 语义，`>=` 变异专属杀手）；(b) **FF FF D9** 才是回退删除的可杀伤构型（FF FF 00 两写法等价——qual 证伪了我的原假设）→ 并入 test 2；(c) 段中头 cap+1 路径专属测试；(d) len=2 段并入 eoi 夹具。**fuzz 不固化（YAGNI，qual 论证：无索引/无 unwrap，随机流只走浅路径）**。
 - **记录不修**：TEM(0x01) 按带长度段处理（T.81 无长度字段；真实罕见，后果=降级截断）；头注"len=0"保守表述；`walk` 内 ~10 处 `Carved{...}` 重复（算法冻结不重构）。
+
+### T5（PNG 重组）—— impl-m1c-t5。提交沿革：`af03104`（主）→ `2555ebb`（qual 三 pin + chunk 提 pub）。DONE → spec **PASS**（68 探针）→ qual **APPROVED** → 三 pin 有牙（T5 关闭，338/0）
+
+- **计划缺陷/裁定照办**：cut 笔误 `len+8`→**`len+12`**（突变双红钉死）；软上限两处按 T4 裁定修正（数据循环逐轮 cap + 单一出口归一）；crc32 对拍按 T3 注记未重建。
+- **spec 探针**：cut 三档逐字节 pin 到坏块 len 字段首（IHDR 坏→8、IDAT 坏→33、IEND 坏→n-12；链中/relative 同验）；首块四档（非 IHDR/len≠13→None；len=13 全 0→接受；IHDR CRC 坏→8 非 None）；CRC 与 zlib 四方全等（200KB 单块与 215KB 链）；cap 三路径含 CRC 字段（cap<8 返 len=cap）；MAX_CHUNK ±1；穷举 end=8..=89 契约吻合。
+- **qual：10/10 变异有据**。关键分析：(a) **#10 `remaining -= n.min(1)` 非死循环**——终止性由 take 界失败兜底，变异只是破坏"进度=读量对齐"→ 5 测杀；(b) **#9 IEND 删除被出口归一在 #8 上掩盖**（归一化双刃，记录）；(c) **真缺口：PNG run 界诚实截断零覆盖**（两处 take 失败返回改 complete:true → 26 测全绿；残片被当整文件=静默数据损坏）→ pin 落码，**实施者重构出更强的三路径有牙矩阵**（数据段/CRC 字段/块头三条返回各自独立打红，`== end` 更紧）；(d) **MAX_CHUNK 门零覆盖**（7/7b）→ 40 字节级 pin（恰 16MiB 放行至 type=41；+1 在长度字段处=37；删门由第二断言打红）。
+- **IEND len≠0 裁定（spec 定，落地）**：只认 CRC、不校验 len==0——len≠0 属坏编码但结构已收束（CRC 强判据），严格拒收会把尾部单字段损坏升级为整文件不完整；误差方向=提前收束少报。头注 + pin 测试 + 反变（`&& len == 0`）钉死。
+- **T6 移交清单已入 T6 段**：① **退化条目不对称需裁定**（PNG 最小非 cap 返回 8=签名长会被当条目上报；建议生效臂改 `e.size > sig.len()`）；② PNG 截断欠报落回断块内部（断尾重扫可能报出残段签名，符合雕刻语义但 dedup 须知情）；③ None 语义/advance；④ cap 恒成立 T6 无需再钳；⑤ 返回后不读 `pos`。
+- **judgment 备忘**：jpeg `MAX_SEGMENT` 上界零覆盖**不补**（u16 域结构不可达）；fixtures `chunk` 提 pub 后 png 测试两处本地构造全换用（可读性反升）。
 
 ---
 
