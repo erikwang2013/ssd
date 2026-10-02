@@ -1253,6 +1253,27 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<ExfatBoot, ExfatError> {
 **计划外实证**：`boot::parse` 已对真实 `mkfs.exfat` 8MB 镜像跑通（Main stored==calc==912DFBC6、
 fat_offset=2048/fat_length=15/heap=4096/count=1536/root=5、无 Backup 回退）——首次非合成镜像验证。
 
+**修复轮（qual-t2，2026-10-02）**：质量审查 **1 Critical + 1 Important**（均计划文本问题，实现忠实照抄），
+修复提交 `c00e897`：
+
+- **C1（Critical）**：`1u64 << head[108]` 对**未校验字节**移位——"EXFAT 签名合法 + 第 108 字节损坏"（恢复工具的
+  典型输入）→ debug 移位溢出 panic；release 掩码后切片越界/容量溢出 panic。修：签名后、移位前校验 `9..=12`。
+  **geometry 同名守卫保留**——备区路径承重（mutation 实证：删掉会 `Ok{bps_shift:13}` 接受损坏备区）。
+- **I2（Important）**：`rejects_bad_geometry` 断言消息化（逐案子串）+ 回归案 `rejects_bad_bps_shift_without_panic`(108=64)
+  + `backup_geometry_bps_guard_load_bearing`。三层守卫（parse 早期/geometry/6 案断言）均经 mutant 双 profile 实证有判别性；
+  19 个非法 bps 值 × debug/release 全部干净 Err 无 panic。
+- **M3-M6**：上界 `0xFFFF_FFF5`（= 2^32−11，排除 BAD_CLUSTER 0xFFFFFFF7 入合法簇域）；六处错误消息带违例值；
+  `ExfatBoot #[non_exhaustive]`；huge_volume 补 volume_length 断言。
+- **遗留（注释级）**：boot.rs:317 注释把 108=64 的 release 表现写作"容量溢出"，实为掩码后切片越界
+  （63/127/255 之类才是容量溢出）——任意后续提交顺手更正。
+- **T3/T4 提醒**：`active_fat_offset()` 是**扇区单位**，entry_bytes 用 `as u64 * sector_bytes() + cluster as u64 * 4`；
+  T4 开工前若需独立校验，给 xd-fixtures 补 `pub use exfat::{entry_set_checksum, name_hash, fold16}`。
+
+**测试矩阵注记（qual-t2）**：C1 属 **debug/release 行为分歧型**缺陷——CI 现仅跑 debug；M1a2 收尾时把
+`cargo test --workspace --release` 纳入矩阵（至少 xd-fs-exfat 与 xd-fs-fat），并记录于 CI 计划。
+
+计数：xd-fs-exfat **11**、workspace **124**。
+
 ---
 
 ### Task 3: xd-fs-exfat —— 32 位 FAT 与分配位图（fattab.rs + bitmap.rs）
