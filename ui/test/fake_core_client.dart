@@ -20,6 +20,9 @@ class FakeCoreClient implements CoreClient {
   /// scanResults 的数据源（内存分页 + deletedOnly 过滤）。
   final List<ScanEntry> entries;
 
+  /// total 覆盖（契约外场景注入：total 与实际条目不符——分页封口守卫用）。
+  int? totalOverride;
+
   /// 错误注入：按 method 返回非 null 时该次调用抛它（全失败/按方法/flaky 都靠它）。
   final Object? Function(String method)? failWith;
 
@@ -146,7 +149,7 @@ class FakeCoreClient implements CoreClient {
         (deletedOnly ? entries.where((e) => e.deleted) : entries).toList()
           ..sort((a, b) => a.idx.compareTo(b.idx));
     return ScanResultsPage(
-      total: filtered.length,
+      total: totalOverride ?? filtered.length,
       entries: filtered.skip(offset).take(limit).toList(),
     );
   }

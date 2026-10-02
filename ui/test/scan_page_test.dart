@@ -132,11 +132,12 @@ void main() {
     expect(find.byType(LinearProgressIndicator), findsNothing);
     expect(find.text('查看结果 (13)'), findsOneWidget);
 
-    // 导航到 T6 前的 ResultsPage 桩（taskId 透传）
+    // 导航到 T6 结果页（client/taskId 透传；Fake 无条目 → 空态）
     await tester.tap(find.text('查看结果 (13)'));
     await tester.pumpAndSettle(); // 终态后定时器已停，可收敛
     expect(find.text('扫描结果'), findsOneWidget);
-    expect(find.text('任务 #3'), findsOneWidget);
+    expect(fake.scanResultQueries.single.taskId, 3);
+    expect(find.text('没有找到结果'), findsOneWidget);
   });
 
   testWidgets('暂停/恢复：按钮文案切换、调用各一次', (tester) async {

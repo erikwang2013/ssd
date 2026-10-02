@@ -96,7 +96,9 @@ class _ScanPageState extends State<ScanPage> {
     final taskId = _controller.taskId;
     if (taskId == null) return;
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => ResultsPage(taskId: taskId)),
+      MaterialPageRoute<void>(
+        builder: (_) => ResultsPage(client: widget.client, taskId: taskId),
+      ),
     );
   }
 
