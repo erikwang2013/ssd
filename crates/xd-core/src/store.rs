@@ -364,6 +364,33 @@ mod tests {
     }
 
     #[test]
+    fn reinsert_same_key_replaces_row() {
+        let s = Store::open_memory().unwrap();
+        let id = s.create_task("d", "fat", 1).unwrap();
+        s.insert_entries(id, &[entry(0, "OLD.JPG", true)]).unwrap();
+        let mut new = entry(0, "NEW.JPG", false);
+        new.path = "/NEW.JPG".into();
+        new.ext = "jpg".into();
+        new.size_bytes = 999;
+        new.quality = "maybeDamaged".into();
+        new.first_cluster = 42;
+        s.insert_entries(id, std::slice::from_ref(&new)).unwrap();
+        let (total, page) = s.entries(id, 0, 10, false).unwrap();
+        assert_eq!(total, 1, "同 (task_id, idx) 替换不增行");
+        assert_eq!(
+            page,
+            vec![new],
+            "全字段被新行覆盖（M1c 断点续跑重插同一 idx）"
+        );
+        let (total2, _) = {
+            s.insert_entries(id, &[entry(1, "OTHER.JPG", false)])
+                .unwrap();
+            s.entries(id, 0, 10, false).unwrap()
+        };
+        assert_eq!(total2, 2, "不同 idx 正常追加，REPLACE 不误伤新行");
+    }
+
+    #[test]
     fn clear_entries_empties_task() {
         let s = Store::open_memory().unwrap();
         let id = s.create_task("d", "fat", 1).unwrap();
