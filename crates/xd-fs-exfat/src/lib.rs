@@ -4,6 +4,7 @@ pub mod bitmap;
 pub mod boot;
 pub mod dirent;
 pub mod fattab;
+pub mod scan;
 
 /// 与 `xd_fs_fat::FatError` 同构（non_exhaustive）。
 #[derive(Debug)]
