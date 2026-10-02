@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":11,"result":{"total":2,"entries":[{"idx":0,"name":"","path":"","ext":"jpg","sizeBytes":24410,"deleted":true,"isDir":false,"quality":"carved","firstCluster":0,"byteOffset":835584},{"idx":1,"name":"","path":"","ext":"png","sizeBytes":4210,"deleted":true,"isDir":false,"quality":"carved","firstCluster":0,"byteOffset":892928}]}}

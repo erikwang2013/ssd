@@ -3,6 +3,7 @@
 resolver = "3"
 members = [
     "crates/xd-core",
+    "crates/xd-carving",
     "crates/xd-device",
     "crates/xd-daemon",
     "crates/xd-ffi",

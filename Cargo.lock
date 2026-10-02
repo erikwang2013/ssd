@@ -417,6 +417,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xd-carving"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
+ "xd-device",
+ "xd-fixtures",
+ "xd-fs-exfat",
+ "xd-fs-fat",
+]
+
+[[package]]
 name = "xd-core"
 version = "0.2.0"
 dependencies = [
@@ -424,6 +435,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "xd-carving",
  "xd-device",
  "xd-fixtures",
  "xd-fs-exfat",

@@ -6,8 +6,11 @@
 //! 存活；4) SIGKILL 中断 → failed（paused 保留）；5) EACCES → -32001；7) XDG 优先于 HOME。
 //! 6) 的裁定：progress 发射分支（250ms 节流）不做 CI 钉死——只做 `elapsedMs` 语义 + 数量 ≤ 条目数
 //! 的弱判别（真机手测清单另记）；大介质难入 CI。
-//! 慢镜像（[`slow_fat_image_bytes`]，每条目一次 fsync，ext4 上 ~3.5s）是 IPC 层撑开「扫描中」
-//! 窗口的唯一手段（T5 的 SlowDev 是进程内 testutil，IPC 层不可用）。
+//! 慢镜像（[`slow_fat_image_bytes`]，513 条目的 FAT16）是 IPC 层撑开「扫描中」窗口的唯一手段
+//! （T5 的 SlowDev 是进程内 testutil，IPC 层不可用）。**窗口量级（T7 阶段三后）**：落库
+//! 8288-10265 条/秒（WAL+NORMAL，spec-t7 量化，见 `store.rs` 头注）⇒ 513 条目 ≈ 46-62ms，
+//! 仍 ≫ 一次 IPC 往返（亚毫秒）——cancel/SIGKILL 的时序裕度 ~100×。旧注释曾记「每条目 fsync ~3.5s」，那是
+//! T7 前 DELETE+FULL 的账，已随选型 b 作废。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -113,6 +116,104 @@ fn first_image_device(stdin: &mut ChildStdin, rx: &Receiver<serde_json::Value>) 
     id.to_string()
 }
 
+/// 轮询 `scan.results.total` 直到 ≥ `n`（返回命中时已落库条数）。条目边扫边插 ⇒ 该信号
+/// 与检查点是否配对写无关，可在**两种实现下**都停进 run1 的条目相（见深扫续跑测试头注）。
+fn wait_for_results_total(
+    stdin: &mut ChildStdin,
+    rx: &Receiver<serde_json::Value>,
+    task_id: i64,
+    n: u64,
+    timeout: Duration,
+) -> u64 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        send(
+            stdin,
+            json!({"jsonrpc":"2.0","id":902,"method":"scan.results","params":{"taskId":task_id,"offset":0,"limit":1,"deletedOnly":false}}),
+        );
+        let v = read_response(rx, 902, Duration::from_secs(10));
+        let total = v["result"]["total"].as_u64().unwrap();
+        if total >= n {
+            return total;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "等 scan.results.total ≥ {n} 超时（末次 {total}）"
+        );
+    }
+}
+
+/// 拉全量条目（`limit` 契约上限 1000 ⇒ 按 offset 分页取全）→ `(idx, byteOffset, sizeBytes)`
+/// 序列（按 idx 升序，即扫描产出序）。逐点比较的形状：丢条、重报、错号都会现形。
+fn collect_entries(
+    stdin: &mut ChildStdin,
+    rx: &Receiver<serde_json::Value>,
+    task_id: i64,
+) -> Vec<(u64, u64, u64)> {
+    let mut out: Vec<(u64, u64, u64)> = Vec::new();
+    let mut total = u64::MAX;
+    while (out.len() as u64) < total {
+        send(
+            stdin,
+            json!({"jsonrpc":"2.0","id":901,"method":"scan.results","params":{"taskId":task_id,"offset":out.len(),"limit":1000,"deletedOnly":false}}),
+        );
+        let rs = read_response(rx, 901, Duration::from_secs(10));
+        total = rs["result"]["total"].as_u64().unwrap();
+        let page = rs["result"]["entries"].as_array().unwrap();
+        assert!(
+            !page.is_empty(),
+            "分页停滞（offset {} < total {total}）",
+            out.len()
+        );
+        out.extend(page.iter().map(|e| {
+            (
+                e["idx"].as_u64().unwrap(),
+                e["byteOffset"].as_u64().unwrap(),
+                e["sizeBytes"].as_u64().unwrap(),
+            )
+        }));
+    }
+    assert_eq!(out.len() as u64, total, "分页须取全");
+    out.sort_unstable();
+    out
+}
+
+/// 深扫续跑夹具（spec-t7 阻断的 daemon 级形状）：exFAT 1MiB 卷 + **两个空闲区间**，
+/// run0 埋 40 枚（512B 间距）、run1 埋 1560 枚（256B 间距；间距 > png 长 61B ⇒ 互不重叠）。
+/// run0 刻意压到 40 枚（相位 ~5ms ≪ 250ms）：节流进度若在 run1 的 `Scanned` 上触发，会
+/// 与配对写**同值同帧**地落 `found_count`（单写旧实现被顺手治好、牙被磨钝）——run0 相位
+/// 越短，该掩蔽所需的时钟停顿倍数越高（5ms → 需 ~50× 停顿，实测不复现）。run1 的 1560 条
+/// 把条目相撑到 ≫ IPC 往返：观测到 total > 40 后仍有充裕余量才收尾。
+///
+/// 几何（实测自 `xd_fs_exfat::freespace::unallocated_runs`，非头注猜读——早期版本按
+/// 「数据自簇 6=24576」硬编码，把 run0 首埋点写进了根目录簇 5，镜像位图即不可读、
+/// 深扫 -32005 响亮拒绝）：4KiB 簇、数据堆簇 n 字节 = 16384+(n-2)*4096、簇 2 位图 /
+/// 3-4 upcase / 5 根目录；BIG.TMP 占簇 6..80、LIVE.TXT 簇 81 ⇒ 空闲 run0 = 簇 6..80
+/// = [32768, 339968)，run1 = 簇 82..253 = [344064, 1048576)（区间间隙 4096B ≥ 7）。
+/// 埋点自各区间起点 +4096（避开续跑点回退 7B 的量级，亦不压区间首簇头）。布局漂移会以
+/// 「计数不吃夹具断言 / 深扫拒绝」形态**响亮**失败（不是静默失明）。
+fn deep_resume_image_bytes() -> Vec<u8> {
+    const RUN0: u64 = 32768;
+    const RUN1: u64 = 344064;
+    let mut img = xd_fixtures::ExfatImageBuilder::new()
+        .add_file("/", "BIG.TMP", &[0u8; 300 * 1024])
+        .add_file("/", "LIVE.TXT", b"live")
+        .delete("/", "BIG.TMP")
+        .build();
+    let png = xd_fixtures::mini_png(b"deep");
+    for (start, n, step) in [(RUN0, 40u64, 512u64), (RUN1, 1560u64, 256u64)] {
+        for i in 0..n {
+            let off = start + 4096 + i * step;
+            assert!(
+                off + png.len() as u64 <= if start == RUN0 { 339968 } else { 1048576 },
+                "埋点 {off} 越出区间"
+            );
+            xd_fixtures::plant_in_run(&mut img, off, &png);
+        }
+    }
+    img
+}
+
 fn exfat_image_bytes() -> Vec<u8> {
     // 与 xd-core testutil::exfat_fixture 同构：3 条目（2 live + 1 删除）
     xd_fixtures::ExfatImageBuilder::new()
@@ -125,7 +226,8 @@ fn exfat_image_bytes() -> Vec<u8> {
 
 /// 慢扫镜像：FAT16 基础镜像（DCIM 一级子目录 + 一条删除文件），再把根目录区补满
 /// 511 条 `0xE5` 首字节的删除项（槽 0 留给 builder 写的 DCIM）——共 513 条目。
-/// 每条目在 worker 里一次 fsync 落库（T6 实测 ~6.9ms/条，ext4 全图 ~3.5s）：
+/// 每条目在 worker 里一次落库（T7 阶段三后 8288-10265 条/秒 ⇒ 全图 ~46-62ms；T7 前的
+/// DELETE+FULL 是 ~6.9ms/条、全图 ~3.5s——窗口量级仍 ≫ IPC 往返，见文件头注）：
 /// cancel（增补 2）/ SIGKILL（增补 4）的「扫描中」窗口 ≫ 一次 IPC 往返，靠它成立。
 fn slow_fat_image_bytes() -> Vec<u8> {
     let mut b = xd_fixtures::FatImageBuilder::fat16();
@@ -295,7 +397,7 @@ fn pause_resume_over_ipc() {
 }
 
 /// 增补 2：cancel 于扫描中 → ScanCanceled hook 静默（stderr 无 `panicked`）+ finished=canceled
-/// 证明取消真发生。慢镜像（本机实测：513 条目 / 3.5s）把「扫描中」窗口撑到 ≫ 一次 IPC 往返，
+/// 证明取消真发生。慢镜像（513 条目 ≈ 46-62ms 纯落库，spec-t7 量化）把「扫描中」窗口撑到 ≫ 一次 IPC 往返，
 /// 故严格断言 canceled（非二态）；cancel 通常在**首个检查点**即落地（foundCount 尚 0）——
 /// 响应 ok=canceled + finished=canceled 即证明 worker 在场且被取消，而非跑完或没跑。
 #[test]
@@ -440,6 +542,7 @@ fn sigkill_mid_scan_leaves_failed_and_keeps_paused() {
             "慢镜像未撑住窗口：kill 前已有任务跑完（{v}）"
         );
     }
+    // 窗口量级：A 的 513 条目 ≈ 46-62ms 落库（WAL+NORMAL）vs kill 紧随响应（µs 级）——裕度 ~100×。
     child.kill().unwrap(); // Unix 上即 SIGKILL
     let _ = child.wait();
 
@@ -459,6 +562,132 @@ fn sigkill_mid_scan_leaves_failed_and_keeps_paused() {
     assert_eq!(b["result"]["state"], "paused", "paused 跨重启保留：{b}");
     drop(stdin2);
     let _ = child2.wait();
+}
+
+/// 深扫断点续跑的 daemon 级全链路（plan Step 2 的 `deep_scan_over_ipc_with_checkpoint_restart`
+/// 真落地）：深扫 → 暂停驻留在**第二个空闲区间** → SIGKILL → 同 `--db` 重启 → `scan.resume`
+/// （NeedsDevice → daemon 重开设备 → restart 续跑）→ 条目集合与**不中断参照运行逐点相等**。
+/// 判别力（spec-t7 阻断的牙）：暂停时刻 run0 的 40 条已落库而 `found_count` 只有配对检查点
+/// 写过（250ms 节流在 ~5ms 的 run0 相位内不触发）——单写旧实现以滞后计数续号，重扫 run1 的
+/// 同号 REPLACE 覆盖 run0 旧行 → 总数 1560 ≠ 1600、逐点比较必红。
+/// 定位器用 `scan.results.total`（> 400 即 run1 的 Scanned 已处理）而非 `scan.status.foundCount`：
+/// 后者本身**依赖配对写**——单写旧实现下扫描全程恒 0，以它为定位器时命中的是「扫描已收尾」，
+/// 牙会咬在「观测不到」而非配对不变量上（T7 实测：那条路径下报错信息与丢条毫无关系）。
+#[test]
+fn deep_scan_sigkill_resume_matches_uninterrupted_run_pointwise() {
+    let dir = tempfile::tempdir().unwrap();
+    let img_path = dir.path().join("deep.img");
+    std::fs::write(&img_path, deep_resume_image_bytes()).unwrap();
+
+    // 参照：不中断的深扫（独立 --db），基准全量序列
+    let reference = {
+        let ref_db = dir.path().join("ref.db");
+        let (mut child, mut stdin, rx, _err) = spawn_image_daemon(&img_path, &ref_db);
+        let dev_id = first_image_device(&mut stdin, &rx);
+        send(
+            &mut stdin,
+            json!({"jsonrpc":"2.0","id":2,"method":"scan.start","params":{"device":dev_id,"mode":"deep"}}),
+        );
+        let sres = read_response(&rx, 2, Duration::from_secs(10));
+        assert!(
+            sres.get("error").is_none(),
+            "深扫 start 须成功（-32005 = 空闲区间不可枚举：夹具几何/位图坏了）: {sres}"
+        );
+        let task = sres["result"]["taskId"].as_i64().unwrap();
+        let fin = wait_notification(&rx, "scan.finished", Duration::from_secs(60));
+        assert_eq!(fin["params"]["taskId"], task);
+        assert_eq!(fin["params"]["state"], "completed");
+        let entries = collect_entries(&mut stdin, &rx, task);
+        drop(stdin);
+        let _ = child.wait();
+        entries
+    };
+    assert_eq!(
+        reference.len(),
+        1600,
+        "参照全量 = run0 40 + run1 1560（夹具布局漂移必在此响亮失败）"
+    );
+
+    // 中断运行：深扫 → 落库数越过 run0（定位器 = `scan.results.total`，**与配对写无关**：
+    // 条目边扫边插，单写旧实现同样能停进 run1，牙落在配对不变量而非定位器上）→ pause → SIGKILL
+    let db = dir.path().join("t.db");
+    let (mut child, mut stdin, rx, _err) = spawn_image_daemon(&img_path, &db);
+    let dev_id = first_image_device(&mut stdin, &rx);
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":2,"method":"scan.start","params":{"device":dev_id,"mode":"deep"}}),
+    );
+    let task_id = read_response(&rx, 2, Duration::from_secs(10))["result"]["taskId"]
+        .as_i64()
+        .unwrap();
+    let landed = wait_for_results_total(&mut stdin, &rx, task_id, 41, Duration::from_secs(60));
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":906,"method":"scan.status","params":{"taskId":task_id}}),
+    );
+    let st = read_response(&rx, 906, Duration::from_secs(10))["result"].clone();
+    assert_eq!(
+        st["state"], "scanning",
+        "已落库 {landed} 条（> 40 ⇒ run1 的 Scanned 已处理）时仍须在扫描中：{st}"
+    );
+    // 定位阈 41 而非 40：run1 的条目只可能在其窗口的 `Scanned{at=344064}` **之后**产出，
+    // 故 total > 40 是「配对检查点（344064 与条目计数）确已落盘」的**充分**证据——
+    // 若恰停在 40 界上，杀机可能抢在 run1 的 Scanned 之前，检查点仍指 run0（旧实现下
+    // 全量重扫即无损失、牙钝）。阈值 41 把「杀进 run1」从竞态变成确定。
+    assert_eq!(
+        st["foundCount"].as_u64(),
+        Some(40),
+        "扫描中 found_count 必为配对检查点值（= run0 条目数）：节流进度从未写过、\
+         单写旧实现此处 0（滞后计数 → 续号覆盖 run0 旧行 = spec-t7 丢条）"
+    );
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"scan.pause","params":{"taskId":task_id}}),
+    );
+    let p = read_response(&rx, 3, Duration::from_secs(10));
+    assert_eq!(
+        p["result"]["state"], "paused",
+        "深扫中 pause 必须落扫描中（慢夹具撑住窗口的等价判据）：{p}"
+    );
+    child.kill().unwrap(); // SIGKILL：无干净关闭（WAL 恢复路径）
+    let _ = child.wait();
+
+    // 同库重启 → paused 保留 → scan.resume（NeedsDevice → 重开设备 → restart 按检查点续跑）
+    let (mut child2, mut stdin2, rx2, _err2) = spawn_image_daemon(&img_path, &db);
+    send(
+        &mut stdin2,
+        json!({"jsonrpc":"2.0","id":4,"method":"scan.status","params":{"taskId":task_id}}),
+    );
+    let st2 = read_response(&rx2, 4, Duration::from_secs(10));
+    assert_eq!(
+        st2["result"]["state"], "paused",
+        "SIGKILL 后 paused 跨重启保留"
+    );
+    assert_eq!(
+        st2["result"]["foundCount"].as_u64(),
+        Some(40),
+        "配对检查点跨进程存续：found_count 与 carved_offset 同帧（单写旧实现此处 0）"
+    );
+    send(
+        &mut stdin2,
+        json!({"jsonrpc":"2.0","id":5,"method":"scan.resume","params":{"taskId":task_id}}),
+    );
+    let r = read_response(&rx2, 5, Duration::from_secs(10));
+    assert_eq!(
+        r["result"]["state"], "scanning",
+        "resume 须走 NeedsDevice → 重开设备 → restart 续跑：{r}"
+    );
+    let fin2 = wait_notification(&rx2, "scan.finished", Duration::from_secs(60));
+    assert_eq!(fin2["params"]["taskId"], task_id);
+    assert_eq!(fin2["params"]["state"], "completed");
+    let resumed = collect_entries(&mut stdin2, &rx2, task_id);
+    drop(stdin2);
+    let _ = child2.wait();
+
+    assert_eq!(
+        resumed, reference,
+        "续跑条目集合（idx/偏移/大小）必须与不中断参照运行逐点相等"
+    );
 }
 
 /// 增补 5：`chmod 000` 常规文件 + `unix:` id → -32001（懒打开唯一出口的权限映射）。

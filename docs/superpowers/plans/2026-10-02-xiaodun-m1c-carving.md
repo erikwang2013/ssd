@@ -599,6 +599,14 @@ git commit -m "feat(carving): xd-carving 骨架（CRC32/签名/Cursor）+ 夹具
 
 ### Task 4: JPEG 重组（marker 走链 + 熵段 EOI）
 
+> **T3 执行后同步（实施前必读）**：
+> 1. 夹具走**根导出**：`xd_fixtures::{mini_jpeg, mini_png}`（`mod carving` 私有；计划 T4 测试片段的 `xd_fixtures::carving::…` 编译不过）。
+> 2. **勿重复建** crc32 对拍测试（已在 T3 以 `crc32_matches_fixtures_copy` 落地，含全字节域样本）。
+> 3. `xd-carving` 的 `signatures`/`Cursor` 已有仓库内测试（T3 qual 补测）；T4 测试直接用 `crate::signatures::{Cursor, Carved}`。
+> 4. T3 落地勘误：`tiny.png` 实为 **70 字节**（计划 68 是算术错）。
+>
+> **T4 执行后同步（实现以仓库为规格）**：① 计划代码 `!(2..=MAX_SEGMENT as u16).contains(&len)` 是**真 bug**（1MiB 转 u16=0 → 全部段长判非法），仓库修为 `(2..=MAX_SEGMENT).contains(&u32::from(len))`（u16 字段 vs 1MiB 上限结构恒真，真牙口在 T5 的 u32 len）；② 头注「非法记号→拒绝」实际为**截断**（仅非 SOI/未过 SOS 即 EOI 返 None）；③ `max_len` 归一为**返回硬上限**（单一出口 `len.min(max_len)`，被钳即 complete=false；EOI+1 与 FF 填充循环两路径由专属测试钉死）；④ 测试片段的 `xd_fixtures::testdev::dev_from_bytes` 不存在（用本地 dev_for）。
+
 **Files:**
 - Create: `crates/xd-carving/src/jpeg.rs`
 - Modify: `crates/xd-carving/src/lib.rs`（`pub use jpeg::carve_jpeg;`）
@@ -791,6 +799,10 @@ git commit -m "feat(carving): JPEG marker 走链重组（熵段转义/RST/多扫
 
 ### Task 5: PNG 重组（chunk 走链 + CRC + IEND）
 
+> **T3 执行后同步**：夹具 `xd_fixtures::{mini_png, TINY_PNG}` 走根导出（`mod carving` 私有）；`tiny.png` 实为 **70 字节**（计划 68 为笔误）；勿重复建 crc32 对拍（T3 已落地）。
+>
+> **T4 裁定同步（cap=返回硬上限，本任务必须遵守）**：`max_len` 是**返回值硬上限**——任何路径 `len ≤ max_len` 恒成立，越限即诚实截断（complete=false）。PNG 侧同款隐患已由 T4 探针类推出：**chunk 数据读取循环（本计划 T5 代码的 `while remaining > 0`）不查上限**，单个 ≤16MiB 的 chunk 可越限 MAX_CHUNK 量级。实现时：(a) chunk 数据读取循环内每轮查 `cur.pos - start >= max_len` → 截断返回；(b) **单一出口归一**（所有 `Some(Carved)` 出口统一 `len = len.min(max_len)`，被钳则 complete=false）比逐点修更难漏；(c) 加两枚钉死测试：跨上限 chunk（cap 落在数据段中间）与 cap 落在 CRC 字段中。
+
 **Files:**
 - Create: `crates/xd-carving/src/png.rs`
 - Modify: `crates/xd-carving/src/lib.rs`（`pub use png::carve_png;`）
@@ -898,6 +910,15 @@ git commit -m "feat(carving): PNG chunk 走链重组（CRC 逐块验证/IEND 收
 5. `Scanned(累计)` 事件在**每窗口**发出（≤4MiB 粒度：暂停/取消/检查点响应及时）；`Entry` 事件每条雕刻发出；回调返回 `false` = 停止（取消）。
 
 - [ ] **Step 1: carver.rs（全代码）**
+
+> **T2 移交决策点（qual-m1c-t2 裁定）**：fat `unallocated_runs` 在 **FAT 全表不可读**时退化为 `Ok(空)`，与"全盘已分配"**不可区分**（exfat 位图不可读则 `Err`——有意不对称，保守方向=绝不虚报空闲，已被专测钉死）。**本任务（T6 深扫接线）需显式裁定**：深扫对 fat 空 runs 的 UX 是照常"扫到 0 个"还是需要区分信号？若需要，最小改法 = `runs_from_fat` 记录 `saw_err`，`Err` 场景返回 `Err`（T2 注释已留此路径）；若不需要，在 `unallocated_runs_of` 处加注释记录该取舍。二选一必须显式落纸。
+>
+> **T5 移交清单（qual-m1c-t5，实施前必读；含一条需 T6 裁定的不对称）**：
+> 1. **退化条目上报不对称（需显式裁定）**：PNG 最小非 cap 返回 = **8 = 签名长**（如首块 CRC 坏）→ 走 `Some(e) if e.size >= sig.len()` 生效臂被**当条目上报**（8 字节垃圾条目）；JPEG 退化 len=0/2 < 3 被 `_` 臂静默过滤。**建议裁定**：把生效臂改为 `e.size > sig.len()`（严格大于），退化件仍走 `_` 臂按签名长推进；裁定必须落纸+测试。
+> 2. **PNG 截断欠报语义**：交付到**最后一个完整读取轮**（take 失败不推进游标；欠报 ≤ CRC_BUF-1，绝不过报）→ `pos = offset + size` 会落回断块内部，断块尾部重扫**可能报出嵌在残段里的签名**（符合雕刻语义，但「内嵌不重报」的实现须知情——若此路径产生 < 签名长的残余扫描区，按 `_` 臂推进）。
+> 3. PNG 的 None 只来自首块裁决 → `_` 臂 advance 8 ✓；JPEG None → advance 3 ✓（`Signature::len()` 已分派）。
+> 4. cap 交互：出口归一保证 `size ≤ max_file_bytes` **恒成立**，T6 无需再钳；MAX_CHUNK/MAX_SEGMENT 是 carver 内门。
+> 5. 每候选自建 Cursor、**返回后不读 `cur.pos`**（None → `pos = abs + sig.len()`；Some 且过生效臂 → `pos = offset + size`）——两 carver 的头注契约段已就绪。
 
 ```rust
 // © 2026 erik · https://erik.xyz · erik@erik.xyz
@@ -1208,7 +1229,15 @@ git commit -m "feat(carving): 顺序块扫描器 + 深扫编排（mode:deep/-320
 
 ### Task 7: 深扫检查点与断点续跑（设计 §4.4 约束 3 的真实兑现）
 
+> **执行后同步（实现以仓库为规格；本节正文为旧稿，三处已被裁定修正）**：
+> 1. **检查点必须配对写**：`set_carved_offset(id, offset, found)` → 单条 `UPDATE tasks SET carved_offset=?2, found_count=?3`；**不变量真口径**：「凡 `idx < found_count` 的已落库条目，其 `byte_offset < carved_offset`」（旧稿 `carved_offset = self.scanned` 的 session 口径错误；旧测试断言 `carved_offset ≥ 已落库条目 byte_offset` 被证伪——条目侧无此保证）。检查点**不节流**（节流致断点滞后且测试不确定）——但必须与 found 同帧，否则续跑以滞后 idx 重编号、`INSERT OR REPLACE` 静默覆盖检查点前的旧行（**spec-t7 阻断缺陷，daemon 级丢 128/358 条实证**）。
+> 2. **续跑点 = `carved_offset` 原值，不做回退**：`at ≥ buf_end−7` 恒成立（重叠已在窗口推进）；自 at 续扫经每个真 Scanned 事件逐点穷举**无损无重**；回退 7 字节会重报已雕容器尾部的嵌入签名（幻影实锤 extra=[4195331]）。原先 lead 的 -7 回退裁定被实施者探针**否证并撤回**。
+> 3. **Step 2 的 deep-over-IPC 测试已真实落地**（`deep_scan_sigkill_resume_matches_uninterrupted_run_pointwise`：真 SIGKILL → 同 --db 重启 → 与不中断参照逐点相等；定位器用 `scan.results.total` 而非 `status.foundCount`——后者依赖配对写，旧实现下恒 0 会钝化牙口）——旧稿的「允许降级并说明」条款作废。
+> 4. **库错路径（裁定）**：配对写与 insert 都保持 `let _ =`（既有「库错不中断扫描」健壮性设计）；README 已加限定——**库写错误（磁盘满/IO）时结果可能缺行**，请保证 `--db` 盘空间。备选「库错置 Failed」待 Store trait 化（M1d/M2）时复议。**属已知限制，非阻断**。
+
 > **前置性能账（qual-m1b-t6 移交）**：`insert_entries` 现为**每条目独立事务 + `synchronous=FULL`** ≈ **6.9ms/条目 fsync**（513 条目 ext4 3.5s vs tmpfs 59ms）。深扫的条目频次与快扫同量级、且 carving 的 I/O 更重——**本任务须评估并落地其一**：(a) worker 侧小批量缓冲提交（如每 64 条或每 250ms 事务批量，崩溃语义=丢末批≤64 条 vs "崩溃保部分结果"的诚实边界，文档写明）；(b) WAL + `synchronous=NORMAL`（单进程 daemon 崩溃安全与性能权衡）。选型要有量化探针（ext4 实测前后条目/秒）与语义声明，写进本任务提交信息。
+>
+> **Cursor 预读缓冲（qual-m1c-t6 移交，本任务落地）**：量化实证——JPEG 熵段逐字节 `cur.u8()` ⇒ **每字节一次 `read_at`**（20KB JPEG=20,014 次调用、avg 2.00B；PNG 仅 13 次）。外推 64MiB JPEG ≈ **6.7×10⁷ 次 1B pread**（对 4MiB 窗口扫描放大 ~4×10⁶）。判定：M1c 可接受，**M1d 真机性能门阻塞项**。最小改法：`signatures.rs` 的 `Cursor` 加内部预读缓冲（64KiB，按绝对 offset 命中；注意 jpeg.rs 会直改 `cur.pos` 回退 1/2，缓存 miss 即重填），语义保持（take 仍精确读满；refill Err/0 → None）；**配 CountingDev 不变量测试**（20KB JPEG carve 的 read_at 调用数 < 字节数/1024 + C）。
 
 **Files:**
 - Modify: `crates/xd-carving/src/{carver.rs（resume 起点）, lib.rs}`
@@ -1352,6 +1381,81 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 4. 深扫暂停 → 杀进程 → 重启 → resume 从检查点续扫，已雕结果保留（至多一条断点残余重复，README 记为已知局限）。
 5. 恢复率门禁测试入 CI：合成镜像 100% 找回 + 0 假阳性。
 6. 全量门禁绿（debug+release+clippy+fmt+flutter+e2e.sh+e2e-loop.sh）。
+
+---
+
+## 执行记录
+
+### T1（契约 v1.1 + store v2）—— impl-m1c-t1。提交沿革：`9dacc65`（主）→ `11440ce`（qual 缺口补测）。DONE → spec **PASS** → qual ISSUES → 补丁有牙（T1 关闭，295/0）
+
+- **偏差 3 条（最小处置）**：rusqlite 0.40.2 下迁移片段零适配（`.exists([])` 直通）；计划漏两处 `ScanEntry` 字面量波及（scan_worker ×2、handlers filler ×1——全仓 9 个构造点清点无第五处）；**Dart `protocol_v1_test.dart` 的 golden 集合测试必须同步 21→22（计划漏项）**。
+- **spec 四类库探针**：全新库 user_version==2、列集精确（含 byte_offset、无 scan_mode/carved_offset）；手造含数据 v1 库迁移后旧行一字不差 + NULL→None；二次 open 幂等；畸形/只读库如实记录（只读 v1 库现无法 open——迁移需写；生产无只读打开路径，M1d `open_read_only` 场景为已迁移库 ✓ 记录备查）。
+- **qual 变异 8 条**：5 强杀（键省略/无探测 ALTER/读写翻转/limit/golden 全等）；2 等价/冗余（闸门整体删除、None→无键断言为 golden 全等所覆盖）；**2 真缺口当场补测**：①版本标记前进 `assert_eq!(ver, 2)`（T6/T7 迁移将依赖；删 `PRAGMA user_version=2` 变异 red `1/2`）②**迁移前旧行必须 NULL**（`ALTER … DEFAULT 0` 会把未知伪造成"偏移=0"；变异 red `Some(0)/None`）；+ 三态语义 doc 一行（NULL=未知；0 是合法偏移）。
+- **里程碑级排序现实（记录）**：README 声明「deep 自 M1c 起有效」而 handlers 仍拒 deep（-32602）——T6 接线后转正，测试注释已明示。
+
+### T2（两引擎 unallocated_runs）—— impl-m1c-t2。提交沿革：`3a646e9`（主）→ `81a1e54`（MAX_RUNS 截断可测性）→ `f02b54e`（末簇用例 + 文档）。DONE → spec **PASS**（208 探针）→ qual ISSUES(minor) → 补丁两段式有牙（T2 关闭，308/0）
+
+- **计划缺陷 2 处（实施者实修）**：exfat 计划夹具口算错（5000B/1 簇触发 builder fail-fast）→ 自洽构型，断言 `(1+1+244)*cb` 原样成立；`cluster_to_byte(max+1)` 越出函数文档契约域 → `cluster_to_byte(253)+cluster_bytes()`（spec 实算恒等 1048576）。**lead 派发稿 "255" 笔误被 spec 抓出**（255 式=1052672）。
+- **spec 独立探针（含自写 FAT12 nibble 编解码）**：208 PASS/0——17 构型 runs 与 raw 合并逐字段全等；Σ 双通道（引擎 is_free 与 raw）一致；已分配簇 0 落入；奇偶簇边界专测；`>=`→`>` 每引擎恰 2 红。
+- **qual 变异 12 条**：6 KILL；等价 4（exfat Err 死臂——`Bitmap::load` 保证长度、防御性；final-flush 守卫仅 m=0 有判别力；exfat count+2 与线性几何恒等）；**缺口 2（M5/M6 末簇已分配）当场补**——两段式证明：**未加新测时 `2..=max`→`2..max` 变异下 164 项全绿（结构性漏杀：单簇差被 final-flush 补回）**，新测下逐引擎恰 1 红（Σ 超报恰 1 簇）。
+- **裁定与记录**：两引擎合并循环**不抽公共层**（算法冻结、差异在关键处、抽取成本>收益；复访触发=第三个 fs 后端）；**fat「FAT 全表不可读→Ok(空)」与"全盘已分配"不可区分**——保守方向已被专测钉死，**列为 T6 显式决策点**（计划 T6 已注）；exfat 拒绝加"恒真无牙"的 m=0 断言（诚实，非假覆盖）。
+- **流程教训（实施者自查拦下）**：水印拼装 `tail -n +2` 误吞模块 doc 首行——`git diff` 审阅拦下未入库；建议拼装后必 `diff` 首几行。
+- 遗留（防御性代码，记录）：fat final-flush 守卫冗余；`pub fn unallocated_runs`/`MAX_RUNS` doc 已齐（I2 四项）。
+
+### T3（xd-carving 骨架）—— impl-m1c-t3。提交沿革：`2e53d76`（主）→ `3510bc3`（qual 补测）。DONE → spec **PASS** → qual ISSUES → 补丁有牙（T3 关闭，316/0）
+
+- **计划缺陷 4 处（全部计划侧）**：**tiny.png 实为 70 字节**（计划 68 是算术错，base64 本身正确且经 zlib/CRC/inflate 三验）；Step 4 断言切片差 4（取到 "IEND" 而非长度字段，TDD 首跑即红）；`pub mod signatures`（dead_code 所迫，无 `#[allow]` 偷懒）；去 unused import。另：计划 Step 3 伪码自相矛盾处以裁定文本为准（fixtures 独立位算法 + 对拍）。
+- **spec 独立对照**：22 向量四方全等（一次性/三段增量/夹具副本/python zlib）；find_candidates 12 边界；Cursor 20 探针（越界 pos 不动/短读/BE 序）；独立解析器复核两夹具与 tiny.png。
+- **qual 变异 10 条：5 杀，存活全部在 signatures.rs 与 JPEG 夹具结构（零覆盖区，判别力边界=测试边界）**→ 补测四枚（take 精确界/短读停位/skip+BE/正反例）+ 夹具自测 +2 断言（APP0 长度/总长）→ 四变异全杀（M3 双杀=两处独立断言同语义，加强非意外）；crc32 doc 幽灵指涉清理；对拍扩到全 256 字节域（CRC 表 256 项全被跨副本覆盖）。
+- **下游注记（已入 T4/T5 计划）**：夹具走**根导出** `xd_fixtures::{mini_jpeg, mini_png, TINY_PNG}`（`mod carving` 私有）；勿重复建 crc32 对拍；marker 插桩 YAGNI（mini_jpeg(n)+Vec 拼接够用）。
+- 实施者纪律亮点：未把 lead 在飞的计划文档改动扫进提交。
+
+### T4（JPEG 重组）—— impl-m1c-t4。提交沿革：`6fa5e0c`（主）→ `41b710b`（cap 硬上限）→ `688d126`（qual 补测）。DONE → spec **PASS**（era 分离/90 断言×2）→ qual **APPROVED** → 补测有牙（T4 关闭，327/0）
+
+- **计划真 bug（实施者抓，6/7 测试红实证）**：`!(2..=MAX_SEGMENT as u16).contains(&len)`——1MiB 转 u16 **恒为 0** → 每张 JPEG 第一段即截断。修为 `(2..=MAX_SEGMENT).contains(&u32::from(len))`（u16 字段结构恒真；真牙口在 T5 的 u32 len）。qual 变异 10 验证：改回旧式 **7 测试红**（回归护栏成立）。
+- **计划语义空白（实施者探针 + lead 裁定）**：`max_len` 原为"软上限"——EOI 跨界 +1、**FF 填充循环不查上限**（10 万 FF → len=100004，24 倍越限且读穿）、段长读失败 +1。裁定 **cap=返回硬上限**（单一出口归一 `len.min(max_len)`，被钳即 `complete=false`）+ 填充循环逐轮读界；两条机制各被专属测试一对一杀死（N1/N2/N3 矩阵），非冗余。
+- **其余偏差**：头注"非法记号→拒绝"实为截断（按代码改正）；`xd_fixtures::testdev::dev_from_bytes` 不存在（本地 dev_for）；测试 cut 修正 + `FF FF 00` 补例。
+- **spec 独立探针**：段长边界 2/65535 过、0/1 截；熵段四分支逐字节（含 8 枚 RST 全查、FF FF 四型）；回退不丢字节（**RecordingDevice 证明读 offset 永不 < start**）；20k FF 终止；60k 随机流零违例；消费契约三分语义完备（T6 不依赖 None 的 pos 终值）。
+- **qual 缺口四枚（全部补测落地）**：(a) cap 恰=完整长度仍 complete（`>` 语义，`>=` 变异专属杀手）；(b) **FF FF D9** 才是回退删除的可杀伤构型（FF FF 00 两写法等价——qual 证伪了我的原假设）→ 并入 test 2；(c) 段中头 cap+1 路径专属测试；(d) len=2 段并入 eoi 夹具。**fuzz 不固化（YAGNI，qual 论证：无索引/无 unwrap，随机流只走浅路径）**。
+- **记录不修**：TEM(0x01) 按带长度段处理（T.81 无长度字段；真实罕见，后果=降级截断）；头注"len=0"保守表述；`walk` 内 ~10 处 `Carved{...}` 重复（算法冻结不重构）。
+
+### T5（PNG 重组）—— impl-m1c-t5。提交沿革：`af03104`（主）→ `2555ebb`（qual 三 pin + chunk 提 pub）。DONE → spec **PASS**（68 探针）→ qual **APPROVED** → 三 pin 有牙（T5 关闭，338/0）
+
+- **计划缺陷/裁定照办**：cut 笔误 `len+8`→**`len+12`**（突变双红钉死）；软上限两处按 T4 裁定修正（数据循环逐轮 cap + 单一出口归一）；crc32 对拍按 T3 注记未重建。
+- **spec 探针**：cut 三档逐字节 pin 到坏块 len 字段首（IHDR 坏→8、IDAT 坏→33、IEND 坏→n-12；链中/relative 同验）；首块四档（非 IHDR/len≠13→None；len=13 全 0→接受；IHDR CRC 坏→8 非 None）；CRC 与 zlib 四方全等（200KB 单块与 215KB 链）；cap 三路径含 CRC 字段（cap<8 返 len=cap）；MAX_CHUNK ±1；穷举 end=8..=89 契约吻合。
+- **qual：10/10 变异有据**。关键分析：(a) **#10 `remaining -= n.min(1)` 非死循环**——终止性由 take 界失败兜底，变异只是破坏"进度=读量对齐"→ 5 测杀；(b) **#9 IEND 删除被出口归一在 #8 上掩盖**（归一化双刃，记录）；(c) **真缺口：PNG run 界诚实截断零覆盖**（两处 take 失败返回改 complete:true → 26 测全绿；残片被当整文件=静默数据损坏）→ pin 落码；(d) **MAX_CHUNK 门零覆盖**（7/7b）→ 40 字节级 pin。
+- **pin 落码插曲（教训记录）**：实施者先按语义重构落地（2555ebb），qual 原文随后直达——**差异是实质性的**：① 砍点构型应为 {109,105,**70**}（70 砍在数据段中、欠报 41=最后完整读取轮，这才是"欠报不过报"的钉子）；② IEND pin 尾挂**整枚 mini_png**（否则"停在第一个 IEND"无判别力）；③ MAX_CHUNK pin 的 **cap=64MiB、run 界 41**——实施者重构版用 cap=41 会让 cap 检查先于 take 失败触发，**放走"数据段 take 失败→complete:true"变异**。最终 `6651b91` 按 qual 原文逐字落（仅 IEND 块构造按裁定走 `xd_fixtures::chunk` 字节等价替换），**六变异全红**（三条 take 路径各自→complete:true / MAX_CHUNK `>=` 与删门 / IEND `&& len==0`）。**教训：跨代理的"成品码"必须走原文直传（本处 lead 转述→重构已证有损），转述仅作方向。**
+- **IEND len≠0 裁定（spec 定，落地）**：只认 CRC、不校验 len==0——len≠0 属坏编码但结构已收束（CRC 强判据），严格拒收会把尾部单字段损坏升级为整文件不完整；误差方向=提前收束少报。头注 + pin 测试 + 反变（`&& len == 0`）钉死。
+- **T6 移交清单已入 T6 段**：① **退化条目不对称需裁定**（PNG 最小非 cap 返回 8=签名长会被当条目上报；建议生效臂改 `e.size > sig.len()`）；② PNG 截断欠报落回断块内部（断尾重扫可能报出残段签名，符合雕刻语义但 dedup 须知情）；③ None 语义/advance；④ cap 恒成立 T6 无需再钳；⑤ 返回后不读 `pos`。
+- **judgment 备忘**：jpeg `MAX_SEGMENT` 上界零覆盖**不补**（u16 域结构不可达）；fixtures `chunk` 提 pub 后 png 测试两处本地构造全换用（可读性反升）。
+
+### T6（顺序块扫描器 + 深扫编排）—— impl-m1c-t6。提交沿革：`8a08775`（主，16 文件 +1057/−77）→ `9698336`（qual 收尾六项）。DONE → spec **PASS**（64 探针）→ qual **APPROVED** → 六项收尾有牙（T6 关闭，355/0）
+
+- **三裁定落地**：退化条目 `e.size > sig.len()`（carver.rs:133；PNG 8 字节地板件不上报、JPEG 4 字节 stub 如实上报——两引擎截断地板 3/8 不对称有据）；**fat Err 语义回归计划字面**（`is_free(c)?`，T2 测试翻转为 `fat_read_errors_yield_err`——裁定要求的可见行为变更）；PNG 断尾重扫=预期语义（头注）。
+- **spec 亮点**：Recorder 证明回读恰 `(CHUNK_BYTES-7, len=8199)` 一次；坏读/全坏设备终止性与 scanned==Σrun；**计划原码两处死循环隐患**（短读退化窗口）被实施者守卫覆盖；v3 列集精确；深扫 e2e 独立复刻 idx==0..foundCount；失败不入册（-32005 后 scan.status→-32003）。
+- **qual 变异 12 条：7 杀 + 5 NO-KILL 逐条裁定**：invariant 3 是**死代码**（find_candidates 契约下不可达）→ 头注改注防御性；invariant 1 对现签名集不可观测 → 头注据实；`scanned` 中段坏读断言无判别力（末窗置值覆盖）→ **末窗坏读 pin**；deep 缺 idx pin → 补；加测 `-6` 亦 NO-KILL ⇒ k=7 最坏档 → **k=1..=8 循环 pin**（`-7→-6` 变异恰在 k=7 红）；#11 属 M1b 窄窗族（保留）。
+- **量化发现（Cursor I/O 放大，最高价值）**：JPEG 熵段逐字节 `read_at` → **20KB JPEG=20,014 次调用 / avg 2.00B**（PNG 仅 13 次/avg 3086B）；外推 64MiB ≈ 6.7×10⁷ 次 1B pread。**裁定：M1d 真机性能门阻塞项**，最小改法=Cursor 64KiB 预读缓冲+CountingDev 不变量测试 → **已写入 T7 计划**；窗口缓冲复用与 fat 簇级读 → M1d 账。
+- **设计偏差记录**：`ScanKind`/`Active.kind` 改为 boxed `WorkerFn` + 持久化 `scan_mode` 承载 T7 分派（功能等价）——T7 需按 mode 分派 + 断点续跑重解 freespace（闭包内 runs 不可从库恢复）。
+- **T8 携带项**：decoy 必须用**空壳形**（`FFD8 FFFF D9` 零上报）；`FFD8FF+垃圾` 会如实上报 4 字节 stub（`garbage_after_soi_reports_stub` 已记录）。
+- **doc nits（已清）**：exfat freespace 头注分层说明；deep `CarveProgress` 补「库错不中断」注释（found/idx 照进、库内可缺行——T7 断点设计知情）。
+
+### T7（断点续跑 + Cursor 预读 + insert 批量）—— impl-m1c-t7。提交沿革：`4149e29` → `fb5d266` → `d9c0d0d` → **`185d34e`（阻断修复）**。DONE → spec **FAIL（阻断：静默丢条）** → 修复 → 增量复审 **PASS（关闭）**（373/0；355→373）
+
+- **阶段一（续跑/schema v4）**：`carve_runs_from`；**事件拆 `Scanned { scanned, at }`**（session 口径 vs 绝对续扫点——计划 `carved_offset=self.scanned` 是错的，实施者改对）；restart 按 `scan_mode` 分派（deep 保留结果/idx 续号/重解 runs；quick 清表）；spawn_carve 抽取；restart 守卫保留。schema v4 探针：列集精确、Some(0)≠NULL、幂等。
+- **阶段二（Cursor 预读）**：20KB JPEG 雕刻 `read_at` **20,046 → 2**（5 变体 PREFETCH=0/1/3/64KiB 的 p3-dump 全文 sha256 全等——语义保持最强形式）；调用预算 `bytes/1024+6` 对旧实现 1000× 牙口。
+- **阶段三（insert 批量）**：**选型 WAL+`synchronous=NORMAL`**（513 条目 DELETE+FULL 3839ms → Store 真实路径 61.9ms = **8288 条/秒**〔spec 独立复测〕；进程崩溃零丢失限定「已提交事务」层面）。**daemon 测试窗口依赖**：cancel/SIGKILL 测原隐式靠 fsync 撑窗（3.5s→46-62ms，仍 ~590-900× IPC 往返）——已改注记 + 转 M1d 风险记录（第 8 条）。
+- **★ spec-t7 阻断缺陷（本轮最大价值）**：**检查点（carved_offset 不节流写绝对 `at`）与 found_count（节流落库）跨帧不一致** → 续跑以滞后 idx 重编号、`INSERT OR REPLACE` 覆盖检查点前**永不重扫**的旧行 → **静默丢条**（daemon 真 SIGKILL 复现：358→230 丢 128 条〔run0 全灭〕；另一形状丢 64 + 重复 58）。触发面=Scanned 步长 <1MiB 且上次进度 <250ms（**非极端时序**）；既有夹具（≥1MiB 整窗对齐）与实施者测试形状（B=0 立即暂停）**结构性失明**——只有独立探针 + 真进程 kill 照出。**修复 `185d34e`**：配对写（`carved_offset+found_count` 单条 UPDATE 同帧）+ 真不变量句改写 + **两处真回归**（manager 级 run1 暂停 + daemon 级 SIGKILL 逐点比对，1600 条；定位器用 `results.total` 防旧实现钝化）+ README #5/store 头注/性能数纠偏。变异实证：单写旧形态三级全红（guard `0/8` → 丢条 `8/11` → daemon `1200≠1600`）。
+- **-7 回退裁定被否证并撤回（流程亮点）**：lead 裁定「续跑点回退 7 字节」补反方向漏点；实施者以可执行探针否证——`at ≥ buf_end−7` 恒成立（重叠已在窗口推进）、自 at 续扫对每个真 Scanned 事件**逐点无损无重**、回退会重报已雕容器尾部嵌入签名（幻影 extra=[4195331]，spec 独立几何复现逐位相同）→ **采纳反证，裁定撤回**；零重叠变异（`advance_to = buf_end`）k=1..7 静默丢失被协议测杀红（pin 住重叠边界）。
+- **残留（非阻断，已裁定/记录）**：(a) 库错路径（配对写/insert 的 `let _ =`）→ 维持「库错不中断」+ README 限定「库错时可能缺行」；备选「库错置 Failed」待 Store trait 化复议。(b) `wal_normal_crash_semantics_declared` 后半段 `mem::forget` 形状零判别力（已改「形态演示」措辞）；`scan.status` 不暴露 carvedOffset → M1d 排障项（已入 M1d 第 9 条）。
+
+### T8（恢复率门禁 e2e，§8.2 v1 基线）—— impl-m1c-t8。提交沿革：`fd82f2c`（主）→ `537e0a6`（qual 收紧）。DONE → spec **PASS** → qual **APPROVED** → 收紧落地（T8 关闭，376/0）
+
+- **§8.2 门禁落成**：`carve_e2e.rs` 三枚——exfat 恢复率门禁（100%/0 假阳性，真件埋于**删除释放簇区**内=雕刻可见性）、跨 run 诚实截断门禁（贴界 ±8 三档 size 随动 992/1000/1008）、fat 臂加分（同构 100%/0）。**decoy 空壳形约束被门禁实抓**（换 stub 形两臂各多 1 条 4B → 必红）。`gen_fat_image.rs` 埋件（26112 簇 3，非元数据区）+ `e2e-loop.sh` deep 三段（附带 totalBytes=Σruns 钉）。
+- **spec 独立核验（强度标杆）**：自写 exFAT 位图/FAT 表解析器复刻几何（runs/埋点/尺寸全等）；**全镜像逐位签名清点**（run 内除埋点零命中）；decoy 变异反向实证；镜像 daemon 实跑 JSON 逐字；`cargo tree` 证引擎仅 dev-dep。
+- **qual 变异 8 条**：4 KILL（decoy 两形/埋点偏一〔机制为"签名落 run 外"〕/MAX_FILE_BYTES 缩小 3/4 e2e）；**2 条 NO-KILL 判非缺口**（退化过滤/坏读计数——门禁无对应注入面，单测各自钉死）；2 条语义审视（跨 run 前提句/`runs[0]` 唯一性）→ 三条收紧落地：fat 臂 `runs[1]` 尾段精确 + `scanned==Σruns` 对齐、脚本 grep 定界（`26112,`/`2045}`/`2136576}`——防子串误命中）、文件头门禁角色分类。
+- **观察①归档（两处）**：exFAT up-case 资产含 `FF D8 FF`@5755（其后即 `FF D9`，空壳形；引擎探针 0 命中、非假阳性源）——`exfat.rs` UPCASE_TABLE 处归档行 + 本节记录；**M2 全卷扫描设计者必读**。
+- **待 CI**：环回 deep 段真设备路径（本机无免密 sudo，已两级替代验证：镜像 daemon 实跑 + grep 逐字重放 `DEEP BLOCK REPLAY OK`）；CI ubuntu-latest 首跑即真环回。
+- 记录不修：三份 JPEG 空壳拷贝（装饰）；`"id":20` 前缀匹配（单扫描串行自洽，并行日再改）。
 
 ---
 

@@ -15,9 +15,10 @@ fn golden(name: &str) -> serde_json::Value {
     serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("parse {name}: {e}"))
 }
 
-/// golden 集合收口：新增/删除契约文件必须同步改测试（21 个是 v1 冻结清单）。
+/// golden 集合收口：新增/删除契约文件必须同步改测试（23 个 = v1 冻结 21 + M1c 雕刻页 1
+/// + M1c -32005 错误页 1）。
 #[test]
-fn golden_set_is_exactly_the_21_contract_files() {
+fn golden_set_is_exactly_the_23_contract_files() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto/v1/examples");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
@@ -29,6 +30,7 @@ fn golden_set_is_exactly_the_21_contract_files() {
         "device_list.response.json",
         "error_device_permission.response.json",
         "error_task_not_active.response.json",
+        "error_unallocated_unavailable.response.json",
         "error_unsupported_fs.response.json",
         "ping.request.json",
         "ping.response.json",
@@ -40,6 +42,7 @@ fn golden_set_is_exactly_the_21_contract_files() {
         "scan_progress.notification.json",
         "scan_results.request.json",
         "scan_results.response.json",
+        "scan_results_carved.response.json",
         "scan_resume.request.json",
         "scan_resume.response.json",
         "scan_start.request.json",
@@ -243,6 +246,34 @@ fn scan_results_response_matches_golden() {
 }
 
 #[test]
+fn scan_results_carved_golden_matches_scan_entry() {
+    // v1.1（M1c）：雕刻条目——无名字/无簇号，byteOffset 为未分配空间内坐标。
+    let (_, result) = ok_result("scan_results_carved.response.json");
+    assert_eq!(result["total"], serde_json::json!(2));
+    let entries: Vec<ScanEntry> = serde_json::from_value(result["entries"].clone()).unwrap();
+    assert_eq!(entries.len(), 2);
+    for (e, off) in entries.iter().zip([835584u64, 892928]) {
+        assert_eq!(e.byte_offset, Some(off));
+        assert_eq!(e.quality, "carved");
+        assert!(e.name.is_empty() && e.path.is_empty());
+        assert!(e.deleted && !e.is_dir);
+        assert_eq!(e.first_cluster, 0);
+    }
+    assert_eq!(entries[0].ext, "jpg");
+    assert_eq!(entries[1].ext, "png");
+    assert_eq!(serde_json::to_value(&entries).unwrap(), result["entries"]);
+    // 缺省=null（FS 条目）：序列化省略 byteOffset 键，旧 golden/旧客户端不受影响。
+    let mut plain = entries[0].clone();
+    plain.byte_offset = None;
+    let v = serde_json::to_value(&plain).unwrap();
+    assert!(v.get("byteOffset").is_none(), "{v}");
+    assert_eq!(
+        serde_json::from_value::<ScanEntry>(v).unwrap().byte_offset,
+        None
+    );
+}
+
+#[test]
 fn task_state_responses_match_golden() {
     for (name, state) in [
         ("scan_pause.response.json", ScanState::Paused),
@@ -274,6 +305,11 @@ fn error_responses_match_golden() {
             "error_task_not_active.response.json",
             9,
             RpcError::task_not_active(1),
+        ),
+        (
+            "error_unallocated_unavailable.response.json",
+            12,
+            RpcError::unallocated_unavailable(),
         ),
     ] {
         let v = golden(name);

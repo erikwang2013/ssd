@@ -15,8 +15,11 @@ pub struct ScanEntry {
     pub size_bytes: u64,
     pub deleted: bool,
     pub is_dir: bool,
-    pub quality: String, // "complete" | "maybeDamaged"
+    pub quality: String, // "complete" | "maybeDamaged" | "carved"
     pub first_cluster: u32,
+    /// 雕刻条目在未分配空间内的起始字节坐标；FS 条目恒 None（序列化省略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +153,14 @@ impl RpcError {
         Self {
             code: -32004,
             message: format!("Task not active: {id}"),
+        }
+    }
+
+    /// -32005：空闲空间不可判定（深扫前置：位图/FAT 表不可读）——不得伪装成「无空闲」。
+    pub fn unallocated_unavailable() -> Self {
+        Self {
+            code: -32005,
+            message: "Cannot determine free space".into(),
         }
     }
 

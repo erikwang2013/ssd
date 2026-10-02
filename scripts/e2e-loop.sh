@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 # 真块设备端到端（Linux）：镜像 → 环回只读设备 → LinuxBlockDevice 字节级 + daemon device.list
-# + M1b 真扫描全链路（scan.start → scan.finished → scan.results）。
+# + M1b quick 真扫描全链路 + M1c deep 深扫（恢复率门禁的真设备臂，carved 恰 1 条）。
 # 无免密 sudo（本机日常）自动跳过；GitHub ubuntu-latest 免密 sudo → 真跑。
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -56,6 +56,34 @@ while :; do
 done
 # 删除项首字符丢失 → 扫描器重组为 '?'（dirent::assemble_sfn_name）
 grep -qF '"name":"?MG_0001.JPG"' <<<"$res_line" || { echo "FAIL: results 未含删除文件 ?MG_0001.JPG"; echo "$res_line"; exit 1; }
+
+# 3b) M1c：深扫真链路（mode:deep → finished → results）。镜像（gen_fat_image）在已删照片释放的
+#     簇区埋了一枚结构完整 JPEG（偏移 26112 = 数据区簇 3 起点）——深扫必须雕出且**恰 1 条**：
+#     恢复率门禁（§8.2）在真块设备上的那一臂（假阳性 0 = carved 计数恰 1）。
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"scan.start\",\"params\":{\"device\":\"unix:$loop\",\"mode\":\"deep\"}}" >&"${XD[1]}"
+deep_start=""; deep_task=""; deep_fin=""
+while :; do
+  IFS= read -r -t 30 line <&"${XD[0]}" || { echo "FAIL: 等深扫 finished 超时/断流"; exit 1; }
+  case "$line" in
+    *'"id":22'*) deep_start="$line"; deep_task=$(sed -n 's/.*"taskId":\([0-9]*\).*/\1/p' <<<"$line");;
+    *'"method":"scan.finished"'*) deep_fin="$line"; break;;
+  esac
+done
+grep -qF '"fs":"fat"' <<<"$deep_start" || { echo "FAIL: 深扫 start 未认 FAT"; echo "$deep_start"; exit 1; }
+grep -qF '"totalBytes":2136576}' <<<"$deep_start" || { echo "FAIL: 深扫 totalBytes 非 Σ空闲区间 2136576"; echo "$deep_start"; exit 1; }
+grep -qF '"state":"completed"' <<<"$deep_fin" || { echo "FAIL: 深扫未 completed"; echo "$deep_fin"; exit 1; }
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"scan.results\",\"params\":{\"taskId\":$deep_task,\"offset\":0,\"limit\":100,\"deletedOnly\":false}}" >&"${XD[1]}"
+while :; do
+  IFS= read -r -t 30 line <&"${XD[0]}" || { echo "FAIL: 等深扫 results 超时/断流"; exit 1; }
+  case "$line" in *'"id":23'*) dres_line="$line"; break;; esac
+done
+grep -qF '"quality":"carved"' <<<"$dres_line" || { echo "FAIL: 深扫 results 未含 carved 条目"; echo "$dres_line"; exit 1; }
+# grep 一律带后随定界（, 或 }）：防字段号子串误命中（如 byteOffset 261120）
+grep -qF '"byteOffset":26112,' <<<"$dres_line" || { echo "FAIL: carved byteOffset 非埋点 26112"; echo "$dres_line"; exit 1; }
+grep -qF '"sizeBytes":2045}' <<<"$dres_line" || { echo "FAIL: carved sizeBytes 非 2045"; echo "$dres_line"; exit 1; }
+[ "$(grep -oF '"quality":"carved"' <<<"$dres_line" | wc -l)" = 1 ] || { echo "FAIL: carved 条目非恰 1 条（假阳性？）"; echo "$dres_line"; exit 1; }
+echo "deep: task $deep_task completed，恰 1 条 carved（byteOffset=26112）经 IPC 可见"
+
 eval "exec ${XD[1]}>&-"   # 关 stdin → daemon 收 EOF 退出
 wait "$XD_PID"
 echo "scan: task $scan_task completed，删除文件 ?MG_0001.JPG 经 IPC 可见"
