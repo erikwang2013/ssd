@@ -2550,8 +2550,8 @@ use xd_device::image::ImageFileDevice;
 
 #[test]
 fn deleted_photo_recovered_byte_exact_from_image_file() {
-    // 造一张"相机卡"：500 字节的"照片"（内容确定），删掉它
-    let photo: Vec<u8> = (0..500u32).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+    // 造一张"相机卡"：1536 字节（3 簇）的"照片"（内容确定），删掉它
+    let photo: Vec<u8> = (0..1536u32).map(|i| ((i * 7 + 13) % 256) as u8).collect();
     let image_bytes = xd_fixtures::FatImageBuilder::fat16()
         .add_subdir("/", "DCIM")
         .add_file("/DCIM", "IMG_0001.JPG", &photo)
@@ -2572,11 +2572,16 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
         .iter()
         .find(|e| e.deleted && !e.is_dir && e.ext == "jpg") // is_dir 忠实 attr 后须排除已删目录（qual-t6 I3）
         .expect("deleted jpg not found");
-    assert_eq!(photo_entry.size_bytes, 500);
+    assert_eq!(photo_entry.size_bytes, 1536); // 3 簇：live 分支只会得 512B 短前缀 → 锁定删除回退语义
+    assert_eq!(photo_entry.path, "/DCIM");
+    assert_eq!(entries.iter().filter(|e| e.deleted).count(), 1);
 
     // 字节级找回
     let recovered = xd_fs_fat::scan::read_file(&dev, photo_entry).unwrap();
     assert_eq!(recovered, photo, "recovered bytes differ from original");
+
+    // 只读铁律（设计 §8.4）：扫描/读取不得改动镜像一个字节
+    assert_eq!(std::fs::read(f.path()).unwrap(), image_bytes, "扫描/读取不得改动镜像");
 
     // 存活文件不受影响
     assert!(entries.iter().any(|e| e.name == "READ_ME.TXT" && !e.deleted));
@@ -2619,6 +2624,16 @@ Expected: `wrote /tmp/xd-fat.img (2162688 bytes)`（FAT16 = 4224×512 = 2,162,68
 git add crates/xd-fs-fat/tests crates/xd-fixtures/examples
 git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
 ```
+
+**修订轮（qual-t8，2026-10-02）**：质量审查 With fixes（2 项 Important 均为**计划级**测试强度问题，无已证实缺陷），
+修复提交 `6aa550c`（"test(fs-fat): e2e 强化——多簇照片锁定删除回退、只读断言与 path/计数守卫（qual-t8）"）：
+
+- **I1（计划级）**：原 500B 照片 = 单簇 → live/deleted 路径返回相同结果，**锁不住"删除项走连续回退"回归**。
+  改 1536B（3 簇）：live 分支只可能得 512B 短前缀 → 该类回归必响亮失败。
+- **I2（计划级）**：补只读断言（设计 §8.4「扫描后镜像哈希不变」；逐字节比对，比哈希更强）。
+- **Minor 3/4**：补 `path == "/DCIM"` 与删除计数 == 1 守卫（防条目错挂根目录/多删场景静默）。
+- **Minor 5**：`fsck.fat -n` 退出 1——夹具 boot 卷标 "XIAODUN" 而根目录无卷标项（真卡必有）；我方解析器
+  不受影响（实测）；见移交注 14。
 
 ---
 
@@ -2674,6 +2689,15 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
 13. **（qual-t7 复审 Minor 1 选项②，转 M2）**：live×环 现为"按链读到 need、内容自重复"（全尺寸）——
     可选严格版：首重复扫描取真实前缀，把"live ⟹ 返回必为真实前缀"升为硬不变量。M2 评估
     （可与 M1b 拆 read.rs 同批）。
+14. **（qual-t8 Minor 5）夹具卷标偏差**：boot 扇区有卷标 "XIAODUN" 而根目录无卷标项（真卡必有），
+    `fsck.fat -n` 因此退出 1；我方解析器不受影响（已实测）。M2 builder 增卷标项后，可去掉 scan.rs
+    卷标过滤测试的手工补丁。
+15. **（qual-t8 覆盖边界）LFN**：fixture builder 仅 8.3（encode_sfn debug_assert），真实相机长文件名
+    删除态的 e2e 通路不可构造（dirent 有 LFN 单测）；M1b e2e 视需要扩 builder。
+16. **（qual-t8 出口叙事）**：M1a 的"可被 daemon 挂载"= 合法 FAT16 镜像三重确认（`file(1)` / `fsck -n` /
+    本方 scan+read）、只读成立（扫描前后 sha256 不变，已实测）；daemon RPC 接线属 M1b（xd-core/xd-daemon
+    现无 scan 方法）。**恢复率承诺限定「未碎裂删除」**：连续假设遇碎裂会静默读空闲邻簇且 quality 仍
+    Complete（真卡高频；M1c 雕刻是答案）。
 
 ---
 
