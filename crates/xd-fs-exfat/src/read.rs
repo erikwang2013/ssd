@@ -141,7 +141,12 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
         // live 链式：只信链（链短/坏 → 诚实短前缀）——绝不连续猜读：坏 FAT 上猜读会交付
         // 他人数据且无从发现（M1a qual-t7 I1 对等）
         let chain = fat.chain(entry.first_cluster).unwrap_or_default();
-        let n = (need as usize).min(chain.len());
+        // 前缀回访（环/回折）→ 只交付首个回访点之前的簇（live 的"诚实短前缀"语义，与链短同规则；
+        // 与 deleted 车道的"回访即空"刻意不对称：live 首簇由 dirent 实指、可先行；qual-t4 追加）
+        let end = (0..chain.len())
+            .find(|&i| chain[..i].contains(&chain[i]))
+            .unwrap_or(chain.len());
+        let n = (need as usize).min(end);
         read_prefix(
             dev,
             &boot,
@@ -523,6 +528,31 @@ mod tests {
             .unwrap();
         let bytes = read_file(&dev, &e).unwrap();
         assert_eq!(bytes.len(), 4096, "live 只信链：链只剩首簇 → 诚实短前缀");
+        assert_eq!(bytes, data[..4096]);
+    }
+
+    #[test]
+    fn live_loop_chain_delivers_prefix_up_to_first_revisit() {
+        // qual-t4 追加：live 链自环 FAT[6]=6 → 只交付首个回访点之前的簇（4096），绝不让同一簇重复出现；
+        // 质量仍是 entry 层 checksum 语义（本测钉住该刻意行为，M1c 若升级链感知分级再改）
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "L.BIN", &data, &[6, 7, 8], false)
+            .build();
+        image[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // 自环
+        let (_f, dev) = dev_for(&image);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "L.BIN")
+            .unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::Complete,
+            "live 质量=entry 层语义（刻意）"
+        );
+        let bytes = read_file(&dev, &e).unwrap();
+        assert_eq!(bytes.len(), 4096, "首个回访点之前恰一簇");
         assert_eq!(bytes, data[..4096]);
     }
 
