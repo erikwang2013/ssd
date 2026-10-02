@@ -801,6 +801,15 @@ Scaffold('恢复文件')
 - **观察 C（双侧承诺）+ qual 细化 → T4 任务书**：Dart 需补四类值级覆盖（五码 expectRpcError / fs_read 值级 / export_start+cancel response / 两通知形状）——否则 11 个 non-error 新 golden 在 Dart 侧零值级覆盖。`idxs 去重后` 措辞两处对齐。
 - 记录不修：golden 单点守卫（同 PR 双改不会被第二道网拦——v1 既有约定）；`alias` 放宽（等价无害）。
 
+### T2（分片读取全链）—— impl-m1d-t2。提交沿革：`e7e16d9`（主，18 文件）→ `753897d`（qual 补测）。DONE → spec **PASS**（2691 窗口差分）→ qual **APPROVED** → 五处有牙（T2 关闭，407/0）
+
+- **计划 vs 仓库裁定差异 4 条（按"仓库 read_file 为规格"落地）**：range 版必须同源 M1c 三道界卫 + (a) 早分支（计划片段是裁定前旧稿）；live 回访截断（计划缺）；**不物化簇序列**（流式滑窗）；fat 删除=连续回退。差分测试比计划强：5×9 / 6×8 → spec 扩到 **2691 窗口**（独立 oracle：自给簇序+设备原始 read_at，先对 oracle 再对切片）。
+- **collector 化不採 sink（B 项，重要设计裁定）**：计划 sink 形态会**静默丢字节**（`Cursor::skip` 段体字节从不流经 sink；jpeg 段体含 `FF D9` 类标记字节时必漏——spec 探针实证"重读不止等价、是规格必需"）；改 `collect_*` = 裁决区间确定性重读（`read_prefix_at`）。M1c 47 测试零回归。
+- **计划片段编译缺陷 3+1 条**：死绑定 `let want`（-D warnings 必红）、`ReadError` 缺 `#[derive(Debug)]`、`map_err` 类型不成立（ScanError 无 Display）、`(offset as usize)` 32 位截断——全部实修（`saturating_add` 防溢出）。
+- **qual 变异 10 条：7 KILL；关键覆盖发现**——**range 分支的可达界卫/回访查重逃逸全部 401 个仓库测试**（repo 夹具盲区），仅差分探针捕获 → 两场景（`ranged_read_deleted_unreachable_is_empty`/`..._revisit_is_empty`）搬进 read_tests 并以有牙实证；`saturating_add` 裸 `+`（debug panic）与 `run.end→u64::MAX`（交付 5000≠4096）两缺口同样补测闭合；`read_prefix_at` 钳位=等价突变（补可选取值契约测试）。
+- **裁定/移交**：(a) read_back 两遍 TOCTOU 可接受（源盘只读+确定性重读）；(b) `complete` 与交付长解耦（零消费者，doc 已注）；(c) **雕刻件"完整/截断"信号不落库**（quality 恒 "carved"）——UI 保守文案（"仅雕刻·可能不完整"）已覆盖，持久化列列为 **v1.3 契约候选**。(d) 性能快速路径的 ponytail 建议不成立（坏读/零读/短读三停点都可在窗口前发生——已改注"升级须以差分网格为裁判"）。
+- 过程：实施者误用 `git checkout` 清掉未提交文档改动 → 自查重写并复核（终提交纯文档差异）；"只追加不 amend"本轮遵守。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
