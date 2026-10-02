@@ -70,6 +70,7 @@ while :; do
   esac
 done
 grep -qF '"fs":"fat"' <<<"$deep_start" || { echo "FAIL: 深扫 start 未认 FAT"; echo "$deep_start"; exit 1; }
+grep -qF '"totalBytes":2136576}' <<<"$deep_start" || { echo "FAIL: 深扫 totalBytes 非 Σ空闲区间 2136576"; echo "$deep_start"; exit 1; }
 grep -qF '"state":"completed"' <<<"$deep_fin" || { echo "FAIL: 深扫未 completed"; echo "$deep_fin"; exit 1; }
 printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"scan.results\",\"params\":{\"taskId\":$deep_task,\"offset\":0,\"limit\":100,\"deletedOnly\":false}}" >&"${XD[1]}"
 while :; do
@@ -77,7 +78,9 @@ while :; do
   case "$line" in *'"id":23'*) dres_line="$line"; break;; esac
 done
 grep -qF '"quality":"carved"' <<<"$dres_line" || { echo "FAIL: 深扫 results 未含 carved 条目"; echo "$dres_line"; exit 1; }
-grep -qF '"byteOffset":26112' <<<"$dres_line" || { echo "FAIL: carved byteOffset 非埋点 26112"; echo "$dres_line"; exit 1; }
+# grep 一律带后随定界（, 或 }）：防字段号子串误命中（如 byteOffset 261120）
+grep -qF '"byteOffset":26112,' <<<"$dres_line" || { echo "FAIL: carved byteOffset 非埋点 26112"; echo "$dres_line"; exit 1; }
+grep -qF '"sizeBytes":2045}' <<<"$dres_line" || { echo "FAIL: carved sizeBytes 非 2045"; echo "$dres_line"; exit 1; }
 [ "$(grep -oF '"quality":"carved"' <<<"$dres_line" | wc -l)" = 1 ] || { echo "FAIL: carved 条目非恰 1 条（假阳性？）"; echo "$dres_line"; exit 1; }
 echo "deep: task $deep_task completed，恰 1 条 carved（byteOffset=26112）经 IPC 可见"
 

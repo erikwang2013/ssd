@@ -27,6 +27,8 @@ pub const FIRST_FILE_CLUSTER: u32 = 6;
 pub const VOLUME_SERIAL: u32 = 0x1234_5678;
 
 /// 规范推荐 Up-case 表（5836 字节；资产与校验见模块头）。
+/// 归档（T8 观察①）：本资产含 FF D8 FF（偏移 5755）——其后即 FF D9，空壳形：探针实测引擎裁决 None、
+/// 0 条上报（非假阳性源）；M2 全卷扫描勿据此误判 FP。
 pub const UPCASE_TABLE: &[u8] = include_bytes!("exfat_upcase.bin");
 pub const UPCASE_TABLE_CHECKSUM: u32 = 0xE619_D30D;
 

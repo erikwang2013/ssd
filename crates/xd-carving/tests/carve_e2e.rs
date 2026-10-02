@@ -1,9 +1,10 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! 雕刻端到端（公共 API 级）：真实 FS 镜像 → `unallocated_runs` → `carve_runs` 全链。
 //!
-//! **恢复率回归门禁（设计 §8.2 的 v1 基线）**：本文件的 FS 级 e2e（exfat 两枚 + fat 一枚）
-//! 即门禁主体——合成镜像埋 N 个真件（含搅局件）→ 找回率必须 **100%（N/N）且假阳性 0**；
-//! 任一测试失败即门禁失败，任何 PR 把恢复率弄低都会在此变红。
+//! **恢复率回归门禁（设计 §8.2 的 v1 基线）**：本文件的 FS 级 e2e——恢复率门禁 2 枚
+//! （exfat/fat 各一）+ 诚实截断门禁 1 枚——即门禁主体。恢复率口径：合成镜像埋 N 个真件
+//! （含搅局件）→ 找回率必须 **100%（N/N）且假阳性 0**；任一测试失败即门禁失败，任何 PR
+//! 把恢复率弄低都会在此变红。
 //!
 //! 搅局件一律"空壳形"（签名为真、结构裁决拒收、零上报）：JPEG 空壳 = SOI+段+EOI **永不过
 //! SOS**（走链器 `eoi_without_sos_is_rejected` 裁决拒收）；PNG 空壳 = magic + 非 IHDR 首块
@@ -209,8 +210,9 @@ fn fat_deleted_file_clusters_recover_with_zero_false_positives() {
         "删除文件的 64 簇必成空闲区间（雕刻可见性）"
     );
     assert_eq!(runs.len(), 2, "KEEP.BIN 把空闲切成两段: {runs:?}");
+    assert_eq!(runs[1], tail_lo..img.len() as u64, "尾段边界精确");
 
-    let (got, _) = carve_all(&dev, &runs);
+    let (got, scanned) = carve_all(&dev, &runs);
     assert_eq!(
         got.len(),
         2,
@@ -223,5 +225,10 @@ fn fat_deleted_file_clusters_recover_with_zero_false_positives() {
             (png_off, xd_fixtures::TINY_PNG.len() as u64, "png", true),
         ],
         "逐字段对齐（偏移/长度/类型/完整性）"
+    );
+    assert_eq!(
+        scanned,
+        runs.iter().map(|r| r.end - r.start).sum::<u64>(),
+        "进度=尝试扫描口径，收尾 100%"
     );
 }
