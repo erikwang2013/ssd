@@ -79,6 +79,9 @@ mod tests {
             (j[0], j[1], j[j.len() - 2], j[j.len() - 1]),
             (0xFF, 0xD8, 0xFF, 0xD9)
         );
+        assert_eq!(&j[2..6], &[0xFF, 0xE0, 0x00, 0x10], "APP0 长度字段=16");
+        // 定长 45 = SOI 2 + APP0 18 + SOF0 13 + SOS 10 + EOI 2（更深走链归 T4）
+        assert_eq!(j.len(), 45 + 100, "总长 = 45 + entropy_len");
         let p = mini_png(b"abc");
         assert_eq!(&p[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
         assert_eq!(

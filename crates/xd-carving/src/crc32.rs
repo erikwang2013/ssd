@@ -31,7 +31,7 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// 增量 CRC（PNG 分块流式校验）：先 crc32_init，逐段 update，末段 finalize。
+/// 增量 CRC（PNG 分块流式校验）：先 Crc32::new，逐段 update，末段 finalize。
 pub struct Crc32(u32);
 
 impl Crc32 {
@@ -78,7 +78,9 @@ mod tests {
     fn crc32_matches_fixtures_copy() {
         // 跨副本对拍：夹具侧第二份实现独立演化时此断言必红（夹具不得依赖本 crate，
         // 否则 CRC 验证测试会拿被测实现自证）。
-        for sample in [&b"123456789"[..], b"IEND", b""] {
+        // 扩谱：全字节域一遍（0x00..=0xFF），覆盖表驱动实现的全部表项
+        let all: Vec<u8> = (0..=255u8).collect();
+        for sample in [&b"123456789"[..], b"IEND", b"", &all[..]] {
             assert_eq!(
                 crc32(sample),
                 xd_fixtures::crc32(sample),
