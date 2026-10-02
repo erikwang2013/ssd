@@ -3,7 +3,9 @@
 - 传输：stdio，每行一条 JSON（LF 结尾），UTF-8。**stdout 仅输出 JSON-RPC 响应行；日志与诊断一律走 stderr。** 空行被忽略（不产生响应）。
 - 信封：JSON-RPC 2.0。`id` 为请求方生成的整数，必须原样回显。
 - 版本：`protocol = 0`。破坏性变更递增；daemon 与 UI 不匹配时由 `ping` 比对 `protocol` 检出。 M0 不校验信封 `jsonrpc` 字段值。
-  `version` 随 workspace 版本更新；仅因发版改动 golden 中的 `version` 不属于契约变更。
+  `version` 为随发布变动的动态值：golden 中固定写作 **`"<VERSION>"` 占位**，两侧测试先断言占位、
+  再归一为运行期真实版本后做全等比对（Rust 两处 + Dart 宽松断言，见各自测试注释）——
+  **契约文件不再因发版改动**（v0.2.0 起；此前约定为发版时手改 golden，已废止）。
 - **golden 规则**：`examples/*.json` 是契约唯一事实源。Rust（`crates/xd-core/tests/contract.rs`）
   与 Dart（`ui/test/protocol_test.dart`）两侧测试都对同一组文件断言：解析（decode）须逐字段一致，
   序列化（encode）输出也须与 golden 逐字段一致（`id` 除外，由调用方生成）。改契约必须同步改 golden 与两侧测试。

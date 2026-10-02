@@ -31,7 +31,15 @@ fn device_list_request_matches_golden() {
 
 #[test]
 fn ping_response_matches_golden() {
-    let v = golden("ping.response.json");
+    let mut v = golden("ping.response.json");
+    // version 是随发布变动的动态值：golden 必须以 "<VERSION>" 占位（约定见 proto/v0/README.md），
+    // 先钉占位、再归一为真实 crate 版本做全等比对——发版不再改契约文件（v0.2.0 注）。
+    assert_eq!(
+        v["result"]["version"],
+        serde_json::Value::String("<VERSION>".into()),
+        "ping.response.json 的 version 必须为 \"<VERSION>\" 占位"
+    );
+    v["result"]["version"] = serde_json::Value::String(env!("CARGO_PKG_VERSION").into());
     let parsed: Response = serde_json::from_value(v.clone()).unwrap();
     let expected = Response::Ok(RpcOk {
         jsonrpc: "2.0".into(),

@@ -1,1 +1,1 @@
-{"jsonrpc":"2.0","id":1,"result":{"pong":true,"version":"0.1.0","protocol":0}}
+{"jsonrpc":"2.0","id":1,"result":{"pong":true,"version":"<VERSION>","protocol":0}}

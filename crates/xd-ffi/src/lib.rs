@@ -9,6 +9,8 @@ pub fn core_version() -> &'static str {
 mod tests {
     #[test]
     fn version_matches_workspace() {
-        assert_eq!(super::core_version(), "0.1.0");
+        // 与 workspace 版本同源：core_version() 必须走 env!（手写死串会在发版时戳穿——v0.2.0 修正）
+        assert_eq!(super::core_version(), env!("CARGO_PKG_VERSION"));
+        assert!(!super::core_version().is_empty());
     }
 }

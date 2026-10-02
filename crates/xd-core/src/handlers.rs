@@ -203,18 +203,26 @@ mod tests {
 
     #[test]
     fn ping_round_trip_matches_response_golden() {
-        // 走真实输出路径：请求 golden → handle_request → 与响应 golden 全等（含 jsonrpc 字段）
+        // 走真实输出路径：请求 golden → handle_request → 与响应 golden 全等（含 jsonrpc 字段）。
+        // version 是随发布变动的动态值：golden 存 "<VERSION>" 占位，先把实际值归一为占位再全等比对，
+        // 然后单独断言实际值 == 本 crate 版本——golden 跨发布稳定，发版不再改契约文件（v0.2.0 注）。
         let ctx = CoreCtx::new(vec![]);
         let req: Request = serde_json::from_str(
             include_str!("../../../proto/v0/examples/ping.request.json").trim(),
         )
         .unwrap();
         let resp = handle_request(&ctx, &req);
+        let mut actual = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            actual["result"]["version"],
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string())
+        );
+        actual["result"]["version"] = serde_json::Value::String("<VERSION>".into());
         let expected: serde_json::Value = serde_json::from_str(
             include_str!("../../../proto/v0/examples/ping.response.json").trim(),
         )
         .unwrap();
-        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+        assert_eq!(actual, expected);
     }
 
     #[test]
