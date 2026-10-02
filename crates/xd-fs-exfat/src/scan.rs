@@ -187,7 +187,7 @@ fn read_subdir_bytes(
     let need = e.data_length.div_ceil(cb);
     let clusters: Vec<u32> = match resolve_clusters(boot, fat, e.first_cluster, need, e.contiguous)
     {
-        Some(Resolved::Chain(chain)) => chain[..need as usize].to_vec(),
+        Some(Resolved::Chain(chain)) => chain, // 已切到 need 前缀（qual-t6 Minor 4）
         Some(Resolved::Contiguous { first, n }) => {
             (0..n).map(|i| (first as u64 + i) as u32).collect()
         }
@@ -237,7 +237,8 @@ fn grade_deleted(
         // 起点非法 / need 超出可达簇数（I1 界卫）：物理不可能 Complete
         None => RecoverQuality::MaybeDamaged,
         Some(Resolved::Chain(chain)) => {
-            if chain[..need as usize].iter().all(|c| all_free(*c)) {
+            // chain 已是 need 前缀（qual-t6 Minor 4）
+            if chain.iter().all(|c| all_free(*c)) {
                 RecoverQuality::Complete
             } else {
                 RecoverQuality::MaybeDamaged
