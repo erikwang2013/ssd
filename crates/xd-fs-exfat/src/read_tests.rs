@@ -703,6 +703,61 @@ fn ranged_read_deleted_stale_chain_stops_at_occupied() {
 }
 
 #[test]
+fn ranged_read_deleted_unreachable_is_empty() {
+    // 可达界卫（range 版）：链 253→6→7 无回访但越过可达（253 是末簇，reachable=1 < need=3）
+    // → 空交付；删界卫则沿链交付 [253,6,7] 的 12288 字节错位数据
+    let image = xd_fixtures::ExfatImageBuilder::new()
+        .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[253], false)
+        .delete("/", "OLD.BIN")
+        .build();
+    let mut patched = image.clone();
+    let stream = SET + 32;
+    patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+    patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3
+    patched[FAT_B + 253 * 4..FAT_B + 253 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // FAT[253]=6
+    patched[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&7u32.to_le_bytes()); // FAT[6]=7
+    refix_deleted_checksum(&mut patched, SET, 3);
+    let (_f, dev) = dev_for(&patched);
+    let e = scan(&dev).unwrap().into_iter().find(|e| e.deleted).unwrap();
+    assert_eq!(
+        read_file(&dev, &e).unwrap(),
+        Vec::<u8>::new(),
+        "全读同判（前提）"
+    );
+    assert!(
+        read_file_range(&dev, &e, 0, 4096).unwrap().is_empty(),
+        "物理不可能的链 → 空（不得交付错位字节）"
+    );
+}
+
+#[test]
+fn ranged_read_deleted_revisit_is_empty() {
+    // 前缀回访（range 版）：删除+非连续、链 [6,6,…]（FAT[6]=6 自环、簇 6 位图空闲——
+    // 界卫不拦：reachable=249 ≥ need=3）→ 查重必须空交付；删查重则重复交付同一簇 3 次（伪造序）
+    let image = xd_fixtures::ExfatImageBuilder::new()
+        .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[6], false)
+        .delete("/", "OLD.BIN")
+        .build();
+    let mut patched = image.clone();
+    let stream = SET + 32;
+    patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+    patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3
+    patched[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // 自环
+    refix_deleted_checksum(&mut patched, SET, 3);
+    let (_f, dev) = dev_for(&patched);
+    let e = scan(&dev).unwrap().into_iter().find(|e| e.deleted).unwrap();
+    assert_eq!(
+        read_file(&dev, &e).unwrap(),
+        Vec::<u8>::new(),
+        "全读同判（前提）"
+    );
+    assert!(
+        read_file_range(&dev, &e, 0, 4096).unwrap().is_empty(),
+        "回访链 → 空（不得重复交付同一簇）"
+    );
+}
+
+#[test]
 fn pick_bitmap_prefers_active_and_falls_back() {
     // 纯函数级：texFAT 双位图选择（随 pick_bitmap 迁入本模块）
     let both = vec![(false, 2, 32u64), (true, 40, 32u64)];

@@ -328,4 +328,68 @@ mod tests {
         // 契约示例（proto/v1/examples/fs_read.response.json）：`hello, xiaodun!` → 16 字节 base64
         assert_eq!(to_base64(b"hello, xiaodun!"), "aGVsbG8sIHhpYW9kdW4h");
     }
+
+    #[test]
+    fn carved_offset_in_allocated_space_is_internal() {
+        // 簇被复用：byte_offset 落回已分配簇（A.BIN 数据区）→ 不在空闲 run → Internal（不空交付）
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "A.BIN", &[7u8; 9000])
+            .build();
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        let mut e = quick_entries(&dev, FsKind::Exfat).remove(0);
+        e.ext = "jpg".into();
+        e.quality = "carved".into();
+        e.byte_offset = Some(16_384 + 4 * 4096 + 100); // 簇 6 中段（已分配）
+        assert!(matches!(
+            read_entry_range(&*dev, FsKind::Exfat, &e, 0, 64),
+            Err(ReadError::Internal(msg)) if msg.contains("free space")
+        ));
+    }
+
+    #[test]
+    fn huge_offset_is_saturated_no_panic() {
+        // 契约层 offset 无上界：offset+length 越 u64 必须饱和（裸 + 在 debug 下 panic）
+        let (_f, dev) = crate::testutil::exfat_fixture();
+        let page = quick_entries(&dev, FsKind::Exfat);
+        let b = page.iter().find(|e| e.name == "LIVE_B.PNG").unwrap();
+        let (bytes, eof) = read_entry_range(&*dev, FsKind::Exfat, b, u64::MAX, 1).unwrap();
+        assert!(bytes.is_empty() && eof, "offset 极大 → 空 + eof");
+        let (bytes, eof) =
+            read_entry_range(&*dev, FsKind::Exfat, b, u64::MAX - 1, u64::MAX).unwrap();
+        assert!(bytes.is_empty() && eof, "offset+length 双双极大");
+    }
+
+    #[test]
+    fn carved_read_back_bounded_by_current_run_end() {
+        // run 右界承重：jpeg 恰被分配边界截断（簇 9 空闲区，右邻簇 10 = C.BIN），
+        // 回读必须止于当前 run 右界，绝不越入他人簇（u64::MAX 变体=交付 5000 ≠ 4096）
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "A.BIN", &[7u8; 9000]) // 簇 6,7,8
+            .add_file_in_clusters("/", "C.BIN", &[5u8; 4500], &[10, 11], false)
+            .build();
+        let j = xd_fixtures::mini_jpeg(5000);
+        let bo = 16_384 + 7 * 4096; // 簇 9 起点；空闲 run = [bo, 簇 10 起点)
+        xd_fixtures::plant_in_run(&mut image, bo, &j);
+        let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+        let e = ScanEntry {
+            idx: 0,
+            name: String::new(),
+            path: "/".into(),
+            ext: "jpg".into(),
+            size_bytes: j.len() as u64,
+            deleted: false,
+            is_dir: false,
+            quality: "carved".into(),
+            first_cluster: 0,
+            byte_offset: Some(bo),
+            contiguous: None,
+        };
+        let (bytes, eof) = read_entry_range(&*dev, FsKind::Exfat, &e, 0, 1 << 20).unwrap();
+        assert_eq!(
+            bytes,
+            &j[..4096],
+            "回读止于 run 右界（4096），不得读穿到簇 10"
+        );
+        assert!(eof, "短交付 = 已到可得末端");
+    }
 }

@@ -28,6 +28,8 @@ pub use signatures::{Carved, Cursor, Signature};
 /// 长度重读字节。重走是确定性的（同设备、同规则）：交付绝不超过雕刻期裁定的区间；
 /// `need` 为交付上限（调用方通常传 `offset + length`）。
 /// `None` = 与雕刻期同判的假阳性（调用方按空交付处理，不报内部错误）。
+/// 注：`complete` 表达**走链裁决是否收束**，与实际交付长解耦（短读设备下可为 true 而交付短）——
+/// 当前无消费者；若 T3/T4 消费再加注。
 pub fn read_back(
     dev: &dyn BlockDevice,
     run_end: u64,

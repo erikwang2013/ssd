@@ -306,8 +306,10 @@ pub fn read_file_range(
 /// 短读/删除项占用簇即停），但**只收窗口内字节**——窗口前的整簇仍按序读（停点语义与
 /// read_prefix 严格同构），只是不复制其字节；跨窗簇按簇内偏移截取。
 /// `produced` = 自簇序列起点的逻辑字节进度（= read_prefix 的 out.len()）。
-/// ponytail: 窗口前整簇的空读 — 预览逐片翻页为 O(offset/cb) 每片；若实测成瓶颈，可在
-/// `produced + cb ≤ offset` 且无 bitmap 门时跳过 read_at（停点语义不变），当前先要正确性。
+/// ponytail: 窗口前整簇的空读 — 预览逐片翻页为 O(offset/cb) 每片。「无 bitmap 门时可跳过
+/// read_at」的快速路径**不成立**（qual 实证）：坏读/零读/短读三停点都能在窗口前发生，跳过会
+/// 破坏 `range == read_file 切片` 差分契约。性能升级（如需）：以差分网格为裁判，须覆盖窗口前
+/// 坏读/零读/短读三停点。
 #[allow(clippy::too_many_arguments)] // 与 fat 侧同构 + 对齐 read_prefix 停点语义：参数即入参，不引入结构体
 fn read_range(
     dev: &dyn BlockDevice,

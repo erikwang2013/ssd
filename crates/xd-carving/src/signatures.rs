@@ -195,6 +195,14 @@ mod tests {
     }
 
     #[test]
+    fn read_prefix_at_clamps_to_cursor_end() {
+        // pub API 右界契约：请求越过游标 end → 只交付 [start, end)（去掉 end 钳位会读到设备尾）
+        let (_f, dev) = dev_for(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let cur = Cursor::new(&dev, 2, 5);
+        assert_eq!(cur.read_prefix_at(2, 100), [3, 4, 5], "越 end 请求止于 end");
+    }
+
+    #[test]
     fn take_accepts_exact_end_and_rejects_past_end() {
         let (_f, dev) = dev_for(&[1, 2, 3, 4]);
         let mut cur = Cursor::new(&dev, 2, 4);
