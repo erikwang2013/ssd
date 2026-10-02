@@ -3,6 +3,9 @@
 //! FAT32 判定：结构优先（root_entry_count == 0 && fat16_size == 0 && root_cluster >= 2），
 //! 否则按数据区簇数 4085/65525 区分 FAT12/16——与 fatfs 等主流实现一致。
 
+// M1a 刻意接受、M2 处理真实损坏盘时重估：reserved_sectors==0；12/16 的 root_entry_count==0；
+// num_fats>2；total16/total32 同时非零时取 t16；total_sectors 不比对设备实际长度。
+
 use crate::FatError;
 use xd_device::BlockDevice;
 
@@ -16,6 +19,7 @@ pub enum FatType {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Bpb {
     pub fat_type: FatType,
     pub bytes_per_sector: u16,
@@ -43,6 +47,8 @@ impl Bpb {
         self.data_start_sector + (cluster - 2) * self.sectors_per_cluster as u32
     }
 
+    /// # Panics
+    /// 同 [`Bpb::cluster_to_sector`]：`cluster` 必须满足 `2 <= cluster <= data_cluster_count() + 1`。
     pub fn cluster_to_byte(&self, cluster: u32) -> u64 {
         self.cluster_to_sector(cluster) as u64 * self.bytes_per_sector as u64
     }
@@ -224,6 +230,10 @@ mod tests {
         let (_f, dev) = device_with(&image);
         let bpb = parse(&dev).unwrap();
         assert_eq!(bpb.fat_type, FatType::Fat12);
+        assert_eq!(bpb.fat_start_sector, 1);
+        assert_eq!(bpb.root_start_sector, 4);
+        assert_eq!(bpb.data_start_sector, 18);
+        assert_eq!(bpb.data_cluster_count(), 1006);
     }
 
     #[test]
@@ -232,7 +242,10 @@ mod tests {
         let mut bad = image.clone();
         bad[510] = 0;
         let (_f, dev) = device_with(&bad);
-        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "missing 0x55AA boot signature"
+        ));
     }
 
     #[test]
@@ -242,7 +255,10 @@ mod tests {
         bad[11] = 0;
         bad[12] = 1; // 256，非法
         let (_f, dev) = device_with(&bad);
-        assert!(matches!(parse(&dev), Err(FatError::InvalidBpb(_))));
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "bad bytes per sector: 256"
+        ));
     }
 
     #[test]
@@ -289,5 +305,50 @@ mod tests {
         let (_f2, dev32) = device_with(&image32);
         let bpb32 = parse(&dev32).unwrap();
         assert_eq!(bpb32.fat_entry_byte(2), 16392); // 32*512 + 2*4
+    }
+
+    #[test]
+    fn rejects_bad_sectors_per_cluster() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut bad = image.clone();
+        bad[13] = 3;
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "bad sectors per cluster: 3"
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_fat_count() {
+        let image = xd_fixtures::FatImageBuilder::fat16().build();
+        let mut bad = image.clone();
+        bad[16] = 0;
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "zero fat count"
+        ));
+    }
+
+    #[test]
+    fn rejects_fat32_without_root_cluster() {
+        let image = xd_fixtures::FatImageBuilder::fat32().build();
+        let mut bad = image.clone();
+        bad[44..48].copy_from_slice(&1u32.to_le_bytes());
+        let (_f, dev) = device_with(&bad);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "fat32 without root cluster"
+        ));
+    }
+
+    #[test]
+    fn rejects_tiny_image() {
+        let (_f, dev) = device_with(&[0u8; 100]);
+        assert!(matches!(
+            parse(&dev),
+            Err(FatError::InvalidBpb(m)) if m == "image smaller than 512 bytes"
+        ));
     }
 }

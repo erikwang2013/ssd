@@ -6,6 +6,7 @@ pub mod bpb;
 
 /// 引擎统一错误类型。
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FatError {
     Device(xd_device::DeviceError),
     InvalidBpb(String),
