@@ -107,6 +107,7 @@ pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
 }
 
 /// 组装 LFN。存活：按 seq 升序（0x40 标志在最后一段）。删除：物理序为尾→头，逆序拼接。
+/// 不做 seq 连续性/0x40 末标/checksum 校验——畸形 run 按低 5 位排序尽力拼接（错名而非 panic）。
 pub fn assemble_lfn(slots: &[LfnSlot]) -> String {
     let mut parts: Vec<String> = Vec::new();
     if slots.iter().all(|s| s.deleted) {
@@ -341,5 +342,51 @@ mod tests {
         assert_eq!(parsed[0].name, "B.TXT");
         assert!(!parsed[0].deleted);
         assert!(!parsed[0].has_lfn);
+    }
+
+    #[test]
+    fn lfn_run_through_parse_directory_bytes() {
+        // 构造：存活 LFN 槽（seq=1|0x40, "photo.jpg"）+ 存活 SFN（PHOTO   JPG）→ 名字取 LFN
+        let mut lfn = [0u8; 32];
+        lfn[0] = 0x41;
+        lfn[11] = 0x0F; // attr 在窗口外，须保持不被字符写入覆盖
+        for (k, u) in "photo.jpg".encode_utf16().enumerate() {
+            let i = lfn_char_offset(k);
+            lfn[i..i + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let mut sfn = [0u8; 32];
+        sfn[..11].copy_from_slice(b"PHOTO   JPG");
+        sfn[11] = 0x20;
+        let mut data = Vec::new();
+        data.extend_from_slice(&lfn);
+        data.extend_from_slice(&sfn);
+        let parsed = parse_directory_bytes(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "photo.jpg");
+        assert!(parsed[0].has_lfn);
+
+        // 删除孤儿：两个删除 LFN 槽（物理序尾→头）+ 删除 SFN → 逆序重建名字
+        let mk_deleted = |text: &str| {
+            let mut s = [0u8; 32];
+            s[0] = 0xE5; // 删除态 seq 全丢
+            s[11] = 0x0F;
+            for (k, u) in text.encode_utf16().enumerate() {
+                let i = lfn_char_offset(k);
+                s[i..i + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            s
+        };
+        let mut dsfn = [0u8; 32];
+        dsfn[..11].copy_from_slice(b"GONE    JPG");
+        dsfn[11] = 0x20;
+        dsfn[0] = 0xE5;
+        let mut data2 = Vec::new();
+        data2.extend_from_slice(&mk_deleted("gone_0")); // 尾段在前
+        data2.extend_from_slice(&mk_deleted("old_")); // 头段在后
+        data2.extend_from_slice(&dsfn);
+        let parsed2 = parse_directory_bytes(&data2);
+        assert_eq!(parsed2.len(), 1);
+        assert_eq!(parsed2[0].name, "old_gone_0");
+        assert!(parsed2[0].deleted);
     }
 }
