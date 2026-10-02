@@ -1,6 +1,8 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! xd-fs-exfat：exFAT 只读解析与删除文件恢复（只读铁律：无任何写设备路径）。
+pub mod bitmap;
 pub mod boot;
+pub mod fattab;
 
 /// 与 `xd_fs_fat::FatError` 同构（non_exhaustive）。
 #[derive(Debug)]
