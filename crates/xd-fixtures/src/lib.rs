@@ -22,8 +22,10 @@
 //!   簇数 < 65525 → 真实驱动会拒认；本引擎结构优先判型不受影响）。
 //! - encode_sfn 只接受 ASCII ≤ 8.3（超长/非 ASCII 由 debug_assert 拦截）。
 
+mod carving;
 mod exfat;
 
+pub use carving::{TINY_PNG, crc32, mini_jpeg, mini_png, plant_in_run};
 pub use exfat::{
     ExfatImageBuilder, UPCASE_TABLE, boot_checksum, entry_set_checksum, refix_deleted_checksum,
 };
