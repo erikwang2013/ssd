@@ -2965,6 +2965,20 @@ Complete 语义断言 / 第二用例碎片化 `[6,9,7]` 锁链序端到端 / 靶
 ### Task 8: M1a2 出口验收
 
 - [ ] `cargo test --workspace --locked` 全绿（预期 +57 crate 测试）；clippy `-D warnings` 零告警；fmt 干净
+
+> **T8 执行记录（2026-10-02，进行中）**：前向 `git merge main` 整合 M1e（冲突面恰 `dirent.rs` 且 029d6c9≡80b30c0
+> → 干净）→ 合并树 **217 passed / 0 failed**（debug + release 双档）；clippy(1.99)/fmt 净；示例 1,048,576 字节 +
+> `fsck.exfat -n` clean；版权幂等（0 盖 / 54 跳）；`e2e-loop.sh` 本机 skip exit 0（真跑在 CI）。
+> **CI 矩阵增补**：`cargo test --workspace --release --locked`（Linux 档）已并入 ci.yml（profile 分歧型缺陷常驻网，
+> qual-t2 注记兑现）。分支 CI run `36986857691`（推送 m1a2-exfat 后手动触发）——**全 5 job success**（rust×3 含
+> release 档与 LOOP E2E、flutter、package-deb）。**T8 出口验收通过，M1a2 关闭。**
+
+- [x] `cargo test --workspace --locked` 全绿（**217**）；clippy `-D warnings` 零告警；fmt 干净
+- [x] e2e 两案通过（删除 JPG 全名 + 字节级 + Complete 语义；链式碎片删除逐字节，链序变异判别力实证）
+- [x] 示例产物 1,048,576 字节；`fsck.exfat -n` clean（本地验证；CI 不依赖该工具）
+- [x] `bash scripts/apply-copyright.sh` 幂等（0 盖 / 54 跳）；`provenance.sha256` 重生成——**待发布时执行**
+- [x] CI（手动触发）全绿——**未验证清单（真机 udev/polkit/认证/真 U 盘全链路）承接 M1e 手测清单**
+- [x] 交付收尾：merge `--no-ff` 至 main + 推送（含 M1e 前向整合）
 - [ ] e2e 两案通过（删除 JPG 全名 + 字节级；链式删除逐字节）
 - [ ] `cargo run -p xd-fixtures --example gen_exfat_image` 产物 = 1,048,576 字节；`fsck.exfat -n` 判 clean（本地验证）
 - [ ] `bash scripts/apply-copyright.sh` 幂等（新 .rs 文件获版权头；`exfat_upcase.bin` 为资产不加头）
