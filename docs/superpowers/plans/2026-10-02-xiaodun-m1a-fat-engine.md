@@ -420,7 +420,7 @@ impl FatType {
     /// (root_entries, fat_size_sectors, reserved, root_cluster, total_sectors)
     fn layout(self) -> (u16, u32, u32, u32, u32) {
         match self {
-            FatType::Fat12 => (224, 2, 1, 0, 1024),
+            FatType::Fat12 => (224, 3, 1, 0, 1024),
             FatType::Fat16 => (512, 17, 1, 0, 4224),
             FatType::Fat32 => (0, 64, 32, 2, 2048),
         }
@@ -490,6 +490,11 @@ impl FatImageBuilder {
         // 空闲簇池（最低优先）。FAT32 的根目录占簇 2，先从池中划走。
         let mut next_free: Vec<u32> = (2..max_cluster).collect();
         let root_cluster_actual = if root_cluster >= 2 { next_free.remove(0) } else { 0 };
+        // FAT32 根目录簇自身的表项 = EOC（规范要求）
+        if root_cluster_actual >= 2 {
+            let o = (fat_start * BPS) as usize + root_cluster_actual as usize * 4;
+            image[o..o + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        }
         // 子目录各占一簇
         let mut dir_clusters: Vec<(String, u32)> = Vec::new();
         for d in &self.subdirs {
@@ -610,7 +615,7 @@ impl FatImageBuilder {
         bs[22..24].copy_from_slice(&(if root_entries > 0 { fat_size as u16 } else { 0 }).to_le_bytes());
         bs[24..26].copy_from_slice(&63u16.to_le_bytes());
         bs[26..28].copy_from_slice(&255u16.to_le_bytes());
-        bs[28..32].copy_from_slice(&(root_start as u32).to_le_bytes());
+        bs[28..32].copy_from_slice(&(data_start as u32).to_le_bytes());
         bs[32..36].copy_from_slice(&total_sectors.to_le_bytes());
         bs[36] = 0x80;
         bs[38] = 0x29;
