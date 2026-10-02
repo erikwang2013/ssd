@@ -811,7 +811,7 @@ fn build_entry_set(name: &str, attr: u16, first_cluster: u32, dl: u64, no_fat_ch
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fixtures`
-Expected: 16 passed（13 `#[test]` + 3 `#[should_panic]`）；既有 FAT builder 测试不回归。
+Expected: **22 passed（15 `#[test]` + 7 `#[should_panic]`）**——基础 16 之上含修复轮新增 6：`upcase_hashes_accented_names_via_real_table`、`empty_file_is_valid`、`panics_when_explicit_clusters_too_few`、`panics_on_allocation_conflict`、`panics_on_vdl_exceeding_data`、`panics_on_subdir_slot_overflow`（见修订轮）；既有 FAT builder 12 测试不回归。
 
 - [ ] **Step 5: Commit**
 
@@ -837,7 +837,23 @@ git commit -m "feat(fixtures): exFAT 合成镜像 builder（几何/checksum/项�
 - **⑤ rustfmt** 展开。
 
 **下游常量（T4-T7 依赖）**：根目录多簇时项集簇对齐 + 0x01 填充；root_grows 场景文件占簇 6..50、第二根簇 51、
-首集为 `F0041.TXT`。计数：xd-fixtures **28**（16 exfat + 12 FAT）、workspace **104**。
+首集为 `F0041.TXT`。
+
+**修复轮（qual-t1，2026-10-02）**：质量审查 With fixes（3 Important 均计划文本问题，实现忠实照抄），
+修复提交 **`cf4e7e7`**（"fix(fixtures): NameHash 走规范表上转型、显式簇数守卫与补齐/断言补测（qual-t1）"）：
+
+- **I1**：NameHash 上转型改为**规范表驱动**（`OnceLock` + `decode_upcase(UPCASE_TABLE)`，decode_un-gate 进生产路径）——
+  é→É、α→Α 等非 ASCII 映射不可漏（实证 `Café.TXT` 旧值 0x7C06 ≠ 表值 **0x6C06**，fsck 判 name hash wrong）；
+  新测试钉 0x6C06。ASCII 结果不变 → 下游零影响。
+- **I2**：`add_file_in_clusters` 加"簇数容得下数据"断言（**计划 T6 配方自己踩中**：`&[7]` 装 4500B 静默丢尾、
+  fsck 判损）→ 断言 + 计划 T6 配方改 `&[7, 8]`（qual 验证断言结果不变）。
+- **I3(a)**：root_grows 补 0x01 补齐断言（槽 126/127）——防回归成 0x00 导致解析器半途终止；
+  **I3(b)**：T5 新增 `scans_multi_cluster_root_completely`（45 文件多簇根 → 45 条全出）。
+- **M1-M4**：push_dir_unit debug_assert（落地为 `is_multiple_of` 形式，rust 1.97 clippy 门禁所迫）；
+  4 个 should_panic + 空文件测试；删 `_pad` 死参；删 `upcase_ascii`（其测试自洽校验改用 `upcase_table()`）。
+- **M5（拆分，不阻塞）**：exfat.rs 916 行 → M1b 欠账（缝：纯 checksum/upcase 函数约 90 行 → exfat_checksum.rs）。
+
+计数：xd-fixtures **34**（22 exfat + 12 FAT）、workspace **110**。
 
 ---
 
@@ -1220,7 +1236,7 @@ pub fn parse(dev: &dyn BlockDevice) -> Result<ExfatBoot, ExfatError> {
 }
 ```
 
-- [ ] **Step 4: 运行 `cargo test -p xd-fs-exfat`** → 预期 **9 passed**；workspace 其余不回归。
+- [ ] **Step 4: 运行 `cargo test -p xd-fs-exfat`** → 预期 **9 passed**；workspace 其余不回归。（T2 无测试计数变化于 T1 修复轮。）
 
 - [ ] **Step 5: Commit** `feat(fs-exfat): 引导区解析（几何校验/checksum/Backup 回退）`
 
@@ -2150,6 +2166,23 @@ mod tests {
         assert!(dcim.deleted && dcim.is_dir, "is_dir 忠实属性");
         assert!(!entries.iter().any(|e| e.name == "IMG.JPG"), "不递归已删目录");
     }
+
+    #[test]
+    fn scans_multi_cluster_root_completely() {
+        // 45 文件把根撑到 2 簇（含 0x01 补齐）：扫描必须读满整链、45 条全出——
+        // 防"补齐回归成 0x00 导致解析器半途终止、静默丢后半根目录"（qual-t1 I3）
+        let mut b = xd_fixtures::ExfatImageBuilder::new();
+        for i in 0..45u32 {
+            b.add_file("/", &format!("F{i:04}.TXT"), b"x");
+        }
+        let image = b.build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let files: Vec<&str> = entries.iter().filter(|e| !e.is_dir).map(|e| e.name.as_str()).collect();
+        assert_eq!(files.len(), 45, "多簇根不得丢条目：{files:?}");
+        assert!(files.contains(&"F0041.TXT"), "第二根簇的条目必须在列");
+        assert!(files.contains(&"F0044.TXT"));
+    }
 }
 ```
 
@@ -2394,7 +2427,7 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 }
 ```
 
-- [ ] **Step 4: 运行** → **11 passed**（累计 crate 46）
+- [ ] **Step 4: 运行** → **12 passed**（累计 crate 47）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 扫描与质量分级（位图权威/texFAT 选表/根失败即 Err）`
 
 ---
@@ -2457,12 +2490,12 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 
     #[test]
     fn deleted_chained_occupied_middle_cluster_truncates_prefix() {
-        // OLD.BIN 链式 3 簇（6,7,8）删除后，簇 7 被 NEW.BIN 复用 → 只交付簇 6 的前缀
+        // OLD.BIN 链式 3 簇（6,7,8）删除后，簇 7/8 被 NEW.BIN 复用 → 只交付簇 6 的前缀
         let data: Vec<u8> = (0..9000u32).map(|i| (i % 239) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
             .add_file_chained("/", "OLD.BIN", &data)
             .delete("/", "OLD.BIN")
-            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4500], &[7], false)
+            .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4500], &[7, 8], false)
             .build();
         let (_f, dev) = dev_for(&image);
         let old = scan(&dev).unwrap().into_iter().find(|e| e.name == "OLD.BIN").unwrap();
@@ -2615,7 +2648,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
 }
 ```
 
-- [ ] **Step 4: 运行** → **9 passed**（累计 crate 55；workspace 相应 +9）
+- [ ] **Step 4: 运行** → **9 passed**（累计 crate 56；workspace 相应 +9）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 文件读取（连续/链/stale 链 + 位图截断前缀、VDL 交付）`
 
 ---
@@ -2691,7 +2724,7 @@ fn deleted_chained_photo_recovered_byte_exact() {
 }
 ```
 
-- [ ] **Step 2: 运行** → crate **57 passed**（55 + 2）
+- [ ] **Step 2: 运行** → crate **58 passed**（56 + 2）
 
 - [ ] **Step 3: 生成示例**
 
