@@ -65,6 +65,7 @@ pub struct TaskRow {
     pub total_bytes: u64,
 }
 
+/// 连接锁中毒即 fail-stop（`unwrap`）——daemon 由监督重启兜底。
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -170,6 +171,7 @@ impl Store {
         Ok(())
     }
 
+    /// `INSERT OR REPLACE`：同 `(task_id, idx)` 重插=替换——供 M1c 断点续跑重扫区间复用。
     pub fn insert_entries(&self, task_id: u64, entries: &[ScanEntry]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
@@ -388,6 +390,53 @@ mod tests {
             s.entries(id, 0, 10, false).unwrap()
         };
         assert_eq!(total2, 2, "不同 idx 正常追加，REPLACE 不误伤新行");
+    }
+
+    #[test]
+    fn set_progress_roundtrips() {
+        let s = Store::open_memory().unwrap();
+        let id = s.create_task("d", "fat", 10).unwrap();
+        s.set_progress(id, 7, 3, 250).unwrap();
+        let t = s.task(id).unwrap().unwrap();
+        assert_eq!(
+            (t.read_bytes, t.found_count, t.elapsed_ms),
+            (7, 3, 250),
+            "三列各归其位"
+        );
+        assert_eq!(t.total_bytes, 10, "total_bytes 不被 set_progress 触碰");
+    }
+
+    #[test]
+    fn unknown_state_reads_as_failed() {
+        let s = Store::open_memory().unwrap();
+        let id = s.create_task("d", "fat", 1).unwrap();
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET state = 'bogus' WHERE id = ?1",
+                params![id as i64],
+            )
+            .unwrap();
+        assert_eq!(
+            s.task(id).unwrap().unwrap().state,
+            ScanState::Failed,
+            "未知态诚实降级"
+        );
+    }
+
+    #[test]
+    fn entries_and_clear_are_task_scoped() {
+        let s = Store::open_memory().unwrap();
+        let a = s.create_task("d", "fat", 1).unwrap();
+        let b = s.create_task("d", "fat", 1).unwrap();
+        s.insert_entries(a, &[entry(0, "A.JPG", false)]).unwrap();
+        s.insert_entries(b, &[entry(0, "B.JPG", false)]).unwrap();
+        let (ta, pa) = s.entries(a, 0, 10, false).unwrap();
+        assert_eq!((ta, pa.len()), (1, 1));
+        assert_eq!(pa[0].name, "A.JPG", "不泄漏他任务条目");
+        s.clear_entries(a).unwrap();
+        assert_eq!(s.entries(b, 0, 10, false).unwrap().0, 1, "clear 只清本任务");
     }
 
     #[test]
