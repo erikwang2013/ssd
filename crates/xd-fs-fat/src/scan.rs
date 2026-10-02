@@ -272,4 +272,35 @@ mod tests {
         let entries = scan(&dev).unwrap();
         assert!(entries.is_empty(), "卷标不应出现在结果中: {entries:?}");
     }
+
+    #[test]
+    fn bad_subdir_chain_does_not_abort_scan() {
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_subdir("/", "PHOTOS")
+            .add_file("/PHOTOS", "IMG.JPG", &[3u8; 100])
+            .add_file("/", "ROOT.TXT", b"root")
+            .build();
+        let mut patched = image.clone();
+        let base = 18 * 512; // FAT16 根目录区起点
+        let pos = patched[base..base + 32 * 8]
+            .chunks(32)
+            .position(|c| &c[..5] == b"PHOTO")
+            .unwrap();
+        patched[base + pos * 32 + 26..base + pos * 32 + 28]
+            .copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        assert!(
+            entries.iter().any(|e| e.name == "ROOT.TXT"),
+            "坏子目录链不得中止全盘"
+        );
+        assert!(
+            entries.iter().any(|e| e.name == "PHOTOS"),
+            "坏目录项本身仍应列出"
+        );
+        assert!(
+            !entries.iter().any(|e| e.name == "IMG.JPG"),
+            "不可读目录不得产出条目"
+        );
+    }
 }
