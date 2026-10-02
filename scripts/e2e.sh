@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 # M0 端到端冒烟：生成镜像 → 走 stdio 发 ping + device.list → 断言。
 set -euo pipefail
 cd "$(dirname "$0")/.."

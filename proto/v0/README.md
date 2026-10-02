@@ -40,3 +40,7 @@
 
 examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.request.json`、
 `device_list.response.json`、`error_method_not_found.response.json`。
+
+---
+
+© 2026 erik · https://erik.xyz · erik@erik.xyz

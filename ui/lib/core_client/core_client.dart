@@ -1,3 +1,4 @@
+// © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 import 'protocol.dart';
 
 /// UI 只依赖这个抽象；桌面实现 = IpcCoreClient，移动端 = FfiCoreClient（M4）。

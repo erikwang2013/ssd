@@ -1,0 +1,29 @@
+© 2026 erik · https://erik.xyz · erik@erik.xyz
+
+「小盾」（xiaodun）项目的全部第一方代码、图片与文档，版权归 erik 所有。
+
+本仓库包含三层所有权标记：
+
+1. 可见版权头 —— 第一方源码文件头部（crates/、ui/lib、ui/test、scripts/、
+   fixtures/、.github/、Cargo.toml、pubspec.yaml），由 scripts/apply-copyright.sh
+   统一加盖，可重复运行（幂等）。
+
+2. 隐藏标记 —— 版权行末尾的零宽字符序列（U+200B=0 / U+200D=1，UTF-8 字节序）
+   编码 "erik.xyz"。诚实说明：这是**编码，不是加密**——任何工具都能检出与删除，
+   仅作复制溯源时的威慑与辅助。解码方法见 scripts/apply-copyright.sh 头注释。
+
+3. 签名清单（不可伪造）—— provenance.sha256 是全部受控文件的 SHA-256 快照，
+   由 erik 的 SSH 私钥签名（provenance.sha256.sig）。没有私钥就无法伪造清单；
+   这一层不依赖"隐藏"，是真正拒止篡改与冒名的一层。
+   注意：清单是快照——任何文件改动后需重新生成并重签（命令见下）。
+
+验证签名：
+  ssh-keygen -Y verify -f provenance.allowed_signers -I erik@erik.xyz \
+    -n erik-xyz-provenance -s provenance.sha256.sig < provenance.sha256
+  # 预期输出：Good "erik-xyz-provenance" signature
+
+重新生成并签名：
+  git ls-files | grep -vE '^provenance\.' | sort | xargs sha256sum > provenance.sha256
+  ssh-keygen -Y sign -f ~/.ssh/id_rsa -n erik-xyz-provenance -O hashalg=sha512 provenance.sha256
+
+图片：SVG 内嵌 <metadata> 与角落署名；PNG/ICO 含版权元数据（tEXt）。

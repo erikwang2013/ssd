@@ -1,3 +1,4 @@
+// © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 import 'dart:io' show Platform, ProcessException;
 
 import 'package:flutter/material.dart';

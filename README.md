@@ -175,3 +175,7 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真实 d
 Flutter 骨架（协议模型、设备列表页）已端到端打通，CI 三平台矩阵就位。
 下一步：M1（FAT/exFAT 快速扫描、照片雕刻、Windows 提权打包）。目标：全端 1.0
 约 9-12 个月（5-6 人团队，4 条工作流并行）。
+
+---
+
+© 2026 erik · https://erik.xyz · erik@erik.xyz

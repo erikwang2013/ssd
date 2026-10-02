@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 # 生成确定性测试镜像：默认 1 MiB，字节模式 (i*7+13) mod 256。
 set -euo pipefail
 out="${1:-$(dirname "$0")/test.img}"

@@ -1,3 +1,4 @@
+// © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! 小盾桌面特权进程：stdio JSON-RPC 服务（每行一条 JSON，见 proto/v0/README.md）。
 //! 提权与设备枚举在 M1/M2 接入；M0 只支持 --image 注册镜像设备。
 
@@ -35,7 +36,7 @@ fn main() {
     }
 
     eprintln!(
-        "小盾 xd-daemon {} · protocol {} · {} 个镜像设备已注册",
+        "小盾 xd-daemon {} · © erik.xyz erik@erik.xyz · protocol {} · {} 个镜像设备已注册",
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION,
         devices.len()

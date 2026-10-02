@@ -1,3 +1,4 @@
+# © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 name: CI
 
 # 仅手动触发（Actions 页 "Run workflow"），不随 push / PR 自动执行。
