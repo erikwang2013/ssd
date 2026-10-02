@@ -31,6 +31,26 @@ class FailingCoreClient implements CoreClient {
   Future<void> close() async {}
 }
 
+class FlakyCoreClient implements CoreClient {
+  FlakyCoreClient(this.devices);
+  final List<DeviceInfo> devices;
+  var calls = 0;
+
+  @override
+  Future<PingResult> ping() async =>
+      const PingResult(pong: true, version: 'test', protocol: 0);
+
+  @override
+  Future<List<DeviceInfo>> listDevices() async {
+    calls++;
+    if (calls == 1) throw const RpcException(-1, 'boom');
+    return devices;
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
 void main() {
   testWidgets('shows device list from client', (tester) async {
     await tester.pumpWidget(
@@ -60,5 +80,31 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining('boom'), findsOneWidget);
     expect(find.text('重试'), findsOneWidget);
+  });
+
+  testWidgets('retry re-invokes the client', (tester) async {
+    final client = FlakyCoreClient(const [
+      DeviceInfo(
+        id: 'image:retry.img',
+        name: 'retry.img',
+        kind: 'image',
+        sizeBytes: 2048,
+        removable: false,
+      ),
+    ]);
+    await tester.pumpWidget(MaterialApp(home: HomePage(client: client)));
+    await tester.pumpAndSettle();
+    expect(find.text('重试'), findsOneWidget);
+    await tester.tap(find.text('重试'));
+    await tester.pumpAndSettle();
+    expect(find.text('retry.img'), findsOneWidget);
+  });
+
+  testWidgets('shows empty state when no devices', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(home: HomePage(client: FakeCoreClient(const []))),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('未发现设备'), findsOneWidget);
   });
 }

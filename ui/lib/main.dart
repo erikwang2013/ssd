@@ -1,3 +1,5 @@
+import 'dart:io' show ProcessException;
+
 import 'package:flutter/material.dart';
 
 import 'core_client/core_client.dart';
@@ -7,12 +9,14 @@ import 'home_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // M0：真实 daemon 通过 XD_DAEMON_BIN 指定；无 daemon 时 UI 显示错误态。
+  // M0：真实 daemon 通过 XD_DAEMON_BIN 指定；未配置或启动失败时 UI 显示错误态。
   CoreClient client;
   try {
     client = await IpcCoreClient.start();
-  } on StateError {
-    client = _MissingDaemonClient();
+  } on StateError catch (e) {
+    client = _MissingDaemonClient('$e');
+  } on ProcessException catch (e) {
+    client = _MissingDaemonClient('daemon 启动失败：${e.message}');
   }
   runApp(XiaodunApp(client: client));
 }
@@ -36,13 +40,15 @@ class XiaodunApp extends StatelessWidget {
 }
 
 class _MissingDaemonClient implements CoreClient {
-  @override
-  Future<PingResult> ping() async =>
-      throw StateError('未找到 daemon：请设置 XD_DAEMON_BIN');
+  _MissingDaemonClient(this.reason);
+
+  final String reason;
 
   @override
-  Future<List<DeviceInfo>> listDevices() async =>
-      throw StateError('未找到 daemon：请设置 XD_DAEMON_BIN');
+  Future<PingResult> ping() async => throw StateError(reason);
+
+  @override
+  Future<List<DeviceInfo>> listDevices() async => throw StateError(reason);
 
   @override
   Future<void> close() async {}

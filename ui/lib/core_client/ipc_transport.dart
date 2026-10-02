@@ -9,11 +9,11 @@ import 'protocol.dart';
 class IpcCoreClient implements CoreClient {
   IpcCoreClient._(this._process) {
     _sub = _process.stdout
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen(_onLine);
     _process.stderr
-        .transform(utf8.decoder)
+        .transform(const Utf8Decoder(allowMalformed: true))
         .transform(const LineSplitter())
         .listen((line) => stderrLines.add(line));
     _process.exitCode.then(_onExit);

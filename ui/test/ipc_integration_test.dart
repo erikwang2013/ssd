@@ -7,6 +7,7 @@ void main() {
   final bin = Platform.environment['XD_DAEMON_BIN'];
   test('handshake with real daemon (ping + device.list)', () async {
     final dir = Directory.systemTemp.createTempSync('xd_ui_it');
+    addTearDown(() => dir.deleteSync(recursive: true));
     final image = File('${dir.path}/test.img')
       ..writeAsBytesSync(List<int>.filled(4096, 0));
     final client = await IpcCoreClient.start(
