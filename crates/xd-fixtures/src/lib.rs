@@ -1,10 +1,10 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! 合成 FAT 镜像构建器：测试与 e2e 的全部输入来源（脱开真实硬件）。
 //! 参数固定（T1 只支持 FAT16；T2 扩展 FAT12/32）：bps=512、spc=1、reserved=1、
-//! fats=1、root_entries=512、fat_size=4 扇区、total=4096 扇区（2 MiB）。
+//! fats=1、root_entries=512、fat_size=17 扇区、total=4224 扇区（≈2.06 MiB）。
 
 pub const BPS: u32 = 512; // bytes per sector
-pub const TOTAL_SECTORS: u32 = 4096;
+pub const TOTAL_SECTORS: u32 = 4224;
 
 #[derive(Clone)]
 struct BuildFile {
@@ -49,15 +49,16 @@ impl FatImageBuilder {
     pub fn build(&self) -> Vec<u8> {
         // 布局（扇区）：
         //  0        reserved / 引导扇区
-        //  1..5     FAT#1（4 扇区）
-        //  5..37    根目录（512 项 × 32B = 32 扇区）
-        //  37..    数据区（簇 N → 扇区 37 + (N-2)）
+        //  1..18    FAT#1（17 扇区 = 8704B = 4352 项 ≥ 4174 簇 + 2）
+        //  18..50   根目录（512 项 × 32B = 32 扇区）
+        //  50..    数据区（簇 N → 扇区 50 + (N-2)）
+        // 数据区 4174 簇 ∈ [4085, 65525)，按微软簇数规则结构判定为真 FAT16
         const FAT_START: u32 = 1;
-        const FAT_SIZE: u32 = 4;
-        const ROOT_START: u32 = FAT_START + FAT_SIZE; // 5
+        const FAT_SIZE: u32 = 17;
+        const ROOT_START: u32 = FAT_START + FAT_SIZE; // 18
         const ROOT_SECTORS: u32 = 32;
-        const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 37
-        const MAX_CLUSTER: u32 = 2 + (TOTAL_SECTORS - DATA_START); // spc=1
+        const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 50
+        const MAX_CLUSTER: u32 = 2 + (TOTAL_SECTORS - DATA_START); // spc=1 → 簇 2..=4175
 
         let mut image = vec![0u8; (TOTAL_SECTORS * BPS) as usize];
 
@@ -126,7 +127,7 @@ impl FatImageBuilder {
         bs[22..24].copy_from_slice(&(FAT_SIZE as u16).to_le_bytes());
         bs[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track（惯例值）
         bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
-        bs[28..32].copy_from_slice(&37u32.to_le_bytes()); // hidden sectors（惯例）
+        bs[28..32].copy_from_slice(&DATA_START.to_le_bytes()); // hidden sectors
         bs[32..36].copy_from_slice(&TOTAL_SECTORS.to_le_bytes());
         bs[36] = 0x80; // drive number
         bs[38] = 0x29; // boot signature
