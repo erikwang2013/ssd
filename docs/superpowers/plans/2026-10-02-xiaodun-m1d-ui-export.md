@@ -647,6 +647,8 @@ git commit -m "feat(ui): 传输层 v1.2——参数化调用/通知流/pkexec �
 
 ### Task 5: 扫描页（模式选择 / 真实进度 / 暂停恢复取消 / EACCES 引导）
 
+> **T4 移交（qual-m1d-t4 错误语义实测）**：transport 文案保持诊断原样；**展示层映射**：`on StateError` → 「核心服务已退出，请重启应用」（-15 是用户在途退出的正常路径，直接 `'$e'` 会渲染 `Bad state: daemon exited with code -15`）；`TimeoutException` → 「核心服务无响应」（close 后的新调用是挂 10s 超时，非 StateError）；其余沿用现有文案。另 `"id":null` 应答行会被当通知入流（契约片段如此）→ **分发器必须容忍 `method==null`**。
+
 **Files:**
 - Create: `ui/lib/features/scan/scan_page.dart`（+`scan_controller.dart`）
 - Modify: `ui/lib/home_page.dart`（设备项 onTap → 进入 ScanPage）、`ui/lib/main.dart`（路由）
@@ -680,6 +682,8 @@ Scaffold(appBar: 设备名 + 返回)
 ---
 
 ### Task 6: 结果浏览页（虚拟化分页 / 过滤 / 多选 / 质量徽标）
+
+> **T4 移交铁律（spec-m1d-t4 观察 b）**：`ScanEntry.displayName`（空名→`carved_%06d.%ext`）**仅供展示**——它不做 sanitize、与 worker 落盘名可能不同（ext 注入等）。**本页与 T8 报告页一律以 `ExportReportItem.name` 为实际落盘名**；任何写路径（导出/打开文件/预览另存）不得消费 displayName。
 
 **Files:**
 - Create: `ui/lib/features/results/{results_page.dart, results_controller.dart, entry_tile.dart}`
@@ -735,6 +739,8 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 ---
 
 ### Task 8: 恢复页（目标选择 / 导出进度 / 报告）
+
+> **T4 移交**：报告页「打开目标文件夹」与任何精确定位落盘文件的动作，一律用 `ExportReportItem.name`（实际落盘名）而非 `displayName`（展示名，见 T6 铁律）；成功件不在 items 里（契约如此）——「打开文件夹」只按目录打开，不按名定位成功件（M5b 注记）。
 
 **Files:**
 - Modify: `ui/pubspec.yaml`（+`file_selector`（官方，desktop 支持））
@@ -818,6 +824,14 @@ Scaffold('恢复文件')
 - **★ 测试底盘竞序（teeth 复验抓出）**：`scan.start`/`export.start` 先起后台线程再回响应 → `finished` 通知可抢在响应前（150 次插桩 6 次）；旧读法丢弃通知→永等。**`Wire` 寄存读口**（两序容忍、通知寄存不丢）收敛 export_ipc + scan_ipc 全量；确定性靶 + 变异版 6× 负载 2 FAIL vs 修复版 60/60（真抢跑负载诱发约 3%/跑，集中 cancel 响应侧）。
 - **记录不修**：M6（items>1000 截断无构造）、M5a（--export-id 错值纯诊断）、I1 µs 残窗（终态×计数同锁发布归 M4）、stale-pid（M4 pidfd）、`{stem}_N` 规则已补 README v1.2。
 - **未验证（需真机 root/pkexec）**：降权链与 root-mode `image:` 门；-32006 真环回断言归 T9/scripts。
+
+### T4（Dart 传输层 v1.2）—— impl-m1d-t4。提交沿革：`88ff380`（主）→ `f35f7a1`（qual 补牙）。DONE → spec **PASS** → qual ISSUES(轻微) → 补牙有牙（T4 关闭；34+1 / 带 daemon 35/0）
+
+- **交付**：v1.2 模型（`ScanEntry+byteOffset/contiguous/displayName`、`FsRead`/`Export*` 模型）；`CoreClient` 11 方法 + 通知流；`_call(params)`；`startPrivileged`（标注未验证）；`FakeCoreClient`（测试公用，home_page_test 全部换用）；`ipc_transport_test.dart`（`/bin/sh` 假 daemon 钉住"无 id=通知"唯一真分支——CI 真 daemon 无法产通知）。
+- **spec 独立核验（强）**：独立 dart 解码器 + python 假 daemon；11 请求 golden 编码逐字 + 真 `IpcCoreClient` 发 23 条线上线文与 golden **逐字节相同**；**displayName 两端对齐表**（ext="" 两端同回退 bin；ext 注入形态 Dart 不 sanitize → 仅展示层——**铁律已入 T6/T8**：写路径只传 idx、报告用 `ExportReportItem.name`）。
+- **qual 变异 10 条**：5 KILL；3 缺口补牙（broadcast 多监听/close onDone/Fake 分页 off-by-one——均实测有牙）；等价 1（null-id 行）;接受 1（startPrivileged argv 归真机清单）。**借文件热关 Fake 保真 P1/P2**（limit 1..=1000 校验文案逐字 + idx 升序）；P3/P4 记录。
+- **错误语义修正（qual 实测）**：close 后**新**调用是挂 10s `TimeoutException`（非 StateError）；`StateError(-15)` 仅在途调用——T5 展示层映射已入计划。
+- helper 重复不合并（YAGNI，第 4 个消费文件出现时再提取）；`"id":null` 行入通知流 → 分发器容忍 `method==null`（已入 T5）。
 
 ---
 
