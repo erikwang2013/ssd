@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn decodes_deleted_sfn_first_byte_05_quirk() {
         let mut raw = [0u8; 32];
-        raw[..11].copy_from_slice(b"\x05EVIL  TXT"); // 真实名以 0xE5 开头时磁盘上写 0x05
+        raw[..11].copy_from_slice(b"\x05EVIL   TXT"); // 真实名以 0xE5 开头时磁盘上写 0x05（11 字节，勿少空格）
         raw[11] = 0x20;
         let e = parse_slot(&raw);
         let Slot::Sfn(s) = e else { panic!() };
@@ -1606,6 +1606,8 @@ pub fn parse_slot(raw: &[u8; 32]) -> Slot {
 }
 
 /// 组装 8.3 名。`lcase` 为属性字节（bit3=基名小写, bit4=扩展名小写）；删除项首字符不可知 → '?'。
+/// 非 ASCII 字节按 Latin-1（`b as char`）呈现——保留磁盘原始 OEM 字节，0xE5 quirk 无损；
+/// 不依赖 UTF-8（0xE5 单字节经 from_utf8_lossy 会变 U+FFFD）。
 pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
     let mut base: Vec<u8> = name83[..8].iter().copied().take_while(|&c| c != b' ').collect();
     let ext: Vec<u8> = name83[8..].iter().copied().take_while(|&c| c != b' ').collect();
@@ -1628,10 +1630,10 @@ pub fn assemble_sfn_name(name83: &[u8; 11], lcase: u8) -> String {
     apply(&mut base, lcase & 0x08 != 0);
     let mut ext = ext;
     apply(&mut ext, lcase & 0x10 != 0);
-    let mut out = String::from_utf8_lossy(&base).into_owned();
+    let mut out: String = base.iter().map(|&b| b as char).collect();
     if !ext.is_empty() {
         out.push('.');
-        out.push_str(&String::from_utf8_lossy(&ext));
+        out.extend(ext.iter().map(|&b| b as char));
     }
     out
 }
