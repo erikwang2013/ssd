@@ -2575,6 +2575,20 @@ bash scripts/e2e.sh
 
 ---
 
+## 执行记录：T9 出口验收（lead 执行）
+
+**Step 1 全量门禁（本地）**：`cargo fmt --check` ✓ / `clippy -D warnings` ✓ / **debug 291 passed / 0 failed** / **release 291 passed / 0 failed**（release 档是 M1a2 抓出过 release-only 缺陷的必跑档）/ `scripts/e2e.sh` **E2E OK**（真机枚举可见 `/dev/sda|sdb` 且 `transport:"sata"`——T1 成果的活证据）/ flutter `+19 ~1` + analyze 干净 + dart format 0 changed。
+
+**Step 2 变异抽检（跨层 kill 链）**：把 `scan_worker.rs` 的 `"scan.finished"` 通知名改成 `"scan.progress"` → `cargo test -p xd-daemon` **恰 3 枚集成测试红**（cancel_mid_scan / scan_flow_and_restart_persistence / pause_resume_over_ipc）→ 还原（cmp 逐字节）。各任务 qual 累计变异：T1 11 + T2 14 + T3 8 + T4 20+ + T5 13 + T6 9 + T7 5 ≈ **80 个变异**，等价/护栏类均逐条有据。
+
+**Step 3 水印与溯源**：`apply-copyright.sh` 幂等（T7 复跑 stamped 0）；provenance.sha256 重生成与签名归发版时（用户触发的发布流程）——本合并记录注明待发版。
+
+**Step 4 文档同步**：README 项目状态节（M1b 合入如实描述 + 剩余切片）与 daemon CLI（`--db`/scan RPC）；`docs/security/linux-privilege-model.md` §5 手测清单追加「真机扫描全链路长跑」条目（进度节奏/暂停读停/取消静默/XDG 库/真百分比）。
+
+**Step 5 合入与 CI**：`--no-ff` merge 至 main（`090cde5`，65 文件 +8429/−1632；含 v0.2.0 以来全部 M1b 工作与三份后续计划）；push main → workflow_dispatch →（CI 结果见下）
+
+---
+
 ## 验收定义（M1b Done 的判据）
 
 1. `proto/v1/` 20 个 golden（19 + device.list 对）双侧断言（Rust contract_v1 + handlers 往返 + Dart），`PROTOCOL_VERSION = 1`，v0 golden 除 method-not-found 文案外不动。
