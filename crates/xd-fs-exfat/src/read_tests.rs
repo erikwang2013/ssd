@@ -1,4 +1,5 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
+//! 测试体集中于此属刻意（源文件线宽控制的另一半）；本文件不受 500 行约束。
 use super::*;
 use crate::boot::testutil::dev_for;
 use crate::scan::{RecoverQuality, scan};
