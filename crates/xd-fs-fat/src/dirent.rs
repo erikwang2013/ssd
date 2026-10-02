@@ -140,8 +140,9 @@ pub struct ParsedEntry {
 pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
     let mut out = Vec::new();
     let mut lfn_run: Vec<LfnSlot> = Vec::new();
-    for chunk in data.chunks_exact(32) {
-        let raw: &[u8; 32] = chunk.try_into().expect("chunks_exact(32)");
+    for raw in data.as_chunks::<32>().0 {
+        // as_chunks(32) 与 chunks_exact(32) 同语义（尾部残片丢弃）；clippy 1.99 起
+        // 提议该写法（chunks_exact_to_as_chunks），此处采用以兼容更新的 CI 工具链
         // 跳过 "." / ".."（真实 FAT 目录均含；不是可恢复文件，也不得触发递归）
         if &raw[..11] == b".          " || &raw[..11] == b"..         " {
             continue;
