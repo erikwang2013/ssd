@@ -1029,7 +1029,7 @@ mod tests {
         let (_f, dev) = dev_for(&image);
         let bpb = bpb::parse(&dev).unwrap();
         let fat = Fat::new(&dev, &bpb);
-        assert_eq!(fat.chain(2).unwrap(), vec![2, 3]);
+        assert_eq!(fat.chain(2).unwrap(), vec![2, 3, 4]); // 1200B → 3 簇
     }
 
     #[test]
@@ -1203,6 +1203,26 @@ mod tests {
         assert_eq!(assemble_sfn_name(&s.name83, 0), "?HOTO.JPG"); // 首字符不可知
     }
 
+    #[test]
+    fn skips_dot_entries() {
+        let mut dot = [0u8; 32];
+        dot[..11].copy_from_slice(b".          ");
+        dot[11] = 0x10;
+        let mut dotdot = [0u8; 32];
+        dotdot[..11].copy_from_slice(b"..         ");
+        dotdot[11] = 0x10;
+        let mut file = [0u8; 32];
+        file[..11].copy_from_slice(b"A       TXT");
+        file[11] = 0x20;
+        let mut data = Vec::new();
+        data.extend_from_slice(&dot);
+        data.extend_from_slice(&dotdot);
+        data.extend_from_slice(&file);
+        let parsed = parse_directory_bytes(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "A.TXT");
+    }
+
     fn lfn_chars_to_slot(seq: u8, last: bool, text: &str) -> LfnSlot {
         LfnSlot {
             seq_raw: if last { seq | 0x40 } else { seq },
@@ -1365,6 +1385,10 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
     let mut lfn_run: Vec<LfnSlot> = Vec::new();
     for chunk in data.chunks_exact(32) {
         let raw: &[u8; 32] = chunk.try_into().expect("chunks_exact(32)");
+        // 跳过 "." / ".."（真实 FAT 目录均含；不是可恢复文件，也不得触发递归）
+        if &raw[..11] == b".          " || &raw[..11] == b"..         " {
+            continue;
+        }
         match parse_slot(raw) {
             Slot::End => break,
             Slot::Lfn(l) => lfn_run.push(l),
@@ -1396,29 +1420,10 @@ pub fn parse_directory_bytes(data: &[u8]) -> Vec<ParsedEntry> {
 }
 ```
 
-（测试辅助随之实现：`lfn_chars_to_slot(seq, last, text) -> LfnSlot` 把 `text` 的 UTF-16 码元填入 `chars`，`seq_raw = if last { seq | 0x40 } else { seq }`（`last=false` 且 seq=0 的删除用例传 `seq_raw: 0xE5, deleted: true` 由测试直接构造 `LfnSlot`）。为消除测试歧义：**测试模块的辅助函数完整写法**——实现者照做：
-
-```rust
-    fn lfn_chars_to_slot(seq: u8, last: bool, text: &str) -> LfnSlot {
-        LfnSlot { seq_raw: if last { seq | 0x40 } else { seq }, chars: text.encode_utf16().collect(), deleted: false }
-    }
-```
-并把 `lfn_assembly_deleted_orphan_reverses_physical_run` 用例改为直接构造删除槽：
-
-```rust
-    #[test]
-    fn lfn_assembly_deleted_orphan_reverses_physical_run() {
-        let mk = |text: &str| LfnSlot { seq_raw: 0xE5, chars: text.encode_utf16().collect(), deleted: true };
-        let slots = vec![mk("0.bin"), mk("my_ph")];
-        assert_eq!(assemble_lfn(&slots), "my_ph0.bin");
-    }
-```
-）
-
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 16 passed（11 + 5）。
+Expected: 17 passed（11 + 6）。
 
 - [ ] **Step 5: Commit**
 
