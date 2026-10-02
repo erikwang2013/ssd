@@ -464,12 +464,31 @@ lsblk FULL 为 "ST2000LM015-2E8174"）；rdev→sysfs 往返对真实设备节�
 false——内核 major 12 位不可达；b) `list_skips_unreadable_entry_not_abort` 用 0o000 手法，root/CAP_DAC_OVERRIDE
 下会失效（CI 无暴露面）。
 
+**修复轮（qual-t1，2026-10-02）**：质量审查 2 Important + 若干 Minor（Critical 无），修复提交 `abc52e5` + 终修 `0cd6b96`：
+
+- **I1（T2 计划缺口，已在本文件 T2 修正）**：`device.list` 同盘重复（`--device /dev/sda` 与枚举项 id 撞车）→
+  `CoreCtx::device_infos` 按 id 去重（打开者优先）+ 专用测试。
+- **I2**：`is_listable_name` mmc 形态紧化（`strip_prefix("mmcblk")` + 全 ASCII 数字）——`mmcblk0boot1`/`gp*`
+  幻影盘天然排除，后缀黑名单删除；谓词 KAT `is_listable_name_mmc_forms`。
+- **Minor 3-8**：`read_at` 循环补齐（对齐 trait 契约与 `image.rs`）；坏 size 字段 → `Io(InvalidData)`；
+  `canonicalize` 派生 id/kernel_name（by-id 场景真机验证 `ata-…→/dev/sdb`）+ sysfs `removable`；
+  `O_NONBLOCK`（FIFO 打开 15.6µs 返回 `NotAFile`——实测防挂死）；0o000 → EISDIR（root 下亦稳）；
+  非 UTF-8 条目名与 size 非数字测试。
+- **终修 `0cd6b96`**：非 UTF-8 测试加齿（补 size 使其"否则合法"，否则该测试无判别力）；linux.rs 折行至
+  **恰 500 行**；`InvalidData` 断言；三处机械折行（语义零变化）。
+- **归因更正**：minor 掩码的"glibc 0xfff00"说法不精确——`0xfff00` 是**内核** `new_decode_dev` 掩码；glibc
+  （`bits/sysmacros.h`）掩码不同但可达域（major<2^12、minor<2^20）逐值一致。结论"不可达、无需改码"不变。
+
+计数：xd-device **19**、worktree workspace **103**。M1e-T1 关闭。
+
 ---
 
 ### Task 2: daemon 接入（`--device` + 启动枚举）与环回 e2e
 
 **Files:**
-- Modify: `crates/xd-core/src/handlers.rs`（CoreCtx + list_only）
+- Modify: `crates/xd-device/src/linux.rs`（**追加** `impl RawDisk { pub fn device_info(&self) -> DeviceInfo }`——映射放 xd-device，
+  避免 "unix:" 语法在 daemon 侧二次格式化漂移；也是去重的实现点）
+- Modify: `crates/xd-core/src/handlers.rs`（CoreCtx + list_only + 去重）
 - Modify: `crates/xd-daemon/src/main.rs`（`--device` 参数 + 启动枚举）
 - Create: `crates/xd-device/tests/loop_e2e.rs`（环境变量门控，无特权静默跳过）
 - Create: `scripts/e2e-loop.sh`
@@ -502,12 +521,50 @@ xd-core handlers.rs 测试模块新增：
 ```
 （xd-core dev-deps 需已有 tempfile——若缺，加 dev-dependency。）
 
+再加去重测试（同 id 的打开项 + 枚举项 → 只出现一次，打开者优先）：
+
+```rust
+    #[test]
+    fn device_list_dedupes_by_id() {
+        use xd_device::{BlockDevice, DeviceError, DeviceInfo, DeviceKind};
+        struct Stub;
+        impl BlockDevice for Stub {
+            fn info(&self) -> &DeviceInfo {
+                static I: std::sync::OnceLock<DeviceInfo> = std::sync::OnceLock::new();
+                I.get_or_init(|| DeviceInfo {
+                    id: "unix:/dev/sda".into(),
+                    name: "opened".into(),
+                    kind: DeviceKind::Physical,
+                    size_bytes: 42,
+                    removable: false,
+                    fs_guess: None,
+                })
+            }
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, DeviceError> {
+                Ok(0)
+            }
+        }
+        let ctx = CoreCtx::new(vec![Box::new(Stub)]).with_list_only(vec![DeviceInfo {
+            id: "unix:/dev/sda".into(), // 与打开项同 id → 必须被去重
+            name: "enumerated".into(),
+            kind: DeviceKind::Physical,
+            size_bytes: 42,
+            removable: false,
+            fs_guess: None,
+        }]);
+        let infos = ctx.device_infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "opened");
+    }
+```
+
 `crates/xd-device/tests/loop_e2e.rs`：
 
 ```rust
 //! 环回真块设备 e2e：由 scripts/e2e-loop.sh（root）建好环回并传入环境变量。
 //! 未设置时静默通过——无特权环境（本机日常）自动跳过，CI 上由脚本驱动真跑。
 use std::path::Path;
+use xd_device::BlockDevice; // size_bytes/read_at 是 trait 方法（qual-t1 预告的编译修正）
 
 #[test]
 fn loop_device_reads_identical_bytes() {
@@ -554,10 +611,34 @@ impl CoreCtx {
         self
     }
 
+    /// 打开的设备优先；`list_only` 中与已打开 id 重复的条目丢弃——
+    /// 否则 `--device /dev/sda` 会与枚举出的同一块盘在 device.list 里出现两次（qual-t1 I1）。
     pub fn device_infos(&self) -> Vec<DeviceInfo> {
         let mut v: Vec<DeviceInfo> = self.devices.iter().map(|d| d.info().clone()).collect();
-        v.extend(self.list_only.iter().cloned());
+        for info in &self.list_only {
+            if !v.iter().any(|e| e.id == info.id) {
+                v.push(info.clone());
+            }
+        }
         v
+    }
+}
+```
+
+`crates/xd-device/src/linux.rs` 追加（映射集中一处，qual-t1 建议）：
+
+```rust
+impl RawDisk {
+    /// 映射为 IPC 契约类型。id 语法 `unix:/dev/<node>` 集中此处（daemon 侧不再格式化）。
+    pub fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            id: format!("unix:{}", self.node.display()),
+            name: self.name.clone(),
+            kind: self.kind,
+            size_bytes: self.size_bytes,
+            removable: self.removable,
+            fs_guess: None, // device.list 零 open()；FS 探测归 M1b 按需调用
+        }
     }
 }
 ```
@@ -568,22 +649,12 @@ daemon main.rs：
 
 ```rust
     #[cfg(target_os = "linux")]
-    let list_only: Vec<xd_device::DeviceInfo> = {
-        use xd_device::{DeviceInfo, DeviceKind};
-        xd_device::linux::BlockEnumerator::new()
-            .list()
-            .unwrap_or_default() // 枚举失败不阻塞 daemon 启动
-            .into_iter()
-            .map(|d| DeviceInfo {
-                id: format!("unix:{}", d.node.display()),
-                name: d.name,
-                kind: DeviceKind::Physical,
-                size_bytes: d.size_bytes,
-                removable: d.removable,
-                fs_guess: None, // device.list 零 open()；FS 探测归 M1b 按需调用
-            })
-            .collect()
-    };
+    let list_only: Vec<xd_device::DeviceInfo> = xd_device::linux::BlockEnumerator::new()
+        .list()
+        .unwrap_or_default() // 枚举失败不阻塞 daemon 启动
+        .iter()
+        .map(|d| d.device_info()) // 映射在 xd-device（qual-t1 建议）
+        .collect();
     #[cfg(not(target_os = "linux"))]
     let list_only: Vec<xd_device::DeviceInfo> = Vec::new();
 
@@ -626,7 +697,7 @@ echo "LOOP E2E OK"
 
 ci.yml：Linux e2e 步骤后追加一步 `bash scripts/e2e-loop.sh`（手动触发策略不变）。
 
-- [ ] **Step 3: 运行** → xd-core +1 测试；xd-device 集成测试本地静默跳过；workspace 全绿；`bash scripts/e2e-loop.sh` 本机输出 `skip: 无免密 sudo…`（退出 0）
+- [ ] **Step 3: 运行** → xd-core +2 测试（合并 + 去重）；xd-device 集成测试本地静默跳过；workspace 全绿；`bash scripts/e2e-loop.sh` 本机输出 `skip: 无免密 sudo…`（退出 0）
 - [ ] **Step 4: Commit** `feat(daemon): --device 注册与启动枚举（device.list 零 open），环回 e2e 脚本`
 
 ---
