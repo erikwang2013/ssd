@@ -1266,8 +1266,9 @@ fat_offset=2048/fat_length=15/heap=4096/count=1536/root=5、无 Backup 回退）
   `ExfatBoot #[non_exhaustive]`；huge_volume 补 volume_length 断言。
 - **遗留（注释级）**：boot.rs:317 注释把 108=64 的 release 表现写作"容量溢出"，实为掩码后切片越界
   （63/127/255 之类才是容量溢出）——任意后续提交顺手更正。
-- **T3/T4 提醒**：`active_fat_offset()` 是**扇区单位**，entry_bytes 用 `as u64 * sector_bytes() + cluster as u64 * 4`；
-  T4 开工前若需独立校验，给 xd-fixtures 补 `pub use exfat::{entry_set_checksum, name_hash, fold16}`。
+- **T3/T4 提醒**：`active_fat_offset()` 是**扇区单位**，entry_bytes 用 `as u64 * sector_bytes() + cluster as u64 * 4`。
+  （**qual-t3 复核后作废**：T4-T8 无任何测试引用 xd-fixtures 的 checksum 助手，无需 re-export；跨实现一致性由
+  `checksum_ok/name_verified` 断言强制。）
 
 **测试矩阵注记（qual-t2）**：C1 属 **debug/release 行为分歧型**缺陷——CI 现仅跑 debug；M1a2 收尾时把
 `cargo test --workspace --release` 纳入矩阵（至少 xd-fs-exfat 与 xd-fs-fat），并记录于 CI 计划。
@@ -1641,6 +1642,33 @@ impl Bitmap {
 - [ ] **Step 4: 运行** → fattab 6 + bitmap 7 = **13 passed**（累计 crate **22**）
 
 - [ ] **Step 5: Commit** `feat(fs-exfat): 32 位 FAT 链与分配位图（ActiveFat/保留位纪律/连续回退）`
+
+**执行记录（2026-10-02）**：实施提交 `b4f7ecc`（24/137；偏离 4 条：缺 import/clippy let-chain/rustfmt/testutil 复用）。
+**修复轮（qual-t3，2026-10-02）**：质量审查 **1 Critical + 3 Important**，修复提交 **`ff49d56`**
+（"fix(fs-exfat): chain 拒绝保留值 1（防回绕错读）与三处测试判别力补强（qual-t3）"）。计数：25/138（双档）。
+**I3 落地偏离**：计划修法的 `dl=8192` 只需 2 簇（[7,6]，均在截断点之前）走不到"读不满"分支——实施者先跑红实证，
+改 **`dl=12288`**（3 簇使簇 8 参与）后命中；变异检查（截断点回退）判别性成立。
+
+**增量确认（qual-t3 复审）**：**Yes**——五组反向变异（`v<2`→`v==0`；删链分支；起点上界 `count+1`→`count`；
+吞"读不满"；截断点后移）各自只挂对应用例、无存活；C1 修复后 release 不再回绕（`read_allocation` 返回确定性
+正确区域而非"真簇+FAT 字节"混合）。N1（I2 注释与 `dl` 不一致）注释级终修；N2（Minor 7 文档化）接受现状。
+**流程注**：变异测试前必须 `cargo clean -p xd-fs-exfat`——审查侧曾因 mtime 回退被 cargo 判 fresh、编进变异体
+造成假失败。T3 关闭。
+
+- **C1（Critical）**：`chain` 未拒保留值 **1**（M1a `fat.rs` 有同款护栏，本 crate 漏）——坏 FAT 卷上 debug 在
+  `cluster_to_byte(1)` 减法溢出 panic；release 回绕到 fat_offset 扇区**把 FAT 字节当数据交付、零错误信号**
+  （T5/T6 全链路承重）。修：`if v < 2 || is_eoc(v) || v == BAD_CLUSTER || (v as u64) > max_cluster`。
+- **I2**：`read_allocation` 回退判别测试重写（原双臂都读物理连续簇、零判别力）——改用非物理序链 7→6→8，
+  `assert_ne!(链读, 连续读)` 锁判别力。
+- **I3**："partial device" 测试重写为**真截断**（切在物理簇 8 中段）命中"读不满"分支（原案被堆界先拦、分支零覆盖）。
+- **I4**：补 `chain(253)==[253]`（count+1 合法端点）与 `chain(254).is_err()`（off-by-one 变异曾存活）。
+- **Minor 6（非承重，注释备案）**：`is_eoc/BAD_CLUSTER` 项在合法几何下被上界覆盖（变异实证），保留但注明。
+- **Minor 7（doc）**：`read_allocation(dl==0)` 早返回先于起点校验（调用点均无害），加 doc 一句。
+- **Minor 5 备案**：`is_free` 的"数据不足"分支**可证不可达**（附鸽笼论证 + 全枚举探针），保留为廉价防御。
+- **策略佐证（qual 上游核实）**：内核 `exfat_allocate_bitmap` 即"链定位 + 纯连续扇区读"；**64MiB 位图上限**
+  的降级路径（>2TiB@4KB 簇的卷）由 T5 `load_bitmap().ok()` 接住 → 删除项封顶 `MaybeDamaged`，scan 仍 Ok。
+- **测试方法注**：变异测试（MA-MF 六组 + P1-P5 探针）对本模块有效；注意先 `cargo clean -p xd-fs-exfat`
+  强制重编，防指纹同秒假存活。
 
 ---
 
