@@ -11,6 +11,16 @@
 //! 2. M1a 恢复按「连续簇假设」：若已删文件之后又有新文件绕过空洞占用其邻簇
 //!    （碎裂），连续回退读可能读到他人的字节——这是刻意的夹具边界，勿在
 //!    T6/T8 构造该形状（真实 FAT 恢复工具同样有此盲区）。
+//!
+//! 夹具边界（测试作者必读二）：
+//! - 子目录含真实 "." / ".." 目录项；扫描器必须跳过（T5 parse_directory_bytes 已处理）。
+//! - 目录簇取最低空闲簇并写 EOC（单簇目录，不产生多簇目录链）。
+//! - 容量上限（超限触发 fail-fast 断言）：FAT32 根 16 项 / 子目录 14 成员 /
+//!   FAT12 根 224 项 / FAT16 根 512 项；簇池 FAT12 1006 / FAT16 4174 /
+//!   FAT32 1952（根目录占 1 → 文件可用 1951）。
+//! - FAT32 为简化版扩展 BPB（fsinfo 声明但空、16 位簇字段、单 FAT 副本、
+//!   簇数 < 65525 → 真实驱动会拒认；本引擎结构优先判型不受影响）。
+//! - encode_sfn 只接受 ASCII ≤ 8.3（超长/非 ASCII 由 debug_assert 拦截）。
 
 pub const BPS: u32 = 512; // bytes per sector
 pub const TOTAL_SECTORS: u32 = 4224; // FAT16 布局的 total（FAT12/32 见 FatType::layout）
@@ -80,6 +90,10 @@ impl FatImageBuilder {
     }
 
     pub fn add_file(&mut self, dir: &str, name: &str, data: &[u8]) -> &mut Self {
+        assert!(
+            dir == "/" || self.subdirs.iter().any(|d| format!("/{d}") == dir),
+            "add_file: 目录 {dir} 不存在（先 add_subdir）"
+        );
         self.files.push(BuildFile {
             dir: dir.to_string(),
             name: encode_sfn(name),
@@ -147,6 +161,20 @@ impl FatImageBuilder {
         let mut dir_clusters: Vec<(String, u32)> = Vec::new();
         for d in &self.subdirs {
             dir_clusters.push((d.clone(), next_free.remove(0)));
+        }
+        // 目录簇写 EOC（单簇目录；与真实 FAT 一致）
+        for (_, c) in &dir_clusters {
+            match self.fat_type {
+                FatType::Fat12 => set_fat12(&mut image, fat_start, *c, 0xFFF),
+                FatType::Fat16 => {
+                    let o = (fat_start * BPS + c * 2) as usize;
+                    image[o..o + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+                }
+                FatType::Fat32 => {
+                    let o = (fat_start * BPS + c * 4) as usize;
+                    image[o..o + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+                }
+            }
         }
 
         // ---- 分配簇（最低空闲优先；删除按真实时序释放：在分配文件 i 前，
@@ -316,16 +344,23 @@ impl FatImageBuilder {
         bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads
         bs[28..32].copy_from_slice(&data_start.to_le_bytes()); // hidden sectors（夹具惯例值）
         bs[32..36].copy_from_slice(&total_sectors.to_le_bytes());
-        bs[36] = 0x80; // drive number（FAT32 下被 36..40 的 fat_size 覆盖）
-        bs[38] = 0x29; // boot signature
-        bs[39..43].copy_from_slice(&0x1234_5678u32.to_le_bytes()); // volume id
-        bs[43..54].copy_from_slice(b"XIAODUN    ");
-        bs[54..62].copy_from_slice(b"FAT16   ");
+        bs[36] = 0x80;
         if root_cluster_actual >= 2 {
-            bs[36..40].copy_from_slice(&fat_size.to_le_bytes()); // FAT32: fat size 在 36
+            // FAT32 扩展 BPB（字段映射与 FAT12/16 不同，独立填写避免残留）
+            bs[36..40].copy_from_slice(&fat_size.to_le_bytes());
             bs[44..48].copy_from_slice(&root_cluster_actual.to_le_bytes());
-            bs[48..50].copy_from_slice(&1u16.to_le_bytes()); // fsinfo sector
-            bs[54..62].copy_from_slice(b"FAT32   ");
+            bs[48..50].copy_from_slice(&1u16.to_le_bytes()); // fsinfo sector（声明，内容简化）
+            bs[50..52].copy_from_slice(&6u16.to_le_bytes()); // 惯例备份引导扇区
+            bs[64] = 0x80;
+            bs[66] = 0x29;
+            bs[67..71].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            bs[71..82].copy_from_slice(b"XIAODUN    ");
+            bs[82..90].copy_from_slice(b"FAT32   ");
+        } else {
+            bs[38] = 0x29;
+            bs[39..43].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            bs[43..54].copy_from_slice(b"XIAODUN    ");
+            bs[54..62].copy_from_slice(b"FAT16   ");
         }
         bs[510] = 0x55;
         bs[511] = 0xAA;
@@ -350,6 +385,7 @@ fn set_fat12(image: &mut [u8], fat_start: u32, cluster: u32, value: u32) {
 
 /// "HELLO.TXT" → b"HELLO   TXT"（大写、空格填充、无扩展名时全空格）
 pub fn encode_sfn(name: &str) -> [u8; 11] {
+    debug_assert!(name.is_ascii(), "encode_sfn 仅支持 ASCII 8.3 名: {name}");
     let (base, ext) = match name.rsplit_once('.') {
         Some((b, e)) => (b, e),
         None => (name, ""),
@@ -504,6 +540,21 @@ mod tests {
             u32::from_le_bytes([image[44], image[45], image[46], image[47]]),
             2
         ); // root_cluster
+        // 根簇 EOC 与根目录内容确实在簇 2（reserved=32 → FAT[2] 在 32*512+8）
+        let fat = 32usize * 512;
+        assert_eq!(
+            u32::from_le_bytes([
+                image[fat + 8],
+                image[fat + 9],
+                image[fat + 10],
+                image[fat + 11]
+            ]) & 0x0FFF_FFFF,
+            0x0FFF_FFFF
+        );
+        let de = 96 * 512; // root_start(=data_start)=96
+        assert_eq!(&image[de..de + 11], b"A       TXT");
+        assert_eq!(u16::from_le_bytes([image[de + 26], image[de + 27]]), 3);
+        assert_eq!(&image[97 * 512..97 * 512 + 3], b"abc");
     }
 
     #[test]
@@ -531,8 +582,17 @@ mod tests {
         let de = image.windows(32).position(|w| &w[..3] == b"DIR").unwrap();
         assert_eq!(image[de + 11] & 0x10, 0x10);
         // 子目录内容区含 "." 与 ".."，以及 IN.TXT；内容可定位
-        assert!(image.windows(11).any(|w| w == b".          "));
-        assert!(image.windows(11).any(|w| w == b"..         "));
-        assert!(image.windows(11).any(|w| w == b"IN      TXT"));
+        let dir_cluster = u16::from_le_bytes([image[de + 26], image[de + 27]]) as usize;
+        let base = (50 + (dir_cluster - 2)) * 512;
+        assert_eq!(&image[base..base + 11], b".          ");
+        assert_eq!(
+            u16::from_le_bytes([image[base + 26], image[base + 27]]) as usize,
+            dir_cluster
+        );
+        assert_eq!(&image[base + 32..base + 43], b"..         ");
+        assert_eq!(u16::from_le_bytes([image[base + 58], image[base + 59]]), 0);
+        assert_eq!(&image[base + 64..base + 75], b"IN      TXT");
+        assert_eq!(u16::from_le_bytes([image[base + 90], image[base + 91]]), 3);
+        assert_eq!(&image[(50 + (3 - 2)) * 512..][..5], b"inner");
     }
 }
