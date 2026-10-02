@@ -11,7 +11,7 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin</allow_active>
       <!-- 安全注（勿改）：pkexec 不校验参数；一旦改为 auth_admin_keep 或 yes，
-           `pkexec xd-daemon --image /etc/shadow` 即本地任意文件读取。 -->
+           攻击者可用 pkexec 以 root 读任意文件（例如影子口令文件）。 -->
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/xiaodun/xd-daemon</annotate>
   </action>
