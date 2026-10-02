@@ -723,6 +723,7 @@ mod tests {
                 is_dir: false,
                 quality: "complete".into(),
                 first_cluster: 0,
+                byte_offset: None,
             });
         }
         store.insert_entries(id, &entries).unwrap();
@@ -761,6 +762,38 @@ mod tests {
             panic!()
         };
         assert_eq!(serde_json::to_value(&o2).unwrap(), golden("results"));
+    }
+
+    #[test]
+    fn scan_results_carved_golden_round_trip() {
+        // 雕刻页 golden：独立 store + 独立 task（id=1，不与既有 golden 测试的 store 抢位），
+        // 只走 scan.results 读路径——预置两条 carved 条目（含 byteOffset）→ 逐字对 golden。
+        use crate::store::Store;
+        let carved: serde_json::Value = serde_json::from_str(
+            include_str!("../../../proto/v1/examples/scan_results_carved.response.json").trim(),
+        )
+        .unwrap();
+        let entries: Vec<crate::api::ScanEntry> =
+            serde_json::from_value(carved["result"]["entries"].clone()).unwrap();
+        let store = Store::open_memory().unwrap();
+        let id = store.create_task("unix:/dev/sdb", "exfat", 1).unwrap();
+        assert_eq!(id, 1);
+        store.insert_entries(id, &entries).unwrap();
+        let ctx = CoreCtx::new(vec![]).with_scan(
+            Arc::new(ScanManager::new(store, Arc::new(|_| {}))),
+            Arc::new(NoopOpener),
+        );
+        let Response::Ok(o) = handle_request(
+            &ctx,
+            &req_with(
+                11,
+                "scan.results",
+                serde_json::json!({"taskId": 1, "offset": 0, "limit": 10}),
+            ),
+        ) else {
+            panic!()
+        };
+        assert_eq!(serde_json::to_value(&o).unwrap(), carved);
     }
 
     #[test]

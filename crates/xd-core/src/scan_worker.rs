@@ -100,6 +100,7 @@ fn fat_to_entry(e: &xd_fs_fat::scan::FatEntry) -> ScanEntry {
             xd_fs_fat::scan::RecoverQuality::MaybeDamaged => "maybeDamaged".into(),
         },
         first_cluster: e.first_cluster,
+        byte_offset: None,
     }
 }
 
@@ -117,6 +118,7 @@ fn exfat_to_entry(e: &xd_fs_exfat::scan::ExfatEntry) -> ScanEntry {
             xd_fs_exfat::scan::RecoverQuality::MaybeDamaged => "maybeDamaged".into(),
         },
         first_cluster: e.first_cluster,
+        byte_offset: None,
     }
 }
 

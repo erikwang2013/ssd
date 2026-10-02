@@ -88,7 +88,8 @@ impl Store {
     }
 
     fn init(&self) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute_batch(
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tasks (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  device_id TEXT NOT NULL,
@@ -110,9 +111,22 @@ impl Store {
                  is_dir INTEGER NOT NULL,
                  quality TEXT NOT NULL,
                  first_cluster INTEGER NOT NULL,
+                 byte_offset INTEGER,
                  PRIMARY KEY (task_id, idx)
              );",
         )?;
+        // v1 → v2 迁移（M1c）：entries.byte_offset。user_version 闸门 + 列探测保证幂等
+        //（全新库建表即含列，仅置版本；v1 旧库列探测后 ALTER）。
+        let ver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if ver < 2 {
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('entries') WHERE name = 'byte_offset'")?
+                .exists([])?;
+            if !has {
+                conn.execute("ALTER TABLE entries ADD COLUMN byte_offset INTEGER", [])?;
+            }
+            conn.execute_batch("PRAGMA user_version = 2")?;
+        }
         Ok(())
     }
 
@@ -181,8 +195,9 @@ impl Store {
         {
             let mut st = tx.prepare(
                 "INSERT OR REPLACE INTO entries
-                 (task_id, idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (task_id, idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster,
+                  byte_offset)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for e in entries {
                 st.execute(params![
@@ -195,7 +210,8 @@ impl Store {
                     e.deleted,
                     e.is_dir,
                     e.quality,
-                    e.first_cluster as i64
+                    e.first_cluster as i64,
+                    e.byte_offset.map(|v| v as i64)
                 ])?;
             }
         }
@@ -250,7 +266,8 @@ impl Store {
             |r| r.get(0),
         )?;
         let mut st = conn.prepare(&format!(
-            "SELECT idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster
+            "SELECT idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster,
+                    byte_offset
              FROM entries WHERE task_id = ?1{filter} ORDER BY idx LIMIT ?2 OFFSET ?3"
         ))?;
         let rows = st.query_map(params![task_id as i64, limit as i64, offset as i64], |r| {
@@ -264,6 +281,7 @@ impl Store {
                 is_dir: r.get(6)?,
                 quality: r.get(7)?,
                 first_cluster: r.get::<_, i64>(8)? as u32,
+                byte_offset: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
             })
         })?;
         let mut out = Vec::new();
@@ -301,6 +319,7 @@ mod tests {
             is_dir: false,
             quality: "complete".into(),
             first_cluster: 6 + idx as u32,
+            byte_offset: None,
         }
     }
 
@@ -480,6 +499,49 @@ mod tests {
         let id2 = s.create_task("d", "fat", 1).unwrap();
         s.set_state_if_active(id2, ScanState::Canceled).unwrap();
         assert_eq!(s.task(id2).unwrap().unwrap().state, ScanState::Canceled);
+    }
+
+    #[test]
+    fn byte_offset_roundtrips_and_defaults_null() {
+        let s = Store::open_memory().unwrap();
+        let id = s.create_task("d", "exfat", 1).unwrap();
+        let mut carved = entry(0, "", true);
+        carved.quality = "carved".into();
+        carved.byte_offset = Some(835584);
+        s.insert_entries(id, &[carved.clone(), entry(1, "A.TXT", false)])
+            .unwrap();
+        let (_, page) = s.entries(id, 0, 10, false).unwrap();
+        assert_eq!(page[0].byte_offset, Some(835584));
+        assert_eq!(page[1].byte_offset, None);
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2() {
+        // 手工造 v1 库（无 byte_offset 列、user_version=1）→ Store::open 迁移后可读写
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, fs TEXT NOT NULL,
+                     state TEXT NOT NULL, read_bytes INTEGER NOT NULL DEFAULT 0, found_count INTEGER NOT NULL DEFAULT 0,
+                     elapsed_ms INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL);
+                 CREATE TABLE entries (task_id INTEGER NOT NULL, idx INTEGER NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+                     ext TEXT NOT NULL, size_bytes INTEGER NOT NULL, deleted INTEGER NOT NULL, is_dir INTEGER NOT NULL,
+                     quality TEXT NOT NULL, first_cluster INTEGER NOT NULL, PRIMARY KEY (task_id, idx));
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let id = s.create_task("d", "exfat", 1).unwrap();
+        let mut e = entry(0, "OLD.JPG", true);
+        e.byte_offset = Some(4096);
+        s.insert_entries(id, &[e]).unwrap();
+        assert_eq!(
+            s.entries(id, 0, 10, false).unwrap().1[0].byte_offset,
+            Some(4096)
+        );
     }
 
     #[test]

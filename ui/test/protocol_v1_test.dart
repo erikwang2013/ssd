@@ -123,8 +123,8 @@ void expectRpcError(String file, int code, String message) {
 }
 
 void main() {
-  test('golden set is exactly the 21 contract files', () {
-    // 与 Rust 侧 golden_set_is_exactly_the_21_contract_files 对称：
+  test('golden set is exactly the 22 contract files', () {
+    // 与 Rust 侧 golden_set_is_exactly_the_22_contract_files 对称：
     // 新增/删除契约文件必须同步两侧测试（flutter test 的 cwd 为 ui/）。
     final names = Directory(
       '../proto/v1/examples',
@@ -145,6 +145,7 @@ void main() {
       'scan_progress.notification.json',
       'scan_results.request.json',
       'scan_results.response.json',
+      'scan_results_carved.response.json',
       'scan_resume.request.json',
       'scan_resume.response.json',
       'scan_start.request.json',

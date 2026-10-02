@@ -15,8 +15,11 @@ pub struct ScanEntry {
     pub size_bytes: u64,
     pub deleted: bool,
     pub is_dir: bool,
-    pub quality: String, // "complete" | "maybeDamaged"
+    pub quality: String, // "complete" | "maybeDamaged" | "carved"
     pub first_cluster: u32,
+    /// 雕刻条目在未分配空间内的起始字节坐标；FS 条目恒 None（序列化省略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

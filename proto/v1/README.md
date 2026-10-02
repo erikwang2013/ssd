@@ -69,6 +69,7 @@ JSON-RPC 2.0 通知：**无 `id` 字段**，不期待响应；UI 按 `method` �
 - `quality`：恢复质量 ∈ `complete` | `maybeDamaged`（删除项沿簇链判定；`maybeDamaged`
   表示链已失效或无法判定，见 M1b 安全裁定 (a)「链只走不猜」）。
 - `firstCluster`：起始簇号（0 = 无簇/未知）。
+- `byteOffset`（v1.1 增量）：雕刻条目的未分配空间内起始字节坐标，缺省省略——见「v1.1 增量」小节。
 
 ## DeviceInfo
 
@@ -100,7 +101,21 @@ v0 字段不变，**新增 `transport`**：
 `Invalid params: <reason>`（`reason` 为诊断文本，**不属契约**）；`Cannot open device: <id>`
 为固定文案。
 
-## golden 文件（21）
+## v1.1 增量（M1c 文件雕刻）
+
+**纯增量，读旧客户端不受影响**（不递增 `protocol`）：`byteOffset` 序列化时省略 `null`
+键，`quality` 既有取值不变，既有 21 个 golden 一字不动；本版新增 golden 1 个（雕刻结果页）。
+
+- `scan.start.mode` 值域 `"quick"（缺省） | "deep"`：`deep` 自 M1c 起有效（未分配空间雕刻）；
+  其它值仍 `-32602`。
+- `scan.start` 结果 `totalBytes` 语义：**本任务的目标扫描字节数**——`quick` = 设备大小
+  （M1b 既有语义，不变）；`deep` = 未分配空间总字节（Σ 雕刻区间）。
+- `ScanEntry.quality` 值域增 `"carved"`：雕刻件（无目录项）。结构重组成功度见 `sizeBytes`：
+  找到 EOI/IEND = 结构完整；未找到 = 诚实截断前缀（不长不短不猜）。
+- `ScanEntry.byteOffset`：u64，**缺省 = null**（序列化省略）。FS 条目恒缺；雕刻条目为
+  未分配空间内的起始字节坐标（`firstCluster` 对雕刻件恒 0——无簇概念）。
+
+## golden 文件（22）
 
 examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.request.json`、
 `device_list.response.json`、`scan_start.request.json`、`scan_start.response.json`、
@@ -109,7 +124,7 @@ examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.reques
 `scan_resume.request.json`、`scan_resume.response.json`、`scan_cancel.request.json`、
 `scan_cancel.response.json`、`scan_progress.notification.json`、`scan_finished.notification.json`、
 `error_device_permission.response.json`、`error_unsupported_fs.response.json`、
-`error_task_not_active.response.json`。
+`error_task_not_active.response.json`、`scan_results_carved.response.json`。
 
 Rust 侧断言：`crates/xd-core/tests/contract_v1.rs`；Dart 侧：`ui/test/protocol_v1_test.dart`。
 
