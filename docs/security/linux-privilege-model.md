@@ -46,6 +46,9 @@ logind 翻译为 `g:user:rw`）。因此只读铁律**不在权限层**，而在
    `--image` 指向**普通文件**且**属主 == `PKEXEC_UID`**（无 `PKEXEC_UID` 拒绝）。
    即：即便策略被误改为 keep/yes，调用者也**读不到不属于自己的文件**（`/etc/shadow` 属主 root
    ≠ 调用者 → 拒绝，exit 2）。打开用 `O_NOFOLLOW`（`0o400000`），拒符号链接换靶。
+   失败关闭的代价（已知边界）：无 `/proc` 可读的环境（`root_mode(None)=true`）下，非 root
+   调用者也会被要求 `PKEXEC_UID`——没有该变量的普通 `--image` 调用将被拒（exit 2）。这是
+   保守换安全的取舍：/proc 缺席本身是异常环境，宁可拒服务也不静默跳过校验。
 
 `--device` 分支**不需要** euid 校验：`LinuxBlockDevice::open` 内含 `NotAFile` 拒绝，
 非块设备节点（含普通文件、符号链接指向的普通文件）在打开后即被拦下。

@@ -13,9 +13,16 @@ void main() {
       ..writeAsBytesSync(List<int>.filled(4096, 0));
     // root 宿主上 daemon 的 --image 会走 PKEXEC_UID 校验（privcheck，失败关闭）；以本进程
     // euid 注入，让 root 环境也覆盖同一生产校验路径（非 root 时该分支走不到，注入无害）。
-    final euid = Platform.isLinux
-        ? Process.runSync('id', ['-u']).stdout.toString().trim()
-        : null;
+    String? euid;
+    if (Platform.isLinux) {
+      try {
+        euid = Process.runSync('id', ['-u']).stdout.toString().trim();
+      } on ProcessException {
+        stderr.writeln(
+          'skip: `id` 不可用，不注入 PKEXEC_UID',
+        ); // 与 Rust harness 的 early-return 对称
+      }
+    }
     final client = await IpcCoreClient.start(
       daemonPath: bin,
       extraArgs: ['--image', image.path],
