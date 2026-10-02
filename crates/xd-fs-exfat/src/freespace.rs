@@ -23,13 +23,14 @@ pub fn unallocated_runs(dev: &dyn BlockDevice) -> Result<Vec<Range<u64>>, ExfatE
     let root = dirent::parse_directory_bytes(&root_data, boot.cluster_bytes() as usize);
     let bitmap = load_bitmap_from_specials(dev, &boot, &fat, &root.specials)
         .ok_or_else(|| ExfatError::InvalidBoot("位图不可读——雕刻拒绝在未知分配上猜".into()))?;
-    Ok(runs_from_free(&boot, &bitmap))
+    Ok(runs_from_free(&boot, &bitmap, MAX_RUNS))
 }
 
 /// 空闲簇 2..=count+1 线性合并。`is_free` Err 视为已分配（保守：宁可漏扫不可误扫——
-/// `Bitmap::load` 已保证长度，该臂实际不可达，纯防御）；MAX_RUNS 到顶截断
-/// （调用方以 Σ区间长 为进度目标，不虚报未枚举区间）。
-fn runs_from_free(boot: &ExfatBoot, bitmap: &Bitmap) -> Vec<Range<u64>> {
+/// `Bitmap::load` 已保证长度，该臂实际不可达，纯防御）；`max_runs` 到顶截断
+/// （调用方以 Σ区间长 为进度目标，不虚报未枚举区间）。参数化只为可测截断语义
+/// （公开入口恒传 `MAX_RUNS`）。
+fn runs_from_free(boot: &ExfatBoot, bitmap: &Bitmap, max_runs: usize) -> Vec<Range<u64>> {
     let max_cluster = boot.cluster_count as u64 + 1;
     let cb = boot.cluster_bytes();
     let mut out: Vec<Range<u64>> = Vec::new();
@@ -44,12 +45,12 @@ fn runs_from_free(boot: &ExfatBoot, bitmap: &Bitmap) -> Vec<Range<u64>> {
             }
             _ => {}
         }
-        if out.len() >= MAX_RUNS {
+        if out.len() >= max_runs {
             break; // 截断：不虚报未扫区间
         }
     }
     if let Some(s) = run_start
-        && out.len() < MAX_RUNS
+        && out.len() < max_runs
     {
         // 末段右界 = 末簇起点 + 簇宽（cluster_to_byte 的契约上界是 count+1，不外推）
         out.push(boot.cluster_to_byte(s as u32)..boot.cluster_to_byte(max_cluster as u32) + cb);
@@ -61,6 +62,68 @@ fn runs_from_free(boot: &ExfatBoot, bitmap: &Bitmap) -> Vec<Range<u64>> {
 mod tests {
     use super::*;
     use crate::boot::testutil::dev_for;
+
+    /// (boot, 位图)：私有 `runs_from_free` 的截断测试需要直接注入 `max_runs`。
+    fn boot_bitmap(dev: &dyn BlockDevice) -> (ExfatBoot, Bitmap) {
+        let boot = boot::parse(dev).unwrap();
+        let fat = Fat32::new(dev, &boot);
+        let root_data = crate::scan::read_root_dir(dev, &boot, &fat).unwrap();
+        let root = dirent::parse_directory_bytes(&root_data, boot.cluster_bytes() as usize);
+        let bm = load_bitmap_from_specials(dev, &boot, &fat, &root.specials).unwrap();
+        (boot, bm)
+    }
+
+    /// 文件各 1 簇占用 `clusters` → 空闲区间 = 6、8、10、…（每文件恰在其后终结一段）。
+    fn image_with_files_at(clusters: &[u32]) -> Vec<u8> {
+        let mut b = xd_fixtures::ExfatImageBuilder::new();
+        for (i, c) in clusters.iter().enumerate() {
+            b.add_file_in_clusters(
+                "/",
+                &format!("F{i}.BIN"),
+                &[1u8; 100],
+                std::slice::from_ref(c),
+                true,
+            );
+        }
+        b.build()
+    }
+
+    #[test]
+    fn truncation_drops_tail_only() {
+        // 4 区间构型（文件 @7/9/11）→ 空闲 = 6、8、10、12..=253
+        let image = image_with_files_at(&[7, 9, 11]);
+        let (_f, dev) = dev_for(&image);
+        let (boot, bm) = boot_bitmap(&dev);
+        let full = unallocated_runs(&dev).unwrap();
+        assert_eq!(full.len(), 4, "前提：无限制确为 4 区间 {full:?}");
+        let capped = runs_from_free(&boot, &bm, 2);
+        assert_eq!(capped.len(), 2, "到顶只丢尾，不得多报: {capped:?}");
+        assert_eq!(capped[0], full[0], "前 2 个逐字段等于无限制结果");
+        assert_eq!(capped[1], full[1]);
+        let sum = |r: &[Range<u64>]| r.iter().map(|x| x.end - x.start).sum::<u64>();
+        assert!(sum(&capped) < sum(&full), "Σ 必须严格小于无限制（不虚报）");
+    }
+
+    #[test]
+    fn cap_at_run_count_keeps_all_runs() {
+        // 5 区间构型（文件 @7/9/11/13）；max_runs=3：第 3 个区间由已分配簇 11 在循环内完整
+        // 终结后恰好到顶 break —— `>=` 截断语义下第 4 个区间不得多报（对 `>=`→`>` 变异必红）
+        let image = image_with_files_at(&[7, 9, 11, 13]);
+        let (_f, dev) = dev_for(&image);
+        let (boot, bm) = boot_bitmap(&dev);
+        let full = unallocated_runs(&dev).unwrap();
+        assert_eq!(full.len(), 5, "前提：无限制确为 5 区间 {full:?}");
+        let capped = runs_from_free(&boot, &bm, 3);
+        assert_eq!(capped.len(), 3, "恰 3 个（第 4 个起丢尾）: {capped:?}");
+        for (i, r) in capped.iter().enumerate() {
+            assert_eq!(*r, full[i], "第 {i} 个区间逐字段等于无限制结果");
+        }
+        assert_eq!(
+            capped[2].end,
+            boot.cluster_to_byte(11),
+            "第 3 个区间为循环内终结的完整区间（非 final-flush 截断）"
+        );
+    }
 
     #[test]
     fn fragmented_free_space_yields_exact_runs() {

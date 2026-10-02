@@ -18,12 +18,13 @@ pub const MAX_RUNS: usize = 100_000;
 pub fn unallocated_runs(dev: &dyn BlockDevice) -> Result<Vec<Range<u64>>, FatError> {
     let bpb = bpb::parse(dev)?;
     let fat = Fat::new(dev, &bpb);
-    Ok(runs_from_fat(&bpb, &fat))
+    Ok(runs_from_fat(&bpb, &fat, MAX_RUNS))
 }
 
 /// 空闲簇 2..=count+1 线性合并。`is_free` Err 视为已分配（保守：宁可漏扫不可误扫）；
-/// MAX_RUNS 到顶截断（调用方以 Σ区间长 为进度目标，不虚报未枚举区间）。
-fn runs_from_fat(bpb: &Bpb, fat: &Fat<'_>) -> Vec<Range<u64>> {
+/// `max_runs` 到顶截断（调用方以 Σ区间长 为进度目标，不虚报未枚举区间）。参数化只为
+/// 可测截断语义（公开入口恒传 `MAX_RUNS`）。
+fn runs_from_fat(bpb: &Bpb, fat: &Fat<'_>, max_runs: usize) -> Vec<Range<u64>> {
     let max_cluster = bpb.data_cluster_count() as u64 + 1;
     let cb = bpb.cluster_bytes() as u64;
     let mut out: Vec<Range<u64>> = Vec::new();
@@ -38,12 +39,12 @@ fn runs_from_fat(bpb: &Bpb, fat: &Fat<'_>) -> Vec<Range<u64>> {
             }
             _ => {}
         }
-        if out.len() >= MAX_RUNS {
+        if out.len() >= max_runs {
             break; // 截断：不虚报未扫区间
         }
     }
     if let Some(s) = run_start
-        && out.len() < MAX_RUNS
+        && out.len() < max_runs
     {
         // 末段右界 = 末簇起点 + 簇宽（cluster_to_byte 的契约上界是 count+1，不外推）
         out.push(bpb.cluster_to_byte(s as u32)..bpb.cluster_to_byte(max_cluster as u32) + cb);
@@ -111,6 +112,53 @@ mod tests {
         assert!(
             !runs.iter().any(|r| r.start <= root && root < r.end),
             "根目录簇仍分配，不得入选: {runs:?}"
+        );
+    }
+
+    /// 空 fat16 + FAT 手工置 EOC（簇 3/5/7/9 已分配）→ 空闲区间 = 2、4、6、8、10..=末簇（5 区间）。
+    fn image_with_five_free_runs() -> Vec<u8> {
+        let mut patched = xd_fixtures::FatImageBuilder::fat16().build();
+        for c in [3usize, 5, 7, 9] {
+            let o = 512 + c * 2; // fat_start_sector = 1，FAT16 表项宽 2 字节
+            patched[o..o + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        }
+        patched
+    }
+
+    #[test]
+    fn truncation_drops_tail_only() {
+        let image = image_with_five_free_runs();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let full = unallocated_runs(&dev).unwrap();
+        assert_eq!(full.len(), 5, "前提：无限制确为 5 区间 {full:?}");
+        let capped = runs_from_fat(&bpb, &fat, 2);
+        assert_eq!(capped.len(), 2, "到顶只丢尾，不得多报: {capped:?}");
+        assert_eq!(capped[0], full[0], "前 2 个逐字段等于无限制结果");
+        assert_eq!(capped[1], full[1]);
+        let sum = |r: &[Range<u64>]| r.iter().map(|x| x.end - x.start).sum::<u64>();
+        assert!(sum(&capped) < sum(&full), "Σ 必须严格小于无限制（不虚报）");
+    }
+
+    #[test]
+    fn cap_at_run_count_keeps_all_runs() {
+        // max_runs=3：第 3 个区间由已分配簇 7 在循环内完整终结后恰好到顶 break ——
+        // `>=` 截断语义下第 4 个区间不得多报（对 `>=`→`>` 变异必红）
+        let image = image_with_five_free_runs();
+        let (_f, dev) = dev_for(&image);
+        let bpb = bpb::parse(&dev).unwrap();
+        let fat = Fat::new(&dev, &bpb);
+        let full = unallocated_runs(&dev).unwrap();
+        let capped = runs_from_fat(&bpb, &fat, 3);
+        assert_eq!(capped.len(), 3, "恰 3 个（第 4 个起丢尾）: {capped:?}");
+        for (i, r) in capped.iter().enumerate() {
+            assert_eq!(*r, full[i], "第 {i} 个区间逐字段等于无限制结果");
+        }
+        assert_eq!(
+            capped[2].end,
+            bpb.cluster_to_byte(7),
+            "第 3 个区间为循环内终结的完整区间（非 final-flush 截断）"
         );
     }
 
