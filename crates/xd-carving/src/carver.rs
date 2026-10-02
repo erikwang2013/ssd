@@ -393,6 +393,46 @@ mod tests {
         }
     }
 
+    /// 读调用计数（T7 阶段二量化不变量：预读把 JPEG 熵段的逐字节读压掉）。
+    struct CountingDev {
+        inner: ImageFileDevice,
+        calls: std::sync::atomic::AtomicU64,
+    }
+    impl BlockDevice for CountingDev {
+        fn info(&self) -> &xd_device::DeviceInfo {
+            self.inner.info()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, xd_device::DeviceError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_at(offset, buf)
+        }
+    }
+
+    #[test]
+    fn jpeg_carve_read_at_calls_stay_near_constant() {
+        // 修复前（T6 量化）：熵段逐字节 `u8()` → 每字节一次 read_at，本夹具 20_045B 实测 20_046 次；
+        // 64KiB 预读后 = 窗口读 1 + 预读重填 1，实测 2 次。判据对两态都有牙：
+        // C=6（窗口 1 + 重填 1 + 回退重填余量），阈值 19+6=25 ≪ 20_046。
+        let j = xd_fixtures::mini_jpeg(20_000);
+        let (_f, inner) = dev_for(&j);
+        let dev = CountingDev {
+            inner,
+            calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let (stats, e) = carve_all(&dev, j.len() as u64, 64 << 20);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert_eq!(e[0].size, j.len() as u64, "结果本身不得因预读而变");
+        assert!(e[0].complete);
+        assert_eq!(stats.found, 1);
+        let calls = dev.calls.load(std::sync::atomic::Ordering::Relaxed);
+        let budget = j.len() as u64 / 1024 + 6;
+        assert!(
+            calls < budget,
+            "read_at 调用 {calls} 未达预算 {budget}（预读须成数量级生效，非逐字节）"
+        );
+    }
+
     /// [bad.start, bad.end) 内的读取一律 Err（模拟坏区）。
     struct BadRegion<'a> {
         inner: &'a dyn BlockDevice,

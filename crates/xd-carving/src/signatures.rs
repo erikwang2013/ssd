@@ -40,16 +40,35 @@ pub struct Carved {
     pub complete: bool,
 }
 
-/// 绝对字节游标：只前进、止于 `end`（所在 run 的右界）；设备坏读/越界 → None（诚实截断）。
+/// 预读块：JPEG 熵段逐字节 `u8()` 是 read_at 调用放大器（每字节一次调用）——
+/// 20KB 文件 ≈ 2 万次调用，一次 64KiB 预读即压到 ~字节/64KiB 量级。
+const PREFETCH: usize = 64 * 1024;
+
+/// 绝对字节游标：只前进（`pos` 可被走链器直接回退，见下）、止于 `end`（所在 run 的右界）；
+/// 设备坏读/越界 → None（诚实截断）。
+///
+/// **内部 64KiB 预读缓冲（T7）：** 按**绝对偏移**命中——`pos ∈ [buf_at, buf_at+len)` 且请求整体
+/// 在缓冲内 → 直取；否则按当前位置重填（jpeg.rs 直改 `pos -= 1/2` 落到缓冲起点之前即
+/// miss → 重填，不依赖走链器配合）。**缓冲绝不改变任何返回值**：重填一次性读到
+/// `min(end-pos, 64KiB)`，请求超过所得字节数即 None（与直读短读同判：不推进游标）；
+/// refill Err/0 → None；请求 > 64KiB 走直读。`skip` 不读、不失效缓冲（设备只读，值稳定）。
 pub struct Cursor<'a> {
     dev: &'a dyn BlockDevice,
     pub pos: u64,
     pub end: u64,
+    buf: Vec<u8>,
+    buf_at: u64,
 }
 
 impl<'a> Cursor<'a> {
     pub fn new(dev: &'a dyn BlockDevice, pos: u64, end: u64) -> Self {
-        Self { dev, pos, end }
+        Self {
+            dev,
+            pos,
+            end,
+            buf: Vec::new(),
+            buf_at: pos,
+        }
     }
 
     /// 读满 buf 并前进；任一步失败/到界 → None（游标停在失败处）。
@@ -60,13 +79,36 @@ impl<'a> Cursor<'a> {
         if self.pos + buf.len() as u64 > self.end {
             return None;
         }
-        match self.dev.read_at(self.pos, buf) {
-            Ok(n) if n == buf.len() => {
-                self.pos += n as u64;
-                Some(())
-            }
-            _ => None,
+        if self.buf_at <= self.pos
+            && self.pos + buf.len() as u64 <= self.buf_at + self.buf.len() as u64
+        {
+            let s = (self.pos - self.buf_at) as usize;
+            buf.copy_from_slice(&self.buf[s..s + buf.len()]);
+            self.pos += buf.len() as u64;
+            return Some(());
         }
+        if buf.len() > PREFETCH {
+            // 大于预读块：直读（语义与无缓冲版本逐字相同）
+            return match self.dev.read_at(self.pos, buf) {
+                Ok(n) if n == buf.len() => {
+                    self.pos += n as u64;
+                    Some(())
+                }
+                _ => None,
+            };
+        }
+        // 重填：读满预读块（或到 run 界）；拿到的不足一个请求 → None（游标不动）
+        let want = (self.end - self.pos).min(PREFETCH as u64) as usize;
+        self.buf.resize(want, 0);
+        let n = self.dev.read_at(self.pos, &mut self.buf).unwrap_or(0);
+        self.buf.truncate(n); // 只信 [0, n)：read_at 已覆写前 n 字节
+        self.buf_at = self.pos;
+        if n < buf.len() {
+            return None;
+        }
+        buf.copy_from_slice(&self.buf[..buf.len()]);
+        self.pos += buf.len() as u64;
+        Some(())
     }
 
     /// 读 1/2/4 字节便捷。
@@ -163,6 +205,33 @@ mod tests {
         assert_eq!(cur.pos, 6, "失败的 skip 不得推进");
         assert_eq!(cur.u8(), None, "越界读 → None");
         assert_eq!(cur.pos, 6);
+    }
+
+    #[test]
+    fn prefetch_preserves_values_across_refill_and_backstep() {
+        // 缓冲不变量（"绝不能改变任何返回值"）：命中 / 跨边界重填 / 回退越缓冲起点
+        // （jpeg 直改 `pos -= 1/2` 的形态）/ 大于预读块的直读——读到的值恒等于设备字节。
+        let img: Vec<u8> = (0..PREFETCH + 16).map(|i| (i * 7 + 3) as u8).collect();
+        let (_f, dev) = dev_for(&img);
+        let mut cur = Cursor::new(&dev, 0, img.len() as u64);
+        assert_eq!(cur.u8(), Some(img[0]), "首缓冲命中");
+        assert_eq!(cur.u8(), Some(img[1]));
+        cur.skip(PREFETCH as u64 - 3).unwrap(); // pos = 64KiB-1（仍在首缓冲内）
+        assert_eq!(cur.u8(), Some(img[PREFETCH - 1]));
+        assert_eq!(
+            cur.u8(),
+            Some(img[PREFETCH]),
+            "跨缓冲边界：miss 按当前位置重填"
+        );
+        cur.pos -= 2; // 回退越过缓冲起点：pos = 64KiB-1 < buf_at → miss 重填
+        assert_eq!(cur.u8(), Some(img[PREFETCH - 1]), "回退重填后取值不变");
+        assert_eq!(cur.u8(), Some(img[PREFETCH]));
+        cur.pos = 0;
+        assert_eq!(
+            cur.take_vec(PREFETCH + 4).as_deref(),
+            Some(&img[..PREFETCH + 4]),
+            "> 预读块走直读"
+        );
     }
 
     #[test]
