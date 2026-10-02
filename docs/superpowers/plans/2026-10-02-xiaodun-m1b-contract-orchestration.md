@@ -2669,6 +2669,15 @@ bash scripts/e2e.sh
 - **性能账（域外观察，转 M1c）**：`insert_entries` 每条目一事务 + `synchronous=FULL` ≈ **6.9ms/条目 fsync**（513 条目 ext4 3539ms vs tmpfs 59ms）；M1c 大扫描前应评估批量提交或 WAL+synchronous=NORMAL（与"崩溃保部分结果"语义权衡）——已写入 M1c 计划。
 - **接受性 nit（记录不修）**：`image:`/未知 scheme 拒绝分支无 stderr 留痕（另一分支有）；「真 panic 仍打印」在 daemon 无可达 panic 路径，T8 只钉可观测半边（cancel 静默）。
 
+### T7（结构欠账纯重构）—— impl-m1b-t7。提交沿革：`e90b41b`（主：fat 拆分/测试内移/助手去重/linux 拆分）→ `c33e606`（收尾：fat 测试内移/线宽注/校验和对拍互锁）。DONE → spec **PASS** → qual **APPROVED**（T7 关闭，283/0 精确守恒）
+
+- **三位一体零变化证据**：函数体**逐字节相同**（fat read_file 含 doc；linux 迁出条目除 4 处 `pub(crate)`〔sysfs_transport/transport_str/compose_disk_name/is_listable_name，仅白盒测试与父模块所需〕无任何可见性变化）；公开面 25 条路径对快照逐条编译状态一致（唯二差异=计划授权的 fixtures +2 导出，dev-dep-only）；测试名集合双向差集为空（283 条）。**qual 差分字节探针**（最强证据）：14 组夹具（fat12/16/32 存活/删除/复用/污染/截断 + exfat 链式/VDL/自环/污染）在重构前快照与现树两侧跑 scan+read 全输出（含内容 sha256）**逐字节相同**（65 行同 sha256），负控变异立即显差——非空转。
+- **校验和对拍互锁（c33e606 新增资产）**：生产 `dirent.rs entry_set_checksum16` ↔ `xd_fixtures::entry_set_checksum` 在既有测试内对拍（3 样本含 128B 真实集），spec/qual 各自独立双向变异均红；qual M5 结论：**互锁须留真实集样本**（1 字节样本对移位漂移不可见），语料本身另有端到端兜底。
+- **线宽规则澄清（写入本计划口径）**：500 行约束针对**生产源文件**；`*_tests.rs` 测试体集中不受约束（刻意的源文件线宽控制另一半，exfat 两测试文件头注已写明）。最终行数：exfat scan 299/read 235、fat scan 242/read 222、linux 420/enumerate 205。
+- **导入解析漂移审计**：全仓无 glob 重导出；`xd_fixtures::refix_deleted_checksum` 仅 dev-dep（`cargo build --workspace` 绿、构建图零 fixtures）；无同名不同项。
+- **测试路径改名**：9 条 fat read 测试 `scan::tests::*` → `read::tests::*`（实现真迁移，1:1）——全仓 grep 文档/CI/README 零外部引用 ✓。
+- 四份新文件（fat read.rs/scan_tests.rs、exfat scan_tests/read_tests、linux/enumerate.rs）真水印头 cmp 通过；`apply-copyright.sh` 幂等 stamped 0。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
