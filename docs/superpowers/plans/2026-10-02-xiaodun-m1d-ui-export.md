@@ -552,6 +552,8 @@ git commit -m "feat(export): 恢复导出——父侧校验/转发 + --export-wo
 
 ### Task 4: Dart 传输层 v1.2（参数化调用 + 通知流 + pkexec 启动）
 
+> **T1 移交（spec-m1d-t1 观察 C + qual 细化）**：README 声明「两侧逐字断言」，但新 13 golden 目前 Dart 侧仅集合测试（零值级）。`protocol_v12_test.dart` 需补**四类**：(i) 五码 -32006..-32010 的 `expectRpcError` 逐字（与既有旧错误页同款）；(ii) `fs_read.response` 的 `bytesBase64`/`eof` 值级解码；(iii) `export_start`/`export_cancel` response 字段；(iv) 两个 export 通知的无 id 信封 + params 形状。
+
 **Files:**
 - Modify: `ui/lib/core_client/{protocol.dart, core_client.dart, ipc_transport.dart}`
 - Create: `ui/test/fake_core_client.dart`（测试公用 Fake，实现全部接口）
@@ -785,6 +787,19 @@ Scaffold('恢复文件')
 4. 降权子进程模型：非 root 路径全测试覆盖；root/pkexec 路径**标注未验证（需真机）**并与 security 文档一致。
 5. UI 三页 + 报告页：widget 测试覆盖状态机与铁律文案（含"连续假设"零出现的 grep 断言）；集成测试全流程（镜像 → 扫描 → 预览 → 导出）在 CI 可复跑。
 6. 全量门禁绿（rust debug+release、clippy、fmt、flutter test+analyze、e2e.sh、e2e-loop.sh）。
+
+---
+
+## 执行记录
+
+### T1（契约 v1.2）—— impl-m1d-t1。提交沿革：`4c7194f`（主）→ `42455fa`（qual 补强）。DONE → spec **PASS** → qual ISSUES → 补强有牙（T1 关闭，382/0）
+
+- **计划缺陷 1**：Step 1 括注「`hello, xiaodun!` 16 字节」实为 **15**（base64 无 padding 实证）——golden 字面量未动（`eof:true` 在"请求 16>可得 15 短交付"语义下自洽）。
+- **集合 36 同步三点**：Rust 收口测试 + Dart 集合测试 + README 清单（计划 Files 漏了 Dart 侧，实施者按前置指示补上）；**spec 诱饵检验**（第 37 个文件）两侧均红——活守卫实证。
+- **spec 亮点**：13 golden 逐字节；params 反钉（snake_case/缺字段/错类型含 `length:-1`、`idxs:[0,-1]`）；错误五码与构造器逐字。
+- **qual 变异 12 条**：6 KILL；**同族弱钉实证（本任务最有价值发现）**——五构造器各只被"单值==golden 内嵌值"调用，任何**去参数化**实现全不可分（M8/8b；clippy `useless_format` 只挡纯字面量子类）；`idxs: Vec<u64>→Vec<i64>`（负值被接受，M4）。补强落地：负值/别名反钉 + 五构造器异值断言（`entry_too_large(67108865)` 破 64MiB 边界巧合）+ **README「params 演进规则」3 行**（新增字段必须可选/不得删改/不得 deny_unknown_fields）——字段级治理从无到有。有牙实证：去参数化后 **golden 测试仍绿、参数化断言红**（M8 族现场）。
+- **观察 C（双侧承诺）+ qual 细化 → T4 任务书**：Dart 需补四类值级覆盖（五码 expectRpcError / fs_read 值级 / export_start+cancel response / 两通知形状）——否则 11 个 non-error 新 golden 在 Dart 侧零值级覆盖。`idxs 去重后` 措辞两处对齐。
+- 记录不修：golden 单点守卫（同 PR 双改不会被第二道网拦——v1 既有约定）；`alias` 放宽（等价无害）。
 
 ---
 
