@@ -4,10 +4,11 @@
 //!
 //! **写放大与崩溃语义（T7 阶段三量化选型 b）：** `journal_mode=WAL` + `synchronous=NORMAL`。
 //! 旧配置（DELETE 日志 + FULL）每条目一次 fsync ≈ 7.2ms → ext4 实测 513 条目 **139 条/秒**
-//! （3.68s，与 qual-m1b-t6 的 6.9ms 同源）；WAL+NORMAL 同调用形态 **12512 条/秒**（41ms，90×），
-//! 优于 worker 侧小批量（64 条/事务）形态的 7075 条/秒。崩溃语义声明：
-//! **daemon 进程崩溃零丢失**（已提交事务在 WAL 里，重开即恢复）；**掉电/OS 崩溃可能丢最后一次
-//! checkpoint 之后的提交**（库恒一致；扫描结果可由重扫再得——源设备只读，结果非独有数据）。
+//! （3.68s，与 qual-m1b-t6 的 6.9ms 同源）；WAL+NORMAL 同调用形态 **8288-10265 条/秒**
+//! （513 条目 ≈ 46-62ms，≈60-74×），优于 worker 侧小批量（64 条/事务）形态的 7075 条/秒。
+//! 崩溃语义声明（限定到**已提交事务**层面）：**daemon 进程崩溃零丢失已提交事务**（在 WAL 里，
+//! 重开即恢复）；**掉电/OS 崩溃可能丢最后一次 checkpoint 之后的提交**（库恒一致；扫描结果可由
+//! 重扫再得——源设备只读，结果非独有数据）。
 //! 内存库不受影响（pragma 落 "memory" 模式）。
 
 use std::path::Path;
@@ -103,7 +104,7 @@ impl Store {
     fn init(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         // 写放大（T7 阶段三量化选型 b，理由与崩溃语义见模块头注）：条目插入走 WAL 提交
-        //（无逐条 fsync）——ext4 实测 139 → 12512 条/秒。内存库上此 pragma 落 "memory" 模式，
+        //（无逐条 fsync）——ext4 实测 139 → 8288-10265 条/秒。内存库上此 pragma 落 "memory" 模式，
         // 语义不变。
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         conn.execute_batch(
@@ -233,11 +234,15 @@ impl Store {
         Ok(())
     }
 
-    /// 深扫检查点写（worker 每窗口调用；`v` = 安全续扫点绝对偏移）。
-    pub fn set_carved_offset(&self, id: u64, v: u64) -> Result<(), StoreError> {
+    /// 深扫检查点写（worker 每窗口调用，**配对写**）：`v` = 安全续扫点绝对偏移，
+    /// `found` = 同帧已落库条目数（= worker 的 `self.found`，本窗口条目尚未产出时恰为
+    /// 「断点前已落库条目数」）。两坐标必须同一条 UPDATE 落盘：只写 `carved_offset` 而
+    /// `found_count` 走节流进度，重启后 `next_idx` 会滞后于断点——续号重扫时
+    /// `INSERT OR REPLACE` 按同号覆盖**断点之前**的旧行（永不重扫 → 静默丢条，spec-t7 阻断）。
+    pub fn set_carved_offset(&self, id: u64, v: u64, found: u64) -> Result<(), StoreError> {
         self.conn.lock().unwrap().execute(
-            "UPDATE tasks SET carved_offset = ?2 WHERE id = ?1",
-            params![id as i64, v as i64],
+            "UPDATE tasks SET carved_offset = ?2, found_count = ?3 WHERE id = ?1",
+            params![id as i64, v as i64, found as i64],
         )?;
         Ok(())
     }
@@ -387,9 +392,10 @@ mod tests {
     fn wal_normal_crash_semantics_declared() {
         // T7 阶段三选型 b 的可执行声明（模块头注的崩溃语义）：
         // 1) 文件库必须真在 WAL + synchronous=NORMAL——谁退回 DELETE/FULL（139 条/秒），此测先红；
-        // 2) daemon 进程崩溃零丢失：连接**未干净关闭**（mem::forget 模拟 —— WAL 未 checkpoint
-        //    回主库）后重开，已提交条目即见（WAL 恢复）。别拿它声明掉电语义：掉电可能丢最后
-        //    checkpoint 之后的提交（库恒一致；条目可由重扫再得）。
+        // 2) 崩溃可见性**形态演示（非掉电语义、无判别力）**：连接未干净关闭（mem::forget 模拟
+        //    —— WAL 未 checkpoint 回主库）后重开，已提交条目即见（WAL 恢复）。同形状下
+        //    DELETE+FULL 亦 100% 可见（qual 探针），故此半段只演示「未干净关闭可见性」形态；
+        //    掉电语义由模块头注声明承担（可能丢最后一次 checkpoint 之后的提交），不由此测钉死。
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.db");
         let id = {
@@ -746,7 +752,7 @@ mod tests {
             None,
             "旧行无检查点必须 NULL（0 会被当成「断点=区间起点」→ 静默整段重扫）"
         );
-        s.set_carved_offset(1, 2048).unwrap();
+        s.set_carved_offset(1, 2048, 0).unwrap();
         assert_eq!(s.task(1).unwrap().unwrap().carved_offset, Some(2048));
     }
 
@@ -759,14 +765,21 @@ mod tests {
             None,
             "新建任务 = 无检查点（不是 0）"
         );
-        s.set_carved_offset(id, 0).unwrap();
+        s.set_carved_offset(id, 0, 0).unwrap();
         assert_eq!(
             s.task(id).unwrap().unwrap().carved_offset,
             Some(0),
             "0 是合法偏移（区间起点）——三态语义：None=未知 / 0=起点 / n=断点"
         );
-        s.set_carved_offset(id, 835584).unwrap();
-        assert_eq!(s.task(id).unwrap().unwrap().carved_offset, Some(835584));
+        // 配对写：同一 UPDATE 落 found_count——重启续跑的 idx 起点与断点必须同帧
+        // （分开写会造出「断点在前、计数滞后」的库态 → 续号覆盖断点前旧行 = 静默丢条）
+        s.set_carved_offset(id, 835584, 7).unwrap();
+        let row = s.task(id).unwrap().unwrap();
+        assert_eq!(
+            (row.carved_offset, row.found_count),
+            (Some(835584), 7),
+            "检查点两坐标同帧落盘"
+        );
     }
 
     #[test]

@@ -393,6 +393,134 @@ mod tests {
         }
     }
 
+    /// 断点续跑协议判据（不丢条 + 不重报）：对全扫的**每个** `Scanned(at)` 事件，模拟
+    /// 「该事件后被杀」的库态（已落库 = 事件前 emit 的条目、`next_idx` = 落库数），断言
+    /// `落库 ∪ 自 at 续扫 == 参考全扫`（按 (offset, size) 逐点）。返回参考集供调用方钉条数。
+    fn assert_resume_protocol(img: &[u8], run_end: u64) -> Vec<(u64, u64)> {
+        let range = 0..run_end;
+        let runs = std::slice::from_ref(&range);
+        let (_f, dev) = dev_for(img);
+        let mut events: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        let mut seen: Vec<(u64, u64)> = Vec::new();
+        carve_runs(&dev, runs, 64 << 20, &mut |ev| {
+            match ev {
+                CarveEvent::Scanned { at, .. } => events.push((at, seen.clone())),
+                CarveEvent::Entry(e) => seen.push((e.byte_offset, e.size)),
+            }
+            true
+        });
+        let mut reference = seen;
+        reference.sort_unstable();
+        assert!(
+            events.len() >= 2,
+            "夹具须多窗口（单窗本测失明）: {events:?}"
+        );
+        for (at, landed) in &events {
+            let (_, resumed) = carve_from(&dev, runs, *at, 64 << 20);
+            let mut union: Vec<(u64, u64)> = landed.clone();
+            union.extend(resumed.iter().map(|e| (e.byte_offset, e.size)));
+            union.sort_unstable();
+            assert_eq!(
+                union, reference,
+                "自 at={at}（落库 {landed:?}）续扫：落库 ∪ 续扫 必须逐点等于参考全扫"
+            );
+        }
+        reference
+    }
+
+    #[test]
+    fn resume_protocol_is_lossless_and_duplicate_free() {
+        // spec-t7 阻断修复的协议级判据：配对检查点（idx 自 found_count 续号）+ 续跑点取
+        // 检查点原值 at ⇒ 落库条目永不丢、重扫区间不重报。夹具矩阵覆盖三类边界形状：
+        // 跨界长读容器（尾部嵌签名诱饵）、窗口界两侧（k=1..8）、run 尾截断。
+        let chunk = CHUNK_BYTES as u64;
+
+        // (a) 前段 png + 起点在窗 1 界前 11 字节的 jpeg（主体跨 buf_end 长读）；其尾部倒数
+        // 第 7 字节起内嵌一枚 jpeg magic——参考全扫因 pos 推进跳过（内嵌容器不重报）。
+        let p = xd_fixtures::mini_png(b"first");
+        let j = xd_fixtures::mini_jpeg(1000);
+        let mut img = vec![0u8; (chunk + 16384) as usize];
+        xd_fixtures::plant_in_run(&mut img, 1024 * 1024, &p);
+        let j_off = chunk - 11;
+        xd_fixtures::plant_in_run(&mut img, j_off, &j);
+        xd_fixtures::plant_in_run(&mut img, j_off + j.len() as u64 - 7, &[0xFF, 0xD8, 0xFF]);
+        assert_eq!(assert_resume_protocol(&img, img.len() as u64).len(), 2);
+
+        // (b) 窗口界两侧 k=1..=8（magic 恰跨 buf_end 的逐档）——独立镜像：雕刻会推进 pos
+        // 吞掉后继候选，同图并存会互斥（判别力归零）。
+        let sp = xd_fixtures::mini_png(b"straddle");
+        for k in 1..=8u64 {
+            let mut img = vec![0u8; (chunk + 8192) as usize];
+            xd_fixtures::plant_in_run(&mut img, chunk - k, &sp);
+            let r = assert_resume_protocol(&img, img.len() as u64);
+            assert_eq!(r.len(), 1, "k={k}: {r:?}");
+            assert_eq!(r[0].0, chunk - k, "k={k}");
+        }
+
+        // (c) run 尾截断：png 尾部越 run 界（complete=false 诚实截断）+ 前段 jpeg；
+        // run 比镜像短 30 字节（镜像铺满其余字节，夹具层 plant 不越界）
+        let j2 = xd_fixtures::mini_jpeg(300);
+        let mut img = vec![0u8; (chunk + 4096) as usize];
+        xd_fixtures::plant_in_run(&mut img, 512, &j2);
+        let sp_off = img.len() as u64 - sp.len() as u64;
+        xd_fixtures::plant_in_run(&mut img, sp_off, &sp);
+        assert_eq!(assert_resume_protocol(&img, img.len() as u64 - 30).len(), 2);
+    }
+
+    #[test]
+    fn window_start_retreat_reemits_embedded_signature() {
+        // 裁定记录（spec-t7 提案的探针否决）：深扫续跑点**不得**回退 7 字节。
+        // 回退把首窗读取起点带回 `[at-7, at)`——该区间按构造属于**上一窗口已处理区**
+        // （at ≥ buf_end-7 恒成立：advance_to 下界即 buf_end-7，或已雕容器 pos 推进所致），
+        // 其中的候选要么已 emit（重报），要么在已雕容器尾巴里被 pos 刻意跳过（幻影）。
+        // 反方向（不回退会漏）不成立：跨 buf_end 的候选由不变量 2/3 把 next_read 推到其起点
+        // ⇒ at ≤ 其起点，自 at 续扫必重见——全形状矩阵见 `resume_protocol_is_lossless_...`。
+        let chunk = CHUNK_BYTES as u64;
+        let p = xd_fixtures::mini_png(b"first");
+        let j = xd_fixtures::mini_jpeg(1000);
+        let mut img = vec![0u8; (chunk + 16384) as usize];
+        xd_fixtures::plant_in_run(&mut img, 1024 * 1024, &p);
+        let j_off = chunk - 11;
+        xd_fixtures::plant_in_run(&mut img, j_off, &j);
+        let bait_off = j_off + j.len() as u64 - 7;
+        xd_fixtures::plant_in_run(&mut img, bait_off, &[0xFF, 0xD8, 0xFF]);
+
+        let whole = 0..img.len() as u64;
+        let runs = std::slice::from_ref(&whole);
+        let (_f, dev) = dev_for(&img);
+        let reference = assert_resume_protocol(&img, img.len() as u64); // 顺带钉死不回退臂干净
+        assert_eq!(reference.len(), 2);
+        // 真续跑点取自事件流（不是从条目偏移倒推）：跨界 jpeg 之后的首个 `Scanned(at)`
+        let mut ats: Vec<u64> = Vec::new();
+        carve_runs(&dev, runs, 64 << 20, &mut |ev| {
+            if let CarveEvent::Scanned { at, .. } = ev {
+                ats.push(at);
+            }
+            true
+        });
+        let at = *ats
+            .iter()
+            .find(|a| **a > j_off && **a <= j_off + j.len() as u64)
+            .expect("夹具须在已雕 jpeg 消耗终点开新窗口（否则本测不成立）");
+        assert!(
+            at - (MAX_SIG_LEN - 1) >= j_off,
+            "at-7={} 须落回该容器内部 [{j_off}, {})，证明回退点确在已处理区",
+            at - (MAX_SIG_LEN - 1),
+            j_off + j.len() as u64
+        );
+        let (_, back) = carve_from(&dev, runs, at - (MAX_SIG_LEN - 1), 64 << 20);
+        let extra: Vec<u64> = back
+            .iter()
+            .map(|e| e.byte_offset)
+            .filter(|o| !reference.iter().any(|(r, _)| r == o))
+            .collect();
+        assert_eq!(
+            extra,
+            vec![bait_off],
+            "回退 7 字节必重报已雕容器尾部内嵌签名（幻影条目）——故续跑点取 at 原值"
+        );
+    }
+
     /// 读调用计数（T7 阶段二量化不变量：预读把 JPEG 熵段的逐字节读压掉）。
     struct CountingDev {
         inner: ImageFileDevice,

@@ -205,9 +205,12 @@ pub(crate) fn run_carve_worker(
 /// `readBytes` 口径 = **已扫描**字节（任务级：断点前累计 + 本次；与 `totalBytes`=Σ空闲区间
 /// 对齐，百分比不超 100%）。
 ///
-/// **驻停次序（T7 契约）**：`Scanned` 先落检查点再驻停（暂停期间进度/断点不倒退）；
-/// `Entry` 先驻停再落盘（**已落库条目恒在 `carved_offset` 之前**——重启续扫不会把已落库内容
-/// 甩在断点之后重扫）。取消检查恒在最先（响应性不因次序变化）。
+/// **驻停次序与检查点不变量（T7 契约，spec-t7 阻断修复后口径）**：`Scanned` 先落**配对**
+/// 检查点（`carved_offset` + `found_count` 同帧）再驻停；`Entry` 先驻停再落盘。不变量：
+/// **凡 `idx < found_count` 的已落库条目，其 `byte_offset < carved_offset`**——续跑自
+/// `found_count` 续号、自 `carved_offset` 起扫，同号 `INSERT OR REPLACE` 只可能覆盖本窗口
+/// 重扫的等价条目（幂等）；断点前的旧行 idx 恒小于续号起点，永不被覆盖。取消检查恒在最先
+/// （响应性不因次序变化）。
 struct CarveProgress<'a> {
     task_id: u64,
     store: &'a Store,
@@ -230,9 +233,11 @@ impl CarveProgress<'_> {
         match ev {
             xd_carving::CarveEvent::Scanned { scanned, at } => {
                 self.scanned = self.progress_base + scanned;
-                // 检查点是**安全机制**，不参与进度节流：每窗口一条小 UPDATE（≤4MiB 粒度）——
-                // 节流漏写会让暂停时的断点滞后，续扫重做已落库窗口（T7 移交给出的口径）。
-                let _ = self.store.set_carved_offset(self.task_id, at);
+                // 检查点是**安全机制**，不参与进度节流：每窗口一条小 UPDATE（≤4MiB 粒度）。
+                // **配对写**：`found_count` 与断点同帧落盘。此刻本窗口条目尚未产出，
+                // `self.found` 恰 = 「断点（at）之前已落库条目数」——两坐标一致，重启后
+                // idx 自 found_count 续号才不会覆盖断点前的旧行（spec-t7 阻断的丢条根因）。
+                let _ = self.store.set_carved_offset(self.task_id, at, self.found);
                 let now = Instant::now();
                 if now.duration_since(self.last_notify_at) >= Duration::from_millis(250)
                     || self.scanned.saturating_sub(self.last_notify_bytes) >= 1024 * 1024
@@ -274,7 +279,7 @@ impl CarveProgress<'_> {
                 self.found += 1; // idx 先占位后自增：条目编号与 found 计数恒一致
                 let _ = self.store.insert_entries(
                     self.task_id,
-                    std::slice::from_ref(&entry), // 库错不中断扫描（found/idx 照进、库内可缺行——T7 断点设计须知情）
+                    std::slice::from_ref(&entry), // 库错不中断扫描（found/idx 照进）。注意：该编号会随配对检查点越过断点，缺失行此后不重扫（库错路径的已知局限，非检查点丢条）
                 );
             }
         }

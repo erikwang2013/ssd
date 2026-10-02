@@ -323,8 +323,10 @@ impl ScanManager {
     /// 仅 handlers 的 `Resume::NeedsDevice` 路径调用；守卫防公开 API 误用（worker 在场所的
     /// paused 应走 resume，否则同 id 双 worker、旧线程被遗弃）。
     ///
-    /// 已知局限（README）：断点所在窗口内已落库的条目会被重扫——同编号 `INSERT OR REPLACE`
-    /// 覆盖为等价记录，罕见时序（两次检查点写之间被杀）下残留至多一条重复条目（不丢数据）。
+    /// 深扫续跑语义（spec-t7 修复后）：`carved_offset`（续扫点）与 `found_count`（续号起点）
+    /// 由 worker **同帧配对落盘**（见 `Store::set_carved_offset`）——断点所在窗口内的条目重扫时
+    /// 以同编号 `INSERT OR REPLACE` 覆盖为等价记录（幂等）。**已落库条目零丢失、无重复**；
+    /// 两次检查点写之间被杀 → 库内仍是上一自洽帧（多回退一个窗口重扫，同样幂等）。
     pub fn restart(&self, id: u64, device: Arc<dyn BlockDevice>) -> Result<(), ScanError> {
         if let Some((_, running, _)) = self.active_of(id)
             && running.load(Ordering::SeqCst)
@@ -751,12 +753,118 @@ mod tests {
         }
         assert_eq!(
             total, 2,
-            "本场景暂停在窗口界：零残余（最坏允许 +1 条，见 README 局限）: {page:?}"
+            "本场景暂停在窗口界：配对检查点下恒 2 条、零残余: {page:?}"
         );
         assert_eq!(
             m2.status(id).unwrap().read_bytes,
             m2.status(id).unwrap().total_bytes,
             "续跑收尾 100%（进度含断点前缀）"
+        );
+    }
+
+    /// spec-t7 阻断形状夹具：run0 埋 8 枚、run1 埋 3 枚 mini_png（4KiB 间距，同 [`deep_resume_fixture`]
+    /// 的 1MiB exFAT 卷）。暂停落在 **run1** 时 run0 全数已落库、而 250ms 节流进度从未写过
+    /// `found_count`——单写检查点的旧实现以滞后计数续号，重扫 run1 的同号 REPLACE 覆盖 run0 旧行。
+    struct DeepTwoRun {
+        image: Vec<u8>,
+        offsets: Vec<u64>,
+        k: usize,
+        run1_start: u64,
+    }
+
+    fn deep_two_run_fixture() -> DeepTwoRun {
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "BIG.TMP", &[0u8; 300 * 1024])
+            .add_file("/", "LIVE.TXT", b"live")
+            .delete("/", "BIG.TMP")
+            .build();
+        let (_f0, dev0) = crate::testutil::dev_from_bytes(&image);
+        let runs = xd_fs_exfat::freespace::unallocated_runs(&*dev0).unwrap();
+        assert!(runs.len() >= 2, "夹具须有两个空闲区间: {runs:?}");
+        assert!(
+            runs[1].start.saturating_sub(runs[0].end) >= 7,
+            "两区间间隙须 ≥7 字节（续跑点收 7 字节不得落进前区间）: {runs:?}"
+        );
+        let png = xd_fixtures::mini_png(b"loss-probe");
+        let mut offsets = Vec::new();
+        for (run, n) in [(runs[0].clone(), 8u64), (runs[1].clone(), 3u64)] {
+            for i in 0..n {
+                let off = run.start + 4096 + i * 4096;
+                assert!(
+                    off + png.len() as u64 <= run.end,
+                    "埋点 {off} 越区间 {}..{}",
+                    run.start,
+                    run.end
+                );
+                xd_fixtures::plant_in_run(&mut image, off, &png);
+                offsets.push(off);
+            }
+        }
+        DeepTwoRun {
+            image,
+            offsets,
+            k: 8,
+            run1_start: runs[1].start,
+        }
+    }
+
+    #[test]
+    fn deep_pause_in_second_run_restart_loses_nothing() {
+        // spec-t7 阻断的真回归（旧形状失明的根因：暂停落在窗口界/首 run，配对与否无差）：
+        // 暂停驻留在**第二个 run**，重启续跑后条目总数与偏移集合必须与全量逐点相等。
+        let fx = deep_two_run_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.db");
+        let id;
+        {
+            let m = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+            let (_f, dev) = crate::testutil::dev_from_bytes(&fx.image);
+            // 每条目 ≈ 一次 64KiB 预读重填（`wrap` 对一切读睡 10ms）：条目边界可观测、可驻停，
+            // 且 run1 检查点时刻 ≪ 250ms → 节流进度此时恒未写过（阻断形状成立的前提）。
+            let slow = crate::testutil::SlowDev::wrap(dev, Duration::from_millis(10));
+            let s = m.start_deep(slow).unwrap();
+            id = s.task_id;
+            crate::testutil::wait_for_entries(&m, id, fx.k as u64, Duration::from_secs(30));
+            m.pause(id).unwrap();
+            wait_for_state(&m, id, ScanState::Paused, Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(50)); // 驻停稳定窗口
+            let row = m.status(id).unwrap();
+            assert_eq!(
+                row.carved_offset,
+                Some(fx.run1_start),
+                "暂停须驻留在 run1（检查点已越到 run1 起点）——停在窗口界时本形状对配对写失明: {row:?}"
+            );
+            assert_eq!(
+                row.found_count, fx.k as u64,
+                "配对写：found_count 与 carved_offset 同帧 = run0 条目数；单写旧实现此处 0（续号覆盖 run0 旧行 = 丢条）"
+            );
+        } // 模拟进程被杀：worker 已驻停、manager 丢弃，库态留存
+        let m2 = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
+        m2.recover_after_restart().unwrap();
+        match m2.resume(id).unwrap() {
+            Resume::NeedsDevice { .. } => {}
+            Resume::InPlace => panic!("worker 已不在场，必须 NeedsDevice"),
+        }
+        let (_f2, dev2) = crate::testutil::dev_from_bytes(&fx.image);
+        m2.restart(id, dev2).unwrap();
+        wait_for_state(&m2, id, ScanState::Completed, Duration::from_secs(30));
+        let (total, page) = m2.results(id, 0, 100, false).unwrap();
+        assert_eq!(
+            total,
+            fx.offsets.len() as u64,
+            "续跑后总数必须等于全量（旧实现续号覆盖 run0 旧行 → 此处少）: {page:?}"
+        );
+        let mut got: Vec<u64> = page.iter().map(|e| e.byte_offset.unwrap()).collect();
+        got.sort_unstable();
+        let mut want = fx.offsets.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "偏移集合逐点相等（丢条/重报都现形）");
+        let mut idxs: Vec<u64> = page.iter().map(|e| e.idx).collect();
+        idxs.sort_unstable();
+        assert_eq!(
+            idxs,
+            (0..total).collect::<Vec<u64>>(),
+            "idx 恰 0..total（同号覆盖会留重号空洞）"
         );
     }
 
@@ -780,7 +888,7 @@ mod tests {
             s.insert_entries(id, &[carved_entry(0, fx.a.0, fx.a.1.len() as u64)])
                 .unwrap();
             s.set_progress(id, 0, 1, 0).unwrap();
-            s.set_carved_offset(id, breakpoint).unwrap();
+            s.set_carved_offset(id, breakpoint, 1).unwrap();
             s.set_state(id, ScanState::Paused).unwrap();
         }
         let m = ScanManager::new(Store::open(&path).unwrap(), Arc::new(|_| {}));
