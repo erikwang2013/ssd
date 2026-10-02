@@ -438,6 +438,7 @@ dependencies = [
  "tempfile",
  "xd-core",
  "xd-device",
+ "xd-fixtures",
 ]
 
 [[package]]

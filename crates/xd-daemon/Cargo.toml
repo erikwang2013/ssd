@@ -11,3 +11,4 @@ xd-device = { path = "../xd-device" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+xd-fixtures = { path = "../xd-fixtures" }
