@@ -861,6 +861,25 @@ docs 可达性措辞改"须诱导真人完成一次认证（auth_admin 是每次
 **门禁增补（T4 打包脚本落实）**：`packaging/` 下 XML 类文件纳入 `xmllint --noout` 校验。
 **账（记 M1e）**：XML 注释体是校验盲区——模板文本必须过一遍真实 parser，不能只靠肉眼。
 
+**修复轮（qual-m1e-t3，2026-10-02）**：质量审查 2 Important + 9 Minor，修复提交 `e2adb38` + 终修 `5061edc`：
+
+- **I1（旗舰场景）**：`ENV{ID_BUS}=="usb"` 漏 USB 硬盘盒/易驱线/移动 SSD（RMB=0 时 ata_id 先置 `ID_BUS=ata`、
+  usb_id 拒绝改写）→ 改 `SUBSYSTEMS=="usb"`；mmc 行按可移除性收窄 `ATTRS{removable}=="1"`
+  （终修补 `ATTR`→`ATTRS`：分区节点自身无该属性，ATTRS 含自身+父链，SD 分区随整盘命中、eMMC/boot 排除）。
+- **I2（root 环境静默必挂）**：`unshare -r cargo test` 复现（daemon exit 2 缺 PKEXEC_UID）→ Rust/Dart 两侧 harness
+  注入 `PKEXEC_UID=<euid>`；修后 root 分支实跑全过（Rust 4+5、Flutter 10/10）。Dart 侧经
+  `IpcCoreClient.start` 新增可选 `environment` 形参（裁量接受，生产调用点行为不变）。
+- **Minor 3/4/8**：`root_mode(Option<u32>)` 失败关闭（None|Some(0) 皆 root）；`open_image_no_follow` 加
+  `O_NONBLOCK`（root+FIFO 实测立即 exit 2 不挂死）；新增 fail-closed 与 ELOOP 两测试（110→112）。
+- **Minor 6/9/10/11**：policy `<message>` 改述；docs 修 SSH/无会话矛盾、绝对路径示例、M4 降权顺序
+  （setgroups→setresgid→setresuid + NO_NEW_PRIVS + 建线程前 + open 必须前置）、TOCTOU 诚实边界与
+  三项排除（硬链接/bind mount/userns）。
+- **变异抽验（qual 独立）**：抽 O_NOFOLLOW → ELOOP 测试 FAILED；root_mode 改失败开放 → fail-closed 测试 FAILED。
+- **披露残留**：非 root `--image <fifo>` 仍会在 `ImageFileDevice::open` 挂死（xd-device 禁动；不跨提权边界；
+  闭合点与 `from_file` 同批）。
+- **并发观察**：多 agent 同工作树并发 git 读可能诱发 `index.lock` 残留（一次 0 字节陈旧锁被清除）——
+  review 类 agent 后续用 `git --no-optional-locks`。
+
 ---
 
 ### Task 4: deb 打包（裸 dpkg-deb 树）
@@ -891,6 +910,7 @@ Description: 小盾数据恢复工具
 set -e
 # 让已插入的块设备重新触发规则（U 盘通常安装后才插，无需此步也可）
 if command -v udevadm >/dev/null 2>&1; then
+  udevadm control --reload-rules || true   # 旧 udevd 的保险（255+ 自动重载 rules 目录）
   udevadm trigger --action=change --subsystem-match=block || true
 fi
 exit 0
@@ -908,6 +928,10 @@ cd "$(dirname "$0")/.."
 version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 [ -n "$version" ] || { echo "FAIL: 未取到版本号"; exit 1; }
 echo "packaging xiaodun v$version"
+
+# XML 门禁（qual-m1e-t3：模板文本必须过真实 parser——曾因注释体含 -- 致 polkitd 拒载）
+command -v xmllint >/dev/null || { echo "FAIL: 需 libxml2-utils（XML 门禁）"; exit 1; }
+xmllint --noout packaging/polkit/*.policy
 
 cargo build -q --locked --release -p xd-daemon
 
@@ -959,7 +983,8 @@ docker run --rm -v "$PWD/dist:/pkg:ro" ubuntu:24.04 bash -c '
 ```
 
 - [ ] **Step 4: ci.yml 新增 `package-deb` job**（`workflow_dispatch` 手动触发，仅 ubuntu-latest）：
-`cargo build --release -p xd-daemon` → `bash scripts/build-deb.sh` → `bash scripts/e2e-deb.sh` → 上传 deb 为 artifact。
+`sudo apt-get install -y libxml2-utils`（xmllint 门禁依赖）→ `cargo build --release -p xd-daemon` →
+`bash scripts/build-deb.sh` → `bash scripts/e2e-deb.sh` → 上传 deb 为 artifact。
 
 - [ ] **Step 5: 运行**：本机 `bash scripts/build-deb.sh`（dpkg-deb 可用）产出 dist/*.deb；`bash scripts/e2e-deb.sh` 有 docker 则跑、无则 skip。Commit：`feat(packaging): deb 树与 build/e2e 脚本（daemon 装 /usr/libexec/xiaodun）`
 
@@ -973,7 +998,10 @@ docker run --rm -v "$PWD/dist:/pkg:ro" ubuntu:24.04 bash -c '
 - [ ] `strace -f -e trace=openat ./target/debug/xd-daemon </dev/null 2>&1 | grep -E "openat.*(/dev/(sd|nvme|mmc|vd))" ` → **无输出**（device.list 零 open 的机器断言；手测记录入库）
 - [ ] `bash scripts/apply-copyright.sh` 幂等（新 .rs 已带头；rules/policy/脚本为配置件不加头）
 - [ ] **未验证清单（平台专有，交付标注"未验证"，M1 出口真机手测）**：pkexec 真实认证路径（CI 无 tty 必 127）、
-      udev uaccess 真机生效（需装包+插盘）、真 U 盘删除照片全链路、`/dev/sdX` 真实介质行为
+      udev uaccess 真机生效（需装包+插盘）、真 U 盘删除照片全链路、`/dev/sdX` 真实介质行为；
+      **补三项（qual-m1e-t3）**：① USB 硬盘盒/易驱线（RMB=0，`SUBSYSTEMS=="usb"` 规则的关键覆盖面）；
+      ② 内置 eMMC 负例（`mmcblk0` 不得获得 uaccess——收窄条 `ATTR{removable}=="1"` 的真机验证）；
+      ③ `--device /dev/sdb` 展示名应为型号名（见 T2 修复轮）
 - [ ] `provenance.sha256` 重生成——待发布时执行
 
 ## 后续切片（各自独立计划）
