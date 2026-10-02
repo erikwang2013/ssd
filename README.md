@@ -98,7 +98,7 @@ Flutter 骨架（协议模型、设备列表页）已端到端打通，CI 三平
 cargo test --workspace
 bash scripts/e2e.sh
 
-# UI 侧：构建 daemon，以镜像设备启动桌面应用（Linux/macOS/Windows）
+# UI 侧：构建 daemon，以镜像设备启动桌面应用（Windows 请用 $env: 语法设置这两个环境变量）
 cargo build -p xd-daemon
 bash fixtures/gen_image.sh /tmp/xiaodun.img 1048576
 cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon XD_IMAGE=/tmp/xiaodun.img flutter run -d linux
