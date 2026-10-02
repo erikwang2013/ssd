@@ -235,9 +235,10 @@ impl CarveProgress<'_> {
                     byte_offset: Some(e.byte_offset),
                 };
                 self.found += 1; // idx 先占位后自增：条目编号与 found 计数恒一致
-                let _ = self
-                    .store
-                    .insert_entries(self.task_id, std::slice::from_ref(&entry));
+                let _ = self.store.insert_entries(
+                    self.task_id,
+                    std::slice::from_ref(&entry), // 库错不中断扫描（found/idx 照进、库内可缺行——T7 断点设计须知情）
+                );
             }
         }
         true

@@ -1,16 +1,25 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! 顺序块扫描器：只做 I/O 与调度；暂停/取消/落库由 `ev` 回调承载（回调返回 false = 停止）。
 //!
-//! **扫描器不变量（测试钉死）：**
-//! 1. 每个候选无论裁决结果，扫描位置**至少推进其签名长度**（len=0 不原地打转）。
+//! **runs 契约**：区间须**互不相交**（重叠段会重复计入 `scanned`，百分比虚高）；本层不校验，
+//! 契约由 freespace 侧合并算法保证。
+//!
+//! **扫描器不变量：**
+//! 1. 每个候选无论裁决结果，扫描位置**至少推进其签名长度**（len=0 不原地打转）——
+//!    对现签名集**不可观测**（JPEG/PNG 结构互斥，无跨签名重叠起点），属未来跨签名防护；
+//!    可观测的是强化臂：命中条目后 `pos = offset + size`（`adjacent_files_not_rescanned` 钉死）。
 //! 2. 窗口重叠由「重读窗口尾部 7 字节」实现：`next_read = max(pos, buf_end - 7)`；
-//!    跨块签名不丢（PNG magic 8 字节，取 -7 即最坏起点回读）。
+//!    跨块签名不丢（PNG magic 8 字节，取 -7 即最坏起点回读）——`k=1..=8` 循环 pin 钉死。
 //! 3. 跨块签名未取全且 run 未尽 → 记 `next_read = abs`，下一轮从候选处重读。
+//!    **防御性**：当前 `find_candidates` 契约（候选恒整体在窗内）下不可达，
+//!    未来支持部分匹配时启用（代码保留）。
 //! 4. 坏读/空读：该窗口 span 计入 `scanned`（进度 = 尝试扫描字节，诚实到 100%），前进不中断。
 //!    `scanned` 口径 = **已尝试到的最远绝对位置**（run 内单调，跨窗口重叠不重复计数）——
 //!    收尾恰为 Σrun 长，百分比不会 >100%（逐窗口累加 span 会因 7 字节回读重复计数而超报）。
 //! 5. `Scanned(累计)` 事件在**每窗口**发出（≤4MiB 粒度：暂停/取消/检查点响应及时）；
 //!    `Entry` 事件每条雕刻发出；回调返回 `false` = 停止（取消）。
+//! 6. **退化窗口守卫**（`next_read <= window_start` → 跳 span）：窗口 ≤7 字节时 `advance_to`
+//!    打不过窗口起点，不跳会在原地打转——**承重**（`short_run_terminates_and_scans` 钉死）。
 //!
 //! **退化条目裁定（T5 移交①）**：生效臂 `e.size > sig.len()`（**严格大于**）——PNG 首块
 //! CRC 坏的最小非 cap 返回恰为签名长 8，不得当条目上报；退化件走 `_` 臂按签名长推进。
@@ -122,7 +131,7 @@ fn scan_run(
                 continue; // 重叠区里上一轮已处理过
             }
             if abs + sig.len() > buf_end && buf_end < run.end {
-                advance_to = abs; // 不变量 3：签名未取全，下轮从候选重读
+                advance_to = abs; // 不变量 3（防御性：现契约不可达，见模块头注）
                 break;
             }
             let mut cur = Cursor::new(dev, abs, run.end);
@@ -146,7 +155,7 @@ fn scan_run(
                     advance_to = advance_to.max(pos); // 不变量 1 的强化：跳过已重组区间（内嵌容器不重报）
                 }
                 _ => {
-                    pos = abs + sig.len(); // 不变量 1
+                    pos = abs + sig.len(); // 不变量 1（现签名集不可观测，见模块头注）
                     advance_to = advance_to.max(pos);
                 }
             }
@@ -221,22 +230,26 @@ mod tests {
 
     #[test]
     fn signature_straddling_chunk_boundary_is_found() {
-        // mini_png 起点放 CHUNK_BYTES-4：窗口 1 尾巴只含 magic 前 4 字节（find_candidates
-        // 不认）→ 不变量 2 的回读（buf_end-7）必须把窗口 2 推到 magic 起点前
+        // k=1..=8：mini_png 起点放 CHUNK_BYTES-k。k≤7 时窗口 1 尾部只含 magic 前缀
+        // （find_candidates 不认）→ 不变量 2 的回读（buf_end-7）必须把窗口 2 推到 magic
+        // 起点前；k=8 为界线另一侧（magic 整体在窗 1 尾，逐档都要找到）。
+        // 钉死常量 7：回读缩到 -6 时 k=7 档（magic 起点 CHUNK-7 < 窗 2 起点 CHUNK-6）必漏报。
         let p = xd_fixtures::mini_png(b"straddle");
-        let mut img = vec![0u8; CHUNK_BYTES + 8192];
-        xd_fixtures::plant_in_run(&mut img, CHUNK_BYTES as u64 - 4, &p);
-        let (_f, dev) = dev_for(&img);
-        let (stats, e) = carve_all(&dev, img.len() as u64, 64 << 20);
-        assert_eq!(e.len(), 1, "{e:?}");
-        assert_eq!(
-            e[0].byte_offset,
-            CHUNK_BYTES as u64 - 4,
-            "跨窗口 offset 精确"
-        );
-        assert_eq!(e[0].size, p.len() as u64);
-        assert!(e[0].complete);
-        assert_eq!(stats.scanned_bytes, img.len() as u64);
+        for k in 1..=8u64 {
+            let mut img = vec![0u8; CHUNK_BYTES + 8192];
+            xd_fixtures::plant_in_run(&mut img, CHUNK_BYTES as u64 - k, &p);
+            let (_f, dev) = dev_for(&img);
+            let (stats, e) = carve_all(&dev, img.len() as u64, 64 << 20);
+            assert_eq!(e.len(), 1, "k={k}: {e:?}");
+            assert_eq!(
+                e[0].byte_offset,
+                CHUNK_BYTES as u64 - k,
+                "k={k}: offset 精确"
+            );
+            assert_eq!(e[0].size, p.len() as u64, "k={k}");
+            assert!(e[0].complete, "k={k}");
+            assert_eq!(stats.scanned_bytes, img.len() as u64, "k={k}");
+        }
     }
 
     /// [bad.start, bad.end) 内的读取一律 Err（模拟坏区）。
@@ -281,6 +294,28 @@ mod tests {
             stats.scanned_bytes,
             img.len() as u64,
             "坏读计入进度：scanned == Σrun 长"
+        );
+    }
+
+    #[test]
+    fn bad_read_in_last_window_still_counts_progress() {
+        // 坏读计入的判别力只在**末窗**：中段坏读的置值会被后续窗口覆盖（口径 = 最远尝试
+        // 位置），故单靠上测无牙。run 尾 1MiB 坏读 → 仍 scanned == Σrun（100%）且终止。
+        let a = xd_fixtures::mini_jpeg(1000);
+        let mut img = vec![0u8; 9 << 20];
+        xd_fixtures::plant_in_run(&mut img, 100, &a);
+        let (_f, inner) = dev_for(&img);
+        let dev = BadRegion {
+            inner: &inner,
+            bad: (8 << 20)..(img.len() as u64), // 末窗（第 3 窗）全坏
+        };
+        let (stats, e) = carve_all(&dev, img.len() as u64, 64 << 20);
+        assert_eq!(e.len(), 1, "坏区前的候选仍须找到: {e:?}");
+        assert_eq!(e[0].byte_offset, 100);
+        assert_eq!(
+            stats.scanned_bytes,
+            img.len() as u64,
+            "末窗坏读不得吞进度：scanned == Σrun（100%）"
         );
     }
 

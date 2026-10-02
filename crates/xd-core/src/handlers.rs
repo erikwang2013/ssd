@@ -668,6 +668,16 @@ mod tests {
         assert_eq!(entries[0]["byteOffset"], run.start, "雕刻偏移逐字节精确");
         assert_eq!(entries[0]["sizeBytes"], j.len() as u64, "完整重组长");
         assert_eq!(entries[0]["deleted"], true);
+        // qual-t6 纵深防御：雕刻 observer 1:1 ⇒ idx 集合恰为 0..foundCount（同 quick 口径，
+        // 防回调重复/编号漂移——`found + 1` 类偏移变异在此必红）
+        let mut idxs: Vec<u64> = entries.iter().map(|e| e["idx"].as_u64().unwrap()).collect();
+        idxs.sort_unstable();
+        let found = status["foundCount"].as_u64().unwrap();
+        assert_eq!(
+            idxs,
+            (0..found).collect::<Vec<u64>>(),
+            "idx 集合 == 0..foundCount"
+        );
     }
 
     #[test]
