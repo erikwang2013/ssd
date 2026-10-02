@@ -2580,7 +2580,7 @@ bash scripts/e2e.sh
 - **B（本次订正）**：记录标题 SHA 与行号漂移（`:47→:50`、`:79→:80`、Dart `:34→:36`）已在上文修正。
 - provenance 对 api.rs 已过期——按 Task 9 Step 3 约定归发版时重签，非 T1 门禁（仅记录）。
 
-**qual 评审（qual-m1b-t1）——结论 ISSUES（非阻塞）→ 补丁 `a563cb1` → 复审增量待跑**。变异表：10 条 9 KILL + 1 等价变异体（#6 `#[serde(default)]` 对 `Option` 冗余——serde 隐式缺失=None，保留作自文档）；加分变异 **11 存活 = 真缺口**（`enumerate` 的 transport 赋值零覆盖）。三个探针结论：ping 归一行删掉仍全绿（独立价值仅自洽，净覆盖由 `ping_returns_pong_and_protocol` 兜底）；三态无关歧义（missing/null→None、编码一律省略键，单向 daemon→UI + README 声明充分）；notify.rs 水印首行与 api.rs 逐字节相同。补丁（`a563cb1`，4 文件，232 测试）：
+**qual 评审（qual-m1b-t1）——结论 ISSUES（非阻塞）→ 补丁 `a563cb1` → 复审增量 APPROVED（T1 关闭，232/0，树净）**。变异表：10 条 9 KILL + 1 等价变异体（#6 `#[serde(default)]` 对 `Option` 冗余——serde 隐式缺失=None，保留作自文档）；加分变异 **11 存活 = 真缺口**（`enumerate` 的 transport 赋值零覆盖）。三个探针结论：ping 归一行删掉仍全绿（独立价值仅自洽，净覆盖由 `ping_returns_pong_and_protocol` 兜底）；三态无关歧义（missing/null→None、编码一律省略键，单向 daemon→UI + README 声明充分）；notify.rs 水印首行与 api.rs 逐字节相同。补丁（`a563cb1`，4 文件，232 测试）：
 - (b) `enumerate_classifies_transport_from_sysfs`（假 sysfs 根含 `/usb` → list() 断言 `Some("usb")`）；实施者手工复验变异 11 → 该测红 → 还原。
 - (a) `scan_state_all_variants_serialize_to_contract_literals`（pending/failed 字面量补齐）+ 订正 `contract_v1.rs` 假注释「全量覆盖」。
 - (d) Dart 侧 golden 集合钉死（21 名单全等）。
