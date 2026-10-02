@@ -347,11 +347,14 @@ impl FatImageBuilder {
 
 /// "HELLO.TXT" → b"HELLO   TXT"（大写、空格填充、无扩展名时全空格）
 pub fn encode_sfn(name: &str) -> [u8; 11] {
-    debug_assert!(name.is_ascii(), "encode_sfn 仅支持 ASCII 8.3 名: {name}");
     let (base, ext) = match name.rsplit_once('.') {
         Some((b, e)) => (b, e),
         None => (name, ""),
     };
+    debug_assert!(
+        name.is_ascii() && base.len() <= 8 && ext.len() <= 3,
+        "encode_sfn 仅支持 ASCII ≤8.3 名: {name}"
+    );
     let mut out = [b' '; 11];
     for (i, c) in base.bytes().take(8).enumerate() {
         out[i] = c.to_ascii_uppercase();
