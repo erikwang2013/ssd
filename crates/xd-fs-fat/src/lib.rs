@@ -3,6 +3,7 @@
 //! 全部输入经 `xd_device::BlockDevice`（任意偏移只读），零平台耦合。
 
 pub mod bpb;
+pub mod dirent;
 pub mod fat;
 
 /// 引擎统一错误类型。
