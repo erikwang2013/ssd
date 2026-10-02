@@ -41,7 +41,7 @@ impl<'d> Fat32<'d> {
         Ok(u32::from_le_bytes(b))
     }
 
-    /// 顺链收集。起点须 2..=count+1；EOC/0/坏簇/越界值即停；环 → 有界长链（len == count+2）。
+    /// 顺链收集。起点须 2..=count+1；EOC/0/1（保留值）/坏簇/越界值即停；环 → 有界长链（len == count+2）。
     pub fn chain(&self, start: u32) -> Result<Vec<u32>, ExfatError> {
         let max_cluster = self.boot.cluster_count as u64 + 1;
         if !(2..=max_cluster).contains(&(start as u64)) {
@@ -53,7 +53,7 @@ impl<'d> Fat32<'d> {
         let mut cur = start;
         while (out.len() as u64) <= max_cluster {
             let v = self.next_raw(cur)?;
-            if v == 0 || is_eoc(v) || v == BAD_CLUSTER || (v as u64) > max_cluster {
+            if v < 2 || is_eoc(v) || v == BAD_CLUSTER || (v as u64) > max_cluster {
                 break;
             }
             out.push(v);
@@ -154,6 +154,22 @@ mod tests {
         assert!(fat.chain(0).is_err());
         assert!(fat.chain(1).is_err());
         assert!(fat.chain(300).is_err()); // > count+1
+        assert_eq!(fat.chain(253).unwrap(), vec![253]); // count+1 = 末簇，合法端点
+        assert!(fat.chain(254).is_err());
+    }
+
+    #[test]
+    fn chain_breaks_on_reserved_value_one() {
+        // FAT[6]=1（保留值）：不得推进链——cluster_to_byte(1) 在 debug panic / release 回绕读错区
+        let mut img = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_chained("/", "B.BIN", &[7u8; 100])
+            .build();
+        let fat_b = 24 * 512;
+        img[fat_b + 6 * 4..fat_b + 6 * 4 + 4].copy_from_slice(&1u32.to_le_bytes());
+        let (_f, dev) = dev_for(&img);
+        let boot = boot::parse(&dev).unwrap();
+        let fat = Fat32::new(&dev, &boot);
+        assert_eq!(fat.chain(6).unwrap(), vec![6]);
     }
 
     #[test]

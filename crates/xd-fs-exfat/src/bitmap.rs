@@ -120,32 +120,49 @@ mod tests {
 
     #[test]
     fn read_allocation_chain_vs_contiguous_fallback() {
-        // 链覆盖：链 [3,4] 覆盖 2 簇需求 → 按链读（3 在前 4 在后，与物理序不同才能区分——夹具里 upcase 链物理连续，
-        // 本测试改用 DataLength=8192 从簇 3 起：链 [3,4] 恰好覆盖 → 内容 == 簇3+簇4）
-        // 短链回退：FAT[3]=EOC → 链 [3] 不足 → 连续回退读簇 3,4（物理连续）
-        let image = xd_fixtures::ExfatImageBuilder::new().build();
-        let (_f, dev) = dev_for(&image);
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let img = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "F.BIN", &data, &[7, 6, 8], false)
+            .build();
+        let (_f, dev) = dev_for(&img);
         let boot = boot::parse(&dev).unwrap();
         let fat = Fat32::new(&dev, &boot);
-        let a = read_allocation(&dev, &boot, &fat, 3, 8192).unwrap();
-        assert_eq!(a.len(), 8192);
-        assert_eq!(&a[..5836], xd_fixtures::UPCASE_TABLE);
-        let mut img2 = image.clone();
-        img2[24 * 512 + 3 * 4..24 * 512 + 3 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let a = read_allocation(&dev, &boot, &fat, 7, 8192).unwrap();
+        assert_eq!(a, data[..8192], "链覆盖时必须按链序 7→6→8 拼接");
+        // 短链回退：FAT[7]=EOC → 链 [7] 不足 → 物理连续读 7,8
+        let mut img2 = img.clone();
+        img2[24 * 512 + 7 * 4..24 * 512 + 7 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let (_f2, dev2) = dev_for(&img2);
         let boot2 = boot::parse(&dev2).unwrap();
         let fat2 = Fat32::new(&dev2, &boot2);
-        let b = read_allocation(&dev2, &boot2, &fat2, 3, 8192).unwrap();
-        assert_eq!(b, a, "短链回退读物理连续簇，内容应与链读一致");
+        let b = read_allocation(&dev2, &boot2, &fat2, 7, 8192).unwrap();
+        // 物理簇 7 + 8 的显式读取作为期望值
+        let cb = boot2.cluster_bytes() as usize;
+        let mut expect = vec![0u8; cb * 2];
+        dev2.read_at(boot2.cluster_to_byte(7), &mut expect[..cb])
+            .unwrap();
+        dev2.read_at(boot2.cluster_to_byte(8), &mut expect[cb..])
+            .unwrap();
+        assert_eq!(b, expect, "短链回退按物理连续读");
+        assert_ne!(a, b, "两条路径内容不同——判别力成立");
     }
 
     #[test]
     fn read_allocation_partial_device_is_err() {
-        // 要求读满 DataLength；截断设备 → Err（不允许用部分位图判空闲）
-        let image = xd_fixtures::ExfatImageBuilder::new().build();
-        let (_f, dev) = dev_for(&image);
+        // 真截断：镜像切在物理簇 8 中段（heap + 6*4096 + 200），从簇 7 读 12288（= 3 簇，需 7→6→8）
+        // → 命中"读不满（设备截断？）"分支（8192 只覆盖链前两簇 7→6，均在截断点之前，够不到该分支）
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let img = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "F.BIN", &data, &[7, 6, 8], false)
+            .build();
+        let cut = 32 * 512 + 6 * 4096 + 200;
+        let truncated = img[..cut].to_vec();
+        let (_f, dev) = dev_for(&truncated);
         let boot = boot::parse(&dev).unwrap();
         let fat = Fat32::new(&dev, &boot);
-        assert!(read_allocation(&dev, &boot, &fat, 3, 10 * 1024 * 1024).is_err());
+        assert!(matches!(
+            read_allocation(&dev, &boot, &fat, 7, 12288),
+            Err(ExfatError::InvalidBoot(m)) if m.contains("读不满")
+        ));
     }
 }
