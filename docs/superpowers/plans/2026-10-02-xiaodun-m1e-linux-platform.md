@@ -700,6 +700,24 @@ ci.yml：Linux e2e 步骤后追加一步 `bash scripts/e2e-loop.sh`（手动触�
 - [ ] **Step 3: 运行** → xd-core +2 测试（合并 + 去重）；xd-device 集成测试本地静默跳过；workspace 全绿；`bash scripts/e2e-loop.sh` 本机输出 `skip: 无免密 sudo…`（退出 0）
 - [ ] **Step 4: Commit** `feat(daemon): --device 注册与启动枚举（device.list 零 open），环回 e2e 脚本`
 
+**执行记录（2026-10-02）**：实施提交 `06801c7` + 跟进 `d213cd5`（Dart 侧修补）。计数：worktree workspace
+103 → **106**（xd-core +2、loop_e2e 集成 +1 静默通过）。偏离 6 条：
+
+1. **计划外文件 `crates/xd-daemon/tests/ipc.rs`**：`device_list_with_image` 的 `len()==1` 与启动枚举冲突（本机实测 3 条）
+   → 按 `kind=="image"` 过滤断言（保原意；下标 0 顺序断言由新核心单测覆盖）。
+2. **计划外文件 `ui/test/ipc_integration_test.dart`（同因漏改，spec 审查发现）**：真 daemon 集成测试
+   `hasLength(1)`/`.single` 于 Linux 必挂 → 同法过滤；本机（真物理盘，比 CI 更能暴露）flutter test 10/10
+   红→绿实证；repo 级同类断言全扫（golden 解码/e2e.sh grep/Handler 构造类均无需改）。
+3. `loop_e2e.rs` 加 `#![cfg(target_os="linux")]`（计划漏，win/mac 矩阵编译必需）。
+4. handlers 测试 `&vec![]` → `&[0u8;512]`（clippy useless_vec）。
+5. `linux.rs` 现 **514 行**（+14 为 `device_info()` 内聚 impl，rustfmt 强制展开；接受，先例 644/631 行）。
+6. 横幅「N 个设备已注册 · 枚举到 M 个物理磁盘」（原"镜像设备"字面在 --device 上线后失准）。
+
+**独立验证（spec 审查，LD_PRELOAD 替代 strace）**：纯枚举 0 条 /dev open（对照组 `cat /dev/null` 被捕获）；
+`/proc/<pid>/fd` 空闲仅 0/1/2；`unshare -rm` 遮蔽 /sys 后"枚举 0 盘"不阻塞 daemon；Windows 交叉
+`cargo check --target x86_64-pc-windows-msvc --all-targets` 干净；`--device` 四类错误路径 exit 2 清晰。
+计划教训（两条断言漏改）记 M1e 账：**daemon 行为变更必须同步扫 Rust 与 Dart 两侧测试**。
+
 ---
 
 ### Task 3: 提权落地件（udev uaccess + polkit + root 参数纵深防御）
