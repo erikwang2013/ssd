@@ -1460,10 +1460,12 @@ pub fn dev_from_bytes(bytes: &[u8]) -> (tempfile::NamedTempFile, Arc<dyn BlockDe
     (f, Arc::new(dev))
 }
 
-/// 小 exfat 夹具：2 live 文件 + 1 删除文件（名字/删除位可断言）。
+/// 小 exfat 夹具：2 live 文件 + 1 删除文件（**共 3 条目**——T5/T8 全链断言 `foundCount==3`、idx 集合 0..3；
+/// 计划初稿曾只放 2 条目，与断言不一致，已修正）。
 pub fn exfat_fixture() -> (tempfile::NamedTempFile, Arc<dyn BlockDevice>) {
     let image = xd_fixtures::ExfatImageBuilder::new()
         .add_file("/", "LIVE_A.TXT", b"aaaa")
+        .add_file("/", "LIVE_B.PNG", &[5u8; 100])
         .add_file("/", "DEL_ME.JPG", &[7u8; 9000])
         .delete("/", "DEL_ME.JPG")
         .build();
@@ -2391,8 +2393,10 @@ fn wait_notification(
 }
 
 fn exfat_image_bytes() -> Vec<u8> {
+    // 与 xd-core testutil::exfat_fixture 同构：3 条目（2 live + 1 删除）
     xd_fixtures::ExfatImageBuilder::new()
         .add_file("/", "LIVE_A.TXT", b"aaaa")
+        .add_file("/", "LIVE_B.PNG", &[5u8; 100])
         .add_file("/", "DEL_ME.JPG", &[7u8; 9000])
         .delete("/", "DEL_ME.JPG")
         .build()
