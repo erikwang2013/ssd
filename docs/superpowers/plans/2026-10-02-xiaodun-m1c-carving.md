@@ -604,6 +604,8 @@ git commit -m "feat(carving): xd-carving 骨架（CRC32/签名/Cursor）+ 夹具
 > 2. **勿重复建** crc32 对拍测试（已在 T3 以 `crc32_matches_fixtures_copy` 落地，含全字节域样本）。
 > 3. `xd-carving` 的 `signatures`/`Cursor` 已有仓库内测试（T3 qual 补测）；T4 测试直接用 `crate::signatures::{Cursor, Carved}`。
 > 4. T3 落地勘误：`tiny.png` 实为 **70 字节**（计划 68 是算术错）。
+>
+> **T4 执行后同步（实现以仓库为规格）**：① 计划代码 `!(2..=MAX_SEGMENT as u16).contains(&len)` 是**真 bug**（1MiB 转 u16=0 → 全部段长判非法），仓库修为 `(2..=MAX_SEGMENT).contains(&u32::from(len))`（u16 字段 vs 1MiB 上限结构恒真，真牙口在 T5 的 u32 len）；② 头注「非法记号→拒绝」实际为**截断**（仅非 SOI/未过 SOS 即 EOI 返 None）；③ `max_len` 归一为**返回硬上限**（单一出口 `len.min(max_len)`，被钳即 complete=false；EOI+1 与 FF 填充循环两路径由专属测试钉死）；④ 测试片段的 `xd_fixtures::testdev::dev_from_bytes` 不存在（用本地 dev_for）。
 
 **Files:**
 - Create: `crates/xd-carving/src/jpeg.rs`
@@ -798,6 +800,8 @@ git commit -m "feat(carving): JPEG marker 走链重组（熵段转义/RST/多扫
 ### Task 5: PNG 重组（chunk 走链 + CRC + IEND）
 
 > **T3 执行后同步**：夹具 `xd_fixtures::{mini_png, TINY_PNG}` 走根导出（`mod carving` 私有）；`tiny.png` 实为 **70 字节**（计划 68 为笔误）；勿重复建 crc32 对拍（T3 已落地）。
+>
+> **T4 裁定同步（cap=返回硬上限，本任务必须遵守）**：`max_len` 是**返回值硬上限**——任何路径 `len ≤ max_len` 恒成立，越限即诚实截断（complete=false）。PNG 侧同款隐患已由 T4 探针类推出：**chunk 数据读取循环（本计划 T5 代码的 `while remaining > 0`）不查上限**，单个 ≤16MiB 的 chunk 可越限 MAX_CHUNK 量级。实现时：(a) chunk 数据读取循环内每轮查 `cur.pos - start >= max_len` → 截断返回；(b) **单一出口归一**（所有 `Some(Carved)` 出口统一 `len = len.min(max_len)`，被钳则 complete=false）比逐点修更难漏；(c) 加两枚钉死测试：跨上限 chunk（cap 落在数据段中间）与 cap 落在 CRC 字段中。
 
 **Files:**
 - Create: `crates/xd-carving/src/png.rs`
@@ -1390,6 +1394,15 @@ git commit -m "test(carving): 恢复率门禁（100%/-0假阳性）+ daemon 深�
 - **qual 变异 10 条：5 杀，存活全部在 signatures.rs 与 JPEG 夹具结构（零覆盖区，判别力边界=测试边界）**→ 补测四枚（take 精确界/短读停位/skip+BE/正反例）+ 夹具自测 +2 断言（APP0 长度/总长）→ 四变异全杀（M3 双杀=两处独立断言同语义，加强非意外）；crc32 doc 幽灵指涉清理；对拍扩到全 256 字节域（CRC 表 256 项全被跨副本覆盖）。
 - **下游注记（已入 T4/T5 计划）**：夹具走**根导出** `xd_fixtures::{mini_jpeg, mini_png, TINY_PNG}`（`mod carving` 私有）；勿重复建 crc32 对拍；marker 插桩 YAGNI（mini_jpeg(n)+Vec 拼接够用）。
 - 实施者纪律亮点：未把 lead 在飞的计划文档改动扫进提交。
+
+### T4（JPEG 重组）—— impl-m1c-t4。提交沿革：`6fa5e0c`（主）→ `41b710b`（cap 硬上限）→ `688d126`（qual 补测）。DONE → spec **PASS**（era 分离/90 断言×2）→ qual **APPROVED** → 补测有牙（T4 关闭，327/0）
+
+- **计划真 bug（实施者抓，6/7 测试红实证）**：`!(2..=MAX_SEGMENT as u16).contains(&len)`——1MiB 转 u16 **恒为 0** → 每张 JPEG 第一段即截断。修为 `(2..=MAX_SEGMENT).contains(&u32::from(len))`（u16 字段结构恒真；真牙口在 T5 的 u32 len）。qual 变异 10 验证：改回旧式 **7 测试红**（回归护栏成立）。
+- **计划语义空白（实施者探针 + lead 裁定）**：`max_len` 原为"软上限"——EOI 跨界 +1、**FF 填充循环不查上限**（10 万 FF → len=100004，24 倍越限且读穿）、段长读失败 +1。裁定 **cap=返回硬上限**（单一出口归一 `len.min(max_len)`，被钳即 `complete=false`）+ 填充循环逐轮读界；两条机制各被专属测试一对一杀死（N1/N2/N3 矩阵），非冗余。
+- **其余偏差**：头注"非法记号→拒绝"实为截断（按代码改正）；`xd_fixtures::testdev::dev_from_bytes` 不存在（本地 dev_for）；测试 cut 修正 + `FF FF 00` 补例。
+- **spec 独立探针**：段长边界 2/65535 过、0/1 截；熵段四分支逐字节（含 8 枚 RST 全查、FF FF 四型）；回退不丢字节（**RecordingDevice 证明读 offset 永不 < start**）；20k FF 终止；60k 随机流零违例；消费契约三分语义完备（T6 不依赖 None 的 pos 终值）。
+- **qual 缺口四枚（全部补测落地）**：(a) cap 恰=完整长度仍 complete（`>` 语义，`>=` 变异专属杀手）；(b) **FF FF D9** 才是回退删除的可杀伤构型（FF FF 00 两写法等价——qual 证伪了我的原假设）→ 并入 test 2；(c) 段中头 cap+1 路径专属测试；(d) len=2 段并入 eoi 夹具。**fuzz 不固化（YAGNI，qual 论证：无索引/无 unwrap，随机流只走浅路径）**。
+- **记录不修**：TEM(0x01) 按带长度段处理（T.81 无长度字段；真实罕见，后果=降级截断）；头注"len=0"保守表述；`walk` 内 ~10 处 `Carved{...}` 重复（算法冻结不重构）。
 
 ---
 
