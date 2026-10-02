@@ -997,7 +997,32 @@ docker run --rm -v "$PWD/dist:/pkg:ro" ubuntu:24.04 bash -c '
 
 ---
 
-### Task 5: M1e 出口验收
+### Task 5: M1e 出口验收（2026-10-02 已执行 ✅）
+
+- [x] 本机：workspace **112 passed / 0 failed**、clippy `-D warnings`、fmt——全绿（T4 修复轮均复跑过）
+- [x] **CI（手动触发 `workflow_dispatch`）：run 36983796198 全 5 job success**——rust×3（含 1.99 clippy）、flutter、
+      package-deb；**ubuntu job 内 `e2e-loop.sh` 真跑出 `LOOP E2E OK`**（日志：`loop=/dev/loop0 (sysfs ro=1)`、
+      字节级用例 1 passed、daemon 横幅"枚举到 1 个物理磁盘"）——**出口硬门槛达成**
+- [x] `build-deb.sh` 产出 deb；`e2e-deb.sh` 容器装/卸 **DEB E2E OK**（本机 docker 实跑 + CI package-deb job）
+- [x] `device.list` 零 open（LD_PRELOAD 探针 0 条 /dev open；`/proc/<pid>/fd` 空闲仅 0/1/2）
+- [x] `apply-copyright.sh` 幂等（0 盖 / 43 跳过）；`.gitignore dist/` 已补（1522456）
+- [x] **未验证清单（交付标注）**：真机 `dpkg -i` 与 udev/polkit 生效、pkexec 认证路径、真 U 盘全链路、
+      USB 硬盘盒/易驱线（`SUBSYSTEMS=="usb"` 关键覆盖）、内置 eMMC 负例（`ATTRS{removable}` 收窄）、
+      `--device /dev/sdb` 型号名——均入 M1 出口真机手测
+
+**过程事件（CI 工具链漂移）**：首跑 run 36983142552 **rust×3 全红**——CI `stable` 已是 **1.99.0**，新 lint
+`clippy::chunks_exact_to_as_chunks` 命中 M1a 的 `xd-fs-fat/dirent.rs:143`（本地 1.97.1 无此 lint）。
+修复 `80b30c0`：`chunks_exact(32)` → `as_chunks::<32>()`（语义同、尾部残片同丢）。**本机 rustup 已升级至
+1.99.0 与 CI 对齐**，as_chunks 修正经 1.99 本机全 workspace clippy 验证。教训记 M1e 账：**CI stable 与本地
+工具链定期对齐**（本地升级即发现此类漂移；`rustup update` 中断会损坏工具链——更新须完整跑完）。
+
+**交付收尾**：merge `--no-ff` 至 main（同 M1a 先例）；rpm/热插拔（netlink）/AppImage 明确不做或归 M2。
+
+---
+
+### Task 5（原清单，保留存档）
+
+- [ ] `cargo test --workspace --locked` 全绿（xd-device +12、xd-core +1、xd-daemon +2）；clippy `-D warnings`、fmt 干净
 
 - [ ] `cargo test --workspace --locked` 全绿（xd-device +12、xd-core +1、xd-daemon +2）；clippy `-D warnings`、fmt 干净
 - [ ] `bash scripts/e2e-loop.sh`：本机 skip（无免密 sudo）；**CI（手动触发）必须 LOOP E2E OK**——未过不得关闭 M1e
