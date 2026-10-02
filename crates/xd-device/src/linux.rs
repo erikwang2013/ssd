@@ -106,6 +106,19 @@ impl Default for BlockEnumerator {
     }
 }
 
+/// 展示名合成：vendor + model（去重后不丢型号）；model 缺失回退内核名。
+/// parse（枚举）与 open（--device）共用，保证同一块盘的 device.list 行名一致。
+fn compose_disk_name(vendor: &str, model: &str, kernel_name: &str) -> String {
+    let (v, m) = (vendor.trim(), model.trim());
+    if m.is_empty() {
+        kernel_name.to_string()
+    } else if !v.is_empty() && !m.starts_with(v) {
+        format!("{v} {m}")
+    } else {
+        m.to_string()
+    }
+}
+
 /// 解析一个 sysfs 条目；size==0 或读不到 size → None（逐条目容错）。
 pub fn parse_disk_entry(class_dir: &Path, name: &str) -> Option<RawDisk> {
     let dir = class_dir.join(name);
@@ -117,19 +130,10 @@ pub fn parse_disk_entry(class_dir: &Path, name: &str) -> Option<RawDisk> {
     let removable = std::fs::read_to_string(dir.join("removable"))
         .map(|s| s.trim() == "1")
         .unwrap_or(false);
-    let model = std::fs::read_to_string(dir.join("device/model"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let vendor = std::fs::read_to_string(dir.join("device/vendor"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let name_field = if model.is_empty() {
-        name.to_string()
-    } else if !vendor.is_empty() && !model.starts_with(&vendor) {
-        format!("{vendor} {model}")
-    } else {
-        model
-    };
+    // sysfs 值带尾随 \n，去空白在 compose_disk_name 内统一处理
+    let model = std::fs::read_to_string(dir.join("device/model")).unwrap_or_default();
+    let vendor = std::fs::read_to_string(dir.join("device/vendor")).unwrap_or_default();
+    let name_field = compose_disk_name(&vendor, &model, name);
     let kind = if dir.join("partition").exists() {
         DeviceKind::Volume
     } else {
@@ -239,18 +243,19 @@ impl LinuxBlockDevice {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| canon.display().to_string());
         let size_bytes = block_size_bytes(std::os::unix::fs::MetadataExt::rdev(&md), sysfs_root)?;
-        // removable 只存在于 sysfs（块设备 stat 无此信息）；条目缺失 → false
-        let rm_path = sysfs_root
-            .join("block")
-            .join(&kernel_name)
-            .join("removable");
-        let removable = std::fs::read_to_string(&rm_path)
+        // removable 与展示名都只在 sysfs（块设备 stat 无此信息）；条目缺失 → false / 回退内核名
+        let dir = sysfs_root.join("block").join(&kernel_name);
+        let removable = std::fs::read_to_string(dir.join("removable"))
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
+        // 型号名与枚举项一致（去重后 --device 行不丢型号）；model/vendor 读失败静默回退 kernel_name
+        let model = std::fs::read_to_string(dir.join("device/model")).unwrap_or_default();
+        let vendor = std::fs::read_to_string(dir.join("device/vendor")).unwrap_or_default();
+        let name = compose_disk_name(&vendor, &model, &kernel_name);
         Ok(Self {
             info: DeviceInfo {
                 id: format!("unix:{}", canon.display()),
-                name: kernel_name,
+                name,
                 kind: DeviceKind::Physical,
                 size_bytes,
                 removable,
@@ -317,6 +322,21 @@ mod tests {
             }
         }
         root
+    }
+
+    #[test]
+    fn compose_disk_name_vendor_model() {
+        // vendor+model 拼接 / model 空回退内核名 / model 已含 vendor 前缀不重复拼 / 两侧空白（sysfs 尾随 \n）
+        assert_eq!(
+            compose_disk_name("ATA", "ST2000LM015-2E81", "sda"),
+            "ATA ST2000LM015-2E81"
+        );
+        assert_eq!(compose_disk_name("", "", "nvme0n1"), "nvme0n1");
+        assert_eq!(
+            compose_disk_name("ATA", "ATA ST2000LM015-2E81", "sda"),
+            "ATA ST2000LM015-2E81"
+        );
+        assert_eq!(compose_disk_name("  ", " X \n", "sda"), "X");
     }
 
     #[test]

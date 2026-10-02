@@ -7,10 +7,13 @@ use xd_device::BlockDevice; // size_bytes/read_at 是 trait 方法（qual-t1 预
 
 #[test]
 fn loop_device_reads_identical_bytes() {
-    let (Ok(dev_path), Ok(img_path)) = (std::env::var("XD_LOOP_DEV"), std::env::var("XD_LOOP_IMG"))
-    else {
-        eprintln!("skip: XD_LOOP_DEV/XD_LOOP_IMG 未设置（无特权环境）");
-        return;
+    let (dev_path, img_path) = match (std::env::var("XD_LOOP_DEV"), std::env::var("XD_LOOP_IMG")) {
+        (Ok(d), Ok(i)) => (d, i),
+        (Err(_), Err(_)) => {
+            eprintln!("skip: XD_LOOP_DEV/XD_LOOP_IMG 未设置（无特权环境）");
+            return;
+        }
+        _ => panic!("只设置了一个环境变量——XD_LOOP_DEV/XD_LOOP_IMG 必须成对（防脚本笔误假绿）"),
     };
     let dev = xd_device::linux::LinuxBlockDevice::open(Path::new(&dev_path)).unwrap();
     let img = std::fs::read(&img_path).unwrap();
@@ -26,9 +29,11 @@ fn loop_device_reads_identical_bytes() {
     // 抽样中段/尾部读（验证偏移寻址）
     let mid = img.len() / 2;
     let mut tail = [0u8; 64];
-    dev.read_at((img.len() - 64) as u64, &mut tail).unwrap();
+    let n = dev.read_at((img.len() - 64) as u64, &mut tail).unwrap();
+    assert_eq!(n, 64, "必须读满");
     assert_eq!(&tail[..], &img[img.len() - 64..]);
     let mut m = [0u8; 64];
-    dev.read_at(mid as u64, &mut m).unwrap();
+    let n = dev.read_at(mid as u64, &mut m).unwrap();
+    assert_eq!(n, 64, "必须读满");
     assert_eq!(&m[..], &img[mid..mid + 64]);
 }

@@ -24,11 +24,12 @@ impl CoreCtx {
         self
     }
 
-    /// 打开的设备优先；`list_only` 中与已打开 id 重复的条目丢弃——
-    /// 否则 `--device /dev/sda` 会与枚举出的同一块盘在 device.list 里出现两次（qual-t1 I1）。
+    /// 双向 first-wins 去重：打开项在前，同 id 只留首个（含打开项内部双开——
+    /// `--device /dev/sda --device /dev/disk/by-id/…` canonicalize 同 id）；
+    /// `list_only` 与已打开 id 重复的同样丢弃，否则同一块盘在 device.list 出现两次（qual-t1 I1 / qual-t2 Minor 5）。
     pub fn device_infos(&self) -> Vec<DeviceInfo> {
-        let mut v: Vec<DeviceInfo> = self.devices.iter().map(|d| d.info().clone()).collect();
-        for info in &self.list_only {
+        let mut v: Vec<DeviceInfo> = Vec::new();
+        for info in self.devices.iter().map(|d| d.info()).chain(&self.list_only) {
             if !v.iter().any(|e| e.id == info.id) {
                 v.push(info.clone());
             }
@@ -159,6 +160,34 @@ mod tests {
         let infos = ctx.device_infos();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].name, "opened");
+    }
+
+    #[test]
+    fn device_list_dedupes_double_open_same_id() {
+        // 同一物理盘经两条路径双开（/dev/sda 与 /dev/disk/by-id/… canonicalize 同 id）→ 只留首个
+        use xd_device::{BlockDevice, DeviceError, DeviceInfo, DeviceKind};
+        struct S(DeviceInfo);
+        impl BlockDevice for S {
+            fn info(&self) -> &DeviceInfo {
+                &self.0
+            }
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<usize, DeviceError> {
+                Ok(0)
+            }
+        }
+        let mk = |name: &str| -> Box<dyn BlockDevice> {
+            Box::new(S(DeviceInfo {
+                id: "unix:/dev/sda".into(),
+                name: name.into(),
+                kind: DeviceKind::Physical,
+                size_bytes: 42,
+                removable: false,
+                fs_guess: None,
+            }))
+        };
+        let infos = CoreCtx::new(vec![mk("first"), mk("second")]).device_infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name, "first");
     }
 
     #[test]

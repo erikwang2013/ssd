@@ -54,14 +54,16 @@ fn main() {
         }
     }
 
-    // 启动枚举（Linux，零 open()）：失败不阻塞 daemon 启动，仅少列物理盘。
+    // 启动枚举（Linux，零 open()）：失败不阻塞 daemon 启动，但留痕（UI 侧收集 stderr 可诊断）。
     #[cfg(target_os = "linux")]
-    let list_only: Vec<xd_device::DeviceInfo> = xd_device::linux::BlockEnumerator::new()
-        .list()
-        .unwrap_or_default()
-        .iter()
-        .map(|d| d.device_info())
-        .collect();
+    let list_only: Vec<xd_device::DeviceInfo> =
+        match xd_device::linux::BlockEnumerator::new().list() {
+            Ok(disks) => disks.iter().map(|d| d.device_info()).collect(),
+            Err(e) => {
+                eprintln!("warn: 物理磁盘枚举失败（listing 可能不完整）: {e}");
+                Vec::new()
+            }
+        };
     #[cfg(not(target_os = "linux"))]
     let list_only: Vec<xd_device::DeviceInfo> = Vec::new();
 
