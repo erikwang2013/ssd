@@ -251,6 +251,11 @@ fn grade_deleted(
     let need = e.data_length.div_ceil(boot.cluster_bytes());
     let all_free = |c: u32| matches!(bitmap.is_free(c), Ok(true));
     if !e.contiguous {
+        let max_cluster = boot.cluster_count as u64 + 1;
+        let fc = e.first_cluster as u64;
+        if !(2..=max_cluster).contains(&fc) || need > max_cluster - fc + 1 {
+            return RecoverQuality::MaybeDamaged; // 链越过可达簇数 = 链在说谎
+        }
         // (a)：链只走不猜——链不足 need（含解析失败）→ 交付必短，证据不足
         let Ok(chain) = fat.chain(e.first_cluster) else {
             return RecoverQuality::MaybeDamaged;
@@ -823,6 +828,32 @@ mod tests {
             e.quality,
             RecoverQuality::MaybeDamaged,
             "链不足 need 不得按连续评级"
+        );
+    }
+
+    #[test]
+    fn deleted_loop_chain_beyond_reachable_degrades() {
+        // qual-t4 发现 B：链在说谎（自环 + DL 污染）→ 可达界卫必须降级（旧 resolve_clusters 界卫对等保留）
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[253], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+        patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3 > reachable=1
+        patched[24 * 512 + 253 * 4..24 * 512 + 253 * 4 + 4].copy_from_slice(&253u32.to_le_bytes()); // FAT[253] 自环
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "链越过可达簇数=链在说谎"
         );
     }
 

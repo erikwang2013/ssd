@@ -52,7 +52,7 @@ pub(crate) enum Resolved {
     },
 }
 
-/// 簇定位（`read_subdir_bytes` / `grade_deleted` / `read_file` 三处共用）。
+/// 簇定位（`read_subdir_bytes` 与 `read_file` 两处共用；`grade_deleted` 自 (a) 起不再使用）。
 /// contiguous ⇒ 连续（NoFatChain 规范保证）；否则链覆盖 need 才用链（只取 need 前缀），短/坏链退连续。
 /// None ⇔ 起点非法或 need 超出可达簇数 → 调用方各自降级。只定位、不物化连续段（qual-t5 I1）。
 pub(crate) fn resolve_clusters(
@@ -110,6 +110,13 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
     // 即止 → 诚实短前缀），绝不回退连续猜读——旧式"链被证伪后退连续"会交付错位数据而无从发现。
     // contiguous=true 的删除项是 NoFatChain 规范保证，不走此分支。
     if entry.deleted && !entry.contiguous {
+        let max_cluster = boot.cluster_count as u64 + 1;
+        let fc = entry.first_cluster as u64;
+        // (a) 可达界卫（保留旧 resolve_clusters 的对等界卫）：need 不得超过 fc→堆尾的物理簇数——
+        // 否则链在说谎（自环/回折 + DL 污染可造出 len 充足但物理不可能的链）→ 空交付
+        if !(2..=max_cluster).contains(&fc) || need > max_cluster - fc + 1 {
+            return Ok(Vec::new());
+        }
         let chain = fat.chain(entry.first_cluster).unwrap_or_default();
         let n = (need as usize).min(chain.len());
         read_prefix(
@@ -379,8 +386,9 @@ mod tests {
 
     #[test]
     fn deleted_occupied_chain_cluster_stops_even_if_contiguous_free() {
-        // (a) 探针 C：链 [6,9,7]，簇 9 被 NEW.BIN 复用（位图置位、FAT[9]=EOC）→ 链从 6 走到 9
-        // 即止、且簇 9 被占用 → 只交付簇 6（4096B）；连续区间 [6,7,8] 全空闲也不得猜读。
+        // (a) 探针 C：链 [6,9,7]，簇 9 被 NEW.BIN 复用（位图置位；FAT[9] 保留旧值 7——NEW.BIN
+        // 连续不写 FAT）→ 链从 6 走到 9 即止、且簇 9 被占用 → 只交付簇 6（4096B）；
+        // 连续区间 [6,7,8] 全空闲也不得猜读。
         let data: Vec<u8> = (0..9000u32).map(|i| (i % 211) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
             .add_file_in_clusters("/", "OLD.BIN", &data, &[6, 9, 7], false)
@@ -393,9 +401,38 @@ mod tests {
             .into_iter()
             .find(|e| e.name == "OLD.BIN")
             .unwrap();
-        assert_eq!(e.quality, RecoverQuality::MaybeDamaged, "链 [6,9] < need=3");
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "链 [6,9,7] 中被占簇 9 截断（NEW.BIN 连续不写 FAT，FAT[9] 保留旧值）"
+        );
         let bytes = read_file(&dev, &e).unwrap();
         assert_eq!(bytes, data[..4096], "被占用簇即止；连续区间空闲≠可猜");
+    }
+
+    #[test]
+    fn deleted_loop_chain_beyond_reachable_delivers_nothing() {
+        // 同 scan 侧构造：无界卫时交付 3×同一簇的重复字节（伪造序）——界卫必须空交付
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[253], false)
+            .delete("/", "OLD.BIN")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes());
+        patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes());
+        patched[24 * 512 + 253 * 4..24 * 512 + 253 * 4 + 4].copy_from_slice(&253u32.to_le_bytes());
+        refix_deleted_checksum(&mut patched, SET, 3);
+        let (_f, dev) = dev_for(&patched);
+        let e = scan(&dev)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OLD.BIN")
+            .unwrap();
+        assert!(
+            read_file(&dev, &e).unwrap().is_empty(),
+            "物理不可能的链 → 确定性空（不得重复交付同一簇）"
+        );
     }
 
     #[test]
