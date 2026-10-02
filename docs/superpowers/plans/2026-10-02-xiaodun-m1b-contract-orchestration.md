@@ -2124,6 +2124,8 @@ git commit -m "feat(core): scan_task 编排（状态机/暂停取消/panic 隔�
 - Modify: `crates/xd-daemon/tests/ipc.rs`（+`image:` 懒开拒绝断言）
 - （协议号断言已在 T5 Step 7 收尾）
 
+> **执行后同步（T6）**：计划代码块里 `Arc<Mutex<StdoutLock<'static>>>` **在 rustc 1.99 不可编译**（`StdoutLock` 因内含 `ReentrantLockGuard` 为 `!Send`，spec 已独立复现 E0277）——实现为 `Arc<Mutex<std::io::Stdout>>`（串行化+每行 flush 语义不变）；计划其余段落照旧。另 ipc.rs 增 5 行 `XDG_STATE_HOME` 隔离（防 daemon 测试在真实 HOME 建库）。
+
 - [ ] **Step 1: main.rs 改造（关键段落全代码）**
 
 设备容器与 CLI 增加 `--db`：
@@ -2318,6 +2320,15 @@ git commit -m "refactor(fs): fat read_file 拆分/两引擎测试内移(#\[path\
 - Modify: `crates/xd-daemon/Cargo.toml`（dev-deps +`xd-fixtures`、`tempfile`；serde_json 已有）
 - Create: `crates/xd-daemon/tests/scan_ipc.rs`（全代码见下）
 - Modify: `scripts/e2e-loop.sh`（真实环回设备补 scan 断言块）
+
+> **T6 评审移交增补（spec-m1b-t6 + qual-m1b-t6 汇总，本任务必须覆盖）**：
+> 1. **`XDG_STATE_HOME`/`--db` 注入**：scan_ipc.rs 的每个 daemon spawn 必须带 `--db <tempdir>`（或注入 XDG）——否则测试在真实 HOME 落库（T6 的 ipc.rs 已踩过此坑）。
+> 2. **stderr 静默断言**：cancel 场景的 daemon 以 `stderr(Stdio::piped())` 捕获——断言无 `"panicked"` 字样（钉死 ScanCanceled hook 静默）；配套断言 cancel 后 `scan.finished state=canceled`（证明取消真发生而非没跑）。
+> 3. **`--db` 降级存活**：daemon 以 `--db <指向目录>` 启动 → ping 正常 + stderr 含 `任务库打开失败` + 进程不退出。
+> 4. **中断→failed 恢复**：kill daemon（SIGKILL）于扫描中 → 同 `--db` 重启 → `scan.status` 为 **failed**（recover_after_restart 护栏的 daemon 级钉死）；paused 任务则保留。
+> 5. **EACCES 端到端**：`chmod 000` 的**常规文件** + `unix:` id → `-32001 Device permission denied`（CI 非 root 可测；T6 spec 已手工验过一次）。
+> 6. `scan.progress` 发射分支（250ms 节流）目前无测试断言——大介质难入 CI，**裁定：以 `elapsedMs`/`readBytes` 语义断言替代**，发射分支不做 CI 钉死（真机手测清单记一笔即可）。
+> 7. **XDG 优先级护栏（qual-t6 变异 9 无归属）**：起 daemon（不传 `--db`）**同时注入 `XDG_STATE_HOME` 与 `HOME`** → 断言库落在 XDG 路径而非 HOME（5 行，用既有 spawn harness）。不加则"XDG 优先"永无 CI 护栏。
 
 - [ ] **Step 1: scan_ipc.rs（全代码；首行水印头）**
 
@@ -2648,6 +2659,15 @@ bash scripts/e2e.sh
 **qual 变异表（13 条）**：8 KILL（cancel 检查/paused 驻停/idx 偏移/错误码互换/limit 界/spawn 登记/downcast/restart 护栏）；2 真缺口当场补测并定点自证（`mode` 校验、"已打开优先"）；等价 1（null params）；无判别 2（节流=性能非正确性；worker 终局条件写=竞态护栏类，与窄窗同族可接受）。**flake 压力 0/40**（串行 20 + 并发 20 进程次）。
 
 **前向注记**：`tasks` map 持有 `Arc<dyn BlockDevice>` 至 daemon 退出（M1c 续跑复用；USB 安全弹出前的句柄策略归 M1d/M2）；`mode:"deep"` 现拒绝、M1c 转正时其断言改合法路径；`elapsedMs`=墙钟（README 已改）。
+
+### T6（daemon 并发接线）—— impl-m1b-t6，提交 `af472ff`。DONE → spec **PASS** → qual **APPROVED**（T6 关闭，283/0）
+
+- **计划-现实修正（1 项，最关键）**：`Arc<Mutex<StdoutLock<'static>>>` 在 rustc 1.99 **不可编译**（`StdoutLock` 含 `ReentrantLockGuard` ⇒ `!Send`；spec 独立复现 E0277，正对照 `Mutex<Stdout>` 通过）→ 实现为 `Arc<Mutex<Stdout>>`（同一把锁串行化整行 + flush）。**计划文本已改**（本任务头注）。
+- **必要性偏差（1 项）**：ipc.rs 注入 `XDG_STATE_HOME=<per-test tempdir>`——否则 daemon 测试在真实 `~/.local/state/xiaodun/tasks.db` 建库（隔离 HOME 复跑验证：目录全空；真实 HOME 零污染）。
+- **spec 证据（节选）**：hook 装点早于一切 worker spawn（唯一 spawn 点只经 serve 到达）；50 并发扫描 + 651 响应 stdout 压测 **751 行逐行 JSON 零坏行**；`image:` 拒绝以 **FIFO + /proc/pid/fd 双证零触碰**；**真 EACCES 端到端**（chmod 000 + unix: → -32001）当场验证；--db 四态 + 旧库续用（scanning→failed、paused 保留）。
+- **qual 变异表（9 条）**：套件 10 轮全绿；**7 条探针杀**（hook 反转/`--db` exit/image 放行/recover 删除/EACCES 降级/HOME 优先反转/…）；等价 1（hook 装载点前移——无 worker 能先于 serve）；护栏 1（XDG 注入，套件不可红，如实记录）。6 条套件零覆盖 → 5 条已入 T8 增补清单、**XDG 优先级入 T8 item 7**。
+- **性能账（域外观察，转 M1c）**：`insert_entries` 每条目一事务 + `synchronous=FULL` ≈ **6.9ms/条目 fsync**（513 条目 ext4 3539ms vs tmpfs 59ms）；M1c 大扫描前应评估批量提交或 WAL+synchronous=NORMAL（与"崩溃保部分结果"语义权衡）——已写入 M1c 计划。
+- **接受性 nit（记录不修）**：`image:`/未知 scheme 拒绝分支无 stderr 留痕（另一分支有）；「真 panic 仍打印」在 daemon 无可达 panic 路径，T8 只钉可观测半边（cancel 静默）。
 
 ---
 

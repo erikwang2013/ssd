@@ -1208,6 +1208,8 @@ git commit -m "feat(carving): 顺序块扫描器 + 深扫编排（mode:deep/-320
 
 ### Task 7: 深扫检查点与断点续跑（设计 §4.4 约束 3 的真实兑现）
 
+> **前置性能账（qual-m1b-t6 移交）**：`insert_entries` 现为**每条目独立事务 + `synchronous=FULL`** ≈ **6.9ms/条目 fsync**（513 条目 ext4 3.5s vs tmpfs 59ms）。深扫的条目频次与快扫同量级、且 carving 的 I/O 更重——**本任务须评估并落地其一**：(a) worker 侧小批量缓冲提交（如每 64 条或每 250ms 事务批量，崩溃语义=丢末批≤64 条 vs "崩溃保部分结果"的诚实边界，文档写明）；(b) WAL + `synchronous=NORMAL`（单进程 daemon 崩溃安全与性能权衡）。选型要有量化探针（ext4 实测前后条目/秒）与语义声明，写进本任务提交信息。
+
 **Files:**
 - Modify: `crates/xd-carving/src/{carver.rs（resume 起点）, lib.rs}`
 - Modify: `crates/xd-core/src/{store.rs（schema v4: carved_offset）, scan_task.rs（深扫检查点写/续跑）, handlers.rs（无需改——resume 语义内部按 mode 分派）}`
