@@ -2,7 +2,7 @@
   <img src="docs/assets/xiaodun-mascot.svg" width="180" alt="小盾吉祥物">
 </p>
 
-<h1 align="center">小盾 (Xiaodun)</h1>
+<h1 align="center">小盾 (ssd)</h1>
 
 <p align="center">跨平台数据恢复工具 · Flutter 界面 + Rust 引擎</p>
 
@@ -91,7 +91,7 @@
 ## 项目结构
 
 ```
-xiaodun/
+ssd/
 ├── crates/                     # Rust workspace
 │   ├── xd-core/                #   RPC 信封 + 处理器（ping / device.list）
 │   ├── xd-device/              #   只读块设备抽象 + 镜像后端（BlockDevice / ImageFileDevice）
