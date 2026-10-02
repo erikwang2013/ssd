@@ -49,7 +49,7 @@ pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<ExfatEntry>, ExfatError> {
     let mut out = Vec::new();
     let root_data = read_root_dir(dev, &boot, &fat)?;
     let root = dirent::parse_directory_bytes(&root_data, boot.cluster_bytes() as usize);
-    let bitmap = load_bitmap(dev, &boot, &fat);
+    let bitmap = load_bitmap_from_specials(dev, &boot, &fat, &root.specials); // 复用根快照（qual-t5 M1）
     scan_parsed(
         dev,
         &boot,
@@ -63,12 +63,24 @@ pub fn scan(dev: &dyn BlockDevice) -> Result<Vec<ExfatEntry>, ExfatError> {
     Ok(out)
 }
 
-/// 定位并加载分配位图（scan 与 read_file 共用）。任何失败 → None（分级层即降级，绝不回退 FAT）。
+/// 由已解析的 specials 加载位图（scan 复用根快照；qual-t5 M1）。
+/// 任何失败 → None（分级层即降级，绝不回退 FAT）。
+fn load_bitmap_from_specials(
+    dev: &dyn BlockDevice,
+    boot: &ExfatBoot,
+    fat: &Fat32,
+    specials: &dirent::Specials,
+) -> Option<Bitmap> {
+    let (first, len) = pick_bitmap(&specials.bitmaps, boot.active_fat_index())?;
+    Bitmap::load(dev, boot, fat, first, len).ok()
+}
+
+/// 自读根目录再转发（T6 `read_file` 用——它没有现成 specials）。
+#[allow(dead_code)]
 fn load_bitmap(dev: &dyn BlockDevice, boot: &ExfatBoot, fat: &Fat32) -> Option<Bitmap> {
     let root_data = read_root_dir(dev, boot, fat).ok()?;
     let root = dirent::parse_directory_bytes(&root_data, boot.cluster_bytes() as usize);
-    let (first, len) = pick_bitmap(&root.specials.bitmaps, boot.active_fat_index())?;
-    Bitmap::load(dev, boot, fat, first, len).ok()
+    load_bitmap_from_specials(dev, boot, fat, &root.specials)
 }
 
 /// 读根目录全部字节（根恒 FAT 链）。链失败或首读 0 字节 → Err（与空盘 Ok 区分，M1a I2 对等）。
@@ -119,7 +131,7 @@ fn scan_parsed(
     out: &mut Vec<ExfatEntry>,
 ) -> Result<(), ExfatError> {
     if depth > MAX_DEPTH || out.len() > MAX_ENTRIES {
-        return Ok(());
+        return Ok(()); // out.len() > 臂不可达（循环内 `>=` 已封顶；M1a 注 7 同款）
     }
     for e in entries {
         if out.len() >= MAX_ENTRIES {
@@ -130,6 +142,8 @@ fn scan_parsed(
             .rsplit_once('.')
             .map(|(_, x)| x.to_ascii_lowercase())
             .unwrap_or_default();
+        // live 目录不看 checksum_ok：子项枚举成功已独立验证流扩展；时间戳/名字损坏
+        // 不影响可恢复性（qual-t5 M3 裁定）
         let quality = if e.attr_dir {
             RecoverQuality::Complete
         } else if e.deleted {
@@ -252,32 +266,34 @@ fn grade_deleted(
         return RecoverQuality::Complete;
     }
     if e.first_cluster < 2 {
-        return RecoverQuality::MaybeDamaged;
+        return RecoverQuality::MaybeDamaged; // 不可达（T4 保证 dl>0 ⇒ fc≥2），防御保留
     }
     let cb = boot.cluster_bytes();
     let need = e.data_length.div_ceil(cb);
     let max_cluster = boot.cluster_count as u64 + 1;
-    let mut clusters: Vec<u32> = Vec::new();
+    if e.first_cluster as u64 > max_cluster {
+        return RecoverQuality::MaybeDamaged; // 起点越界（T4 不保证 fc ≤ max）：兼防 reachable 下溢
+    }
+    let reachable = max_cluster - e.first_cluster as u64 + 1;
+    if need > reachable {
+        return RecoverQuality::MaybeDamaged; // I1 界卫：超出可达簇数，物理不可能 Complete
+    }
+    let all_free = |c: u32| matches!(bitmap.is_free(c), Ok(true));
     if !e.contiguous
         && let Ok(chain) = fat.chain(e.first_cluster)
         && chain.len() as u64 >= need
     {
-        clusters = chain[..need as usize].to_vec();
+        return if chain[..need as usize].iter().all(|c| all_free(*c)) {
+            RecoverQuality::Complete
+        } else {
+            RecoverQuality::MaybeDamaged
+        };
     }
-    if clusters.is_empty() {
-        let mut c = e.first_cluster as u64;
-        while (clusters.len() as u64) < need && c <= max_cluster {
-            clusters.push(c as u32);
-            c += 1;
-        }
-    }
-    if (clusters.len() as u64) < need {
-        return RecoverQuality::MaybeDamaged; // 越界截断：表项不可信
-    }
-    for c in clusters {
-        match bitmap.is_free(c) {
-            Ok(true) => {}
-            _ => return RecoverQuality::MaybeDamaged, // 已占用/不可判：宁可漏报
+    // 连续回退：流式判定，不物化（qual-t5 I1：need 可被污染放大，Vec 会爆内存）；
+    // 区间 first_cluster..first_cluster+need 的界由上方两道界卫保证
+    for i in 0..need {
+        if !all_free(e.first_cluster + i as u32) {
+            return RecoverQuality::MaybeDamaged;
         }
     }
     RecoverQuality::Complete
@@ -290,6 +306,67 @@ mod tests {
 
     const ROOT_B: usize = 32 * 512 + 3 * 4096;
     const SET: usize = ROOT_B + 96;
+
+    fn dummy_parsed() -> ParsedEntry {
+        ParsedEntry {
+            name: "X.TXT".into(),
+            attr_dir: false,
+            first_cluster: 0,
+            valid_data_length: 0,
+            data_length: 0,
+            contiguous: false,
+            deleted: false,
+            checksum_ok: true,
+            name_verified: true,
+        }
+    }
+
+    fn dummy_entry() -> ExfatEntry {
+        ExfatEntry {
+            name: String::new(),
+            path: String::new(),
+            size_bytes: 0,
+            data_length: 0,
+            first_cluster: 0,
+            deleted: false,
+            is_dir: false,
+            contiguous: false,
+            quality: RecoverQuality::Complete,
+            ext: String::new(),
+        }
+    }
+
+    /// 独立重算 SetChecksum（16 位循环右移累加、跳下标 2/3）：
+    /// 构造"污染 DataLength 但还原校验仍自洽"的删除项（否则 T4 会直接丢弃该项）。
+    fn set_checksum(set: &[u8]) -> u16 {
+        let mut sum = 0u16;
+        for (i, b) in set.iter().enumerate() {
+            if i == 2 || i == 3 {
+                continue;
+            }
+            sum = (if sum & 1 != 0 { 0x8000u16 } else { 0u16 })
+                .wrapping_add(sum >> 1)
+                .wrapping_add(*b as u16);
+        }
+        sum
+    }
+
+    /// 记账设备：记录每次 `read_at` 的起点偏移（qual-t5 M1 根单读证明）。
+    /// `Mutex`（非 `RefCell`）——`BlockDevice: Send + Sync` 要求。
+    struct CountingDev<'a> {
+        inner: &'a dyn BlockDevice,
+        reads: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl BlockDevice for CountingDev<'_> {
+        fn info(&self) -> &xd_device::DeviceInfo {
+            self.inner.info()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, xd_device::DeviceError> {
+            self.reads.lock().unwrap().push(offset);
+            self.inner.read_at(offset, buf)
+        }
+    }
 
     #[test]
     fn scans_live_and_deleted_with_full_names() {
@@ -504,5 +581,233 @@ mod tests {
         assert_eq!(files.len(), 45, "多簇根不得丢条目：{files:?}");
         assert!(files.contains(&"F0041.TXT"), "第二根簇的条目必须在列");
         assert!(files.contains(&"F0044.TXT"));
+    }
+
+    #[test]
+    fn live_dir_with_broken_checksum_stays_complete() {
+        // qual-t5 M3 裁定：live 目录不看 checksum_ok——结构完好 + 子项枚举成功 → Complete
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_subdir("/", "DCIM")
+            .add_file("/DCIM", "IMG.JPG", &[3u8; 100])
+            .build();
+        let mut patched = image.clone();
+        patched[SET + 8] ^= 0xFF; // DCIM 主项时间戳字节：结构完好
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let d = entries.iter().find(|e| e.name == "DCIM").unwrap();
+        assert_eq!(d.quality, RecoverQuality::Complete);
+        assert!(entries.iter().any(|e| e.name == "IMG.JPG"), "子项照常枚举");
+    }
+
+    #[test]
+    fn root_clusters_read_once() {
+        // qual-t5 M1：根只读一遍。45 文件撑到 2 簇根，两簇各须恰好被读 1 次
+        // （修复前 load_bitmap 会自读根一遍 → 每簇 2 次）。
+        let mut b = xd_fixtures::ExfatImageBuilder::new();
+        for i in 0..45u32 {
+            b.add_file("/", &format!("F{i:04}.TXT"), b"x");
+        }
+        let image = b.build();
+        let (_f, dev) = dev_for(&image);
+        let boot = boot::parse(&dev).unwrap();
+        let fat = Fat32::new(&dev, &boot);
+        let chain = fat.chain(boot.root_cluster).unwrap();
+        assert!(chain.len() >= 2, "夹具须多簇根（45 文件）");
+        let cd = CountingDev {
+            inner: &dev,
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let entries = scan(&cd).unwrap();
+        assert_eq!(entries.len(), 45);
+        let reads = cd.reads.lock().unwrap();
+        for c in &chain {
+            let start = boot.cluster_to_byte(*c);
+            let n = reads.iter().filter(|o| **o == start).count();
+            assert_eq!(n, 1, "根簇 {c} 应恰好读 1 次，实际 {n}");
+        }
+    }
+
+    #[test]
+    fn max_depth_semantics_direct() {
+        // MAX_DEPTH 边界：depth == MAX_DEPTH 处理、depth == MAX_DEPTH + 1 截断
+        let image = xd_fixtures::ExfatImageBuilder::new().build();
+        let (_f, dev) = dev_for(&image);
+        let boot = boot::parse(&dev).unwrap();
+        let fat = Fat32::new(&dev, &boot);
+        let e = dummy_parsed();
+        let mut at_limit = Vec::new();
+        scan_parsed(
+            &dev,
+            &boot,
+            &fat,
+            None,
+            std::slice::from_ref(&e),
+            "/",
+            MAX_DEPTH,
+            &mut at_limit,
+        )
+        .unwrap();
+        assert_eq!(at_limit.len(), 1, "depth == MAX_DEPTH 须处理");
+        let mut over = Vec::new();
+        scan_parsed(
+            &dev,
+            &boot,
+            &fat,
+            None,
+            std::slice::from_ref(&e),
+            "/",
+            MAX_DEPTH + 1,
+            &mut over,
+        )
+        .unwrap();
+        assert!(over.is_empty(), "depth > MAX_DEPTH 须截断");
+    }
+
+    #[test]
+    fn max_entries_semantics_direct() {
+        // 满额语义：out 已达 MAX_ENTRIES → 立即 Ok（非 Err）且不增
+        let image = xd_fixtures::ExfatImageBuilder::new().build();
+        let (_f, dev) = dev_for(&image);
+        let boot = boot::parse(&dev).unwrap();
+        let fat = Fat32::new(&dev, &boot);
+        let e = dummy_parsed();
+        let mut out: Vec<ExfatEntry> = (0..MAX_ENTRIES).map(|_| dummy_entry()).collect();
+        scan_parsed(
+            &dev,
+            &boot,
+            &fat,
+            None,
+            std::slice::from_ref(&e),
+            "/",
+            0,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), MAX_ENTRIES, "满额即 Ok 且不增");
+    }
+
+    #[test]
+    fn deep_nesting_40_levels_e2e() {
+        // 40 层子目录链：列出 depth 0..=32 的 33 个目录；D33 与 D32 内的文件不列出；无栈溢出
+        let mut b = xd_fixtures::ExfatImageBuilder::new();
+        let mut path = String::new();
+        let mut d32 = String::new();
+        for i in 0..40u32 {
+            let name = format!("D{i:02}");
+            let parent = if path.is_empty() {
+                "/".to_string()
+            } else {
+                path.clone()
+            };
+            b.add_subdir(&parent, &name);
+            path = format!("{path}/{name}");
+            if i == 32 {
+                d32 = path.clone();
+            }
+        }
+        b.add_file(&d32, "DEEP.TXT", b"x");
+        let image = b.build();
+        let (_f, dev) = dev_for(&image);
+        let entries = scan(&dev).unwrap();
+        let dirs: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(dirs.len(), 33, "depth 0..=32 共 33 个目录：{dirs:?}");
+        assert!(dirs.contains(&"D00") && dirs.contains(&"D32"));
+        assert!(!dirs.contains(&"D33"), "depth 33 起须截断");
+        assert!(
+            !entries.iter().any(|e| e.name == "DEEP.TXT"),
+            "D32 内文件属 depth 33 枚举，不得列出"
+        );
+    }
+
+    #[test]
+    fn bitmap_datalength_bounds_degrade() {
+        // 0x81 位图 DataLength 越界（上界 64MiB+1 / 下界 31 < ceil(252/8)）→ 位图不可读
+        // → 删除项 MaybeDamaged，scan 仍 Ok
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "PHOTO.JPG", &[1u8; 9000])
+            .delete("/", "PHOTO.JPG")
+            .build();
+        for dl in [MAX_DIR_BYTES + 1, 31u64] {
+            let mut patched = image.clone();
+            patched[ROOT_B + 32 + 24..ROOT_B + 32 + 32].copy_from_slice(&dl.to_le_bytes());
+            let (_f, dev) = dev_for(&patched);
+            let entries = scan(&dev).unwrap();
+            let e = entries.iter().find(|e| e.deleted).unwrap();
+            assert_eq!(e.quality, RecoverQuality::MaybeDamaged, "bitmap dl={dl}");
+        }
+    }
+
+    #[test]
+    fn read_subdir_bytes_gates_direct() {
+        // dl==0 与 dl>64MiB 两道闸：不得进入任何读路径
+        let image = xd_fixtures::ExfatImageBuilder::new().build();
+        let (_f, dev) = dev_for(&image);
+        let boot = boot::parse(&dev).unwrap();
+        let fat = Fat32::new(&dev, &boot);
+        let mk = |dl: u64| ParsedEntry {
+            attr_dir: true,
+            first_cluster: 6,
+            data_length: dl,
+            contiguous: true,
+            ..dummy_parsed()
+        };
+        assert!(matches!(
+            read_subdir_bytes(&dev, &boot, &fat, &mk(0)),
+            Err(ExfatError::InvalidBoot(_))
+        ));
+        assert!(matches!(
+            read_subdir_bytes(&dev, &boot, &fat, &mk(MAX_DIR_BYTES + 1)),
+            Err(ExfatError::InvalidBoot(_))
+        ));
+    }
+
+    #[test]
+    fn deleted_polluted_datalength_degrades() {
+        // qual-t5 I1 构型：删除项 DataLength 污染成巨值（重算还原校验以过 T4 门槛）
+        // → 界卫即刻降级 MaybeDamaged，且不物化簇表
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "PHOTO.JPG", &[1u8; 9000])
+            .delete("/", "PHOTO.JPG")
+            .build();
+        let mut patched = image.clone();
+        let stream = SET + 32;
+        patched[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes()); // DataLength
+        let mut restored = patched[SET..SET + 96].to_vec();
+        for k in 0..3 {
+            restored[k * 32] |= 0x80; // 还原类型位（删除只清 bit7）
+        }
+        let cs = set_checksum(&restored);
+        patched[SET + 2..SET + 4].copy_from_slice(&cs.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "PHOTO.JPG").unwrap();
+        assert!(e.deleted && e.size_bytes == 9000);
+        assert_eq!(
+            e.quality,
+            RecoverQuality::MaybeDamaged,
+            "need ≫ reachable：界卫即刻降级"
+        );
+
+        // 同构：起点污染（T4 不设 fc 上界）→ 起点界卫兜住，debug 档也不得下溢 panic
+        let mut patched2 = image.clone();
+        patched2[stream + 20..stream + 24].copy_from_slice(&9999u32.to_le_bytes()); // FirstCluster
+        let mut restored2 = patched2[SET..SET + 96].to_vec();
+        for k in 0..3 {
+            restored2[k * 32] |= 0x80;
+        }
+        let cs2 = set_checksum(&restored2);
+        patched2[SET + 2..SET + 4].copy_from_slice(&cs2.to_le_bytes());
+        let (_f2, dev2) = dev_for(&patched2);
+        let entries2 = scan(&dev2).unwrap();
+        let e2 = entries2.iter().find(|e| e.name == "PHOTO.JPG").unwrap();
+        assert_eq!(
+            e2.quality,
+            RecoverQuality::MaybeDamaged,
+            "fc 越界：起点界卫兜住"
+        );
     }
 }
