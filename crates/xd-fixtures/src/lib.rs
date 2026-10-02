@@ -385,11 +385,14 @@ fn set_fat12(image: &mut [u8], fat_start: u32, cluster: u32, value: u32) {
 
 /// "HELLO.TXT" → b"HELLO   TXT"（大写、空格填充、无扩展名时全空格）
 pub fn encode_sfn(name: &str) -> [u8; 11] {
-    debug_assert!(name.is_ascii(), "encode_sfn 仅支持 ASCII 8.3 名: {name}");
     let (base, ext) = match name.rsplit_once('.') {
         Some((b, e)) => (b, e),
         None => (name, ""),
     };
+    debug_assert!(
+        name.is_ascii() && base.len() <= 8 && ext.len() <= 3,
+        "encode_sfn 仅支持 ASCII ≤8.3 名: {name}"
+    );
     let mut out = [b' '; 11];
     for (i, c) in base.bytes().take(8).enumerate() {
         out[i] = c.to_ascii_uppercase();
@@ -594,5 +597,35 @@ mod tests {
         assert_eq!(&image[base + 64..base + 75], b"IN      TXT");
         assert_eq!(u16::from_le_bytes([image[base + 90], image[base + 91]]), 3);
         assert_eq!(&image[(50 + (3 - 2)) * 512..][..5], b"inner");
+    }
+
+    #[test]
+    #[should_panic(expected = "根目录单簇容量不足")]
+    fn fat32_root_capacity_fails_fast() {
+        let mut b = FatImageBuilder::fat32();
+        for i in 0..17 {
+            b.add_file("/", &format!("F{i:02}.TXT"), b"x");
+        }
+        b.build();
+    }
+
+    #[test]
+    #[should_panic(expected = "成员超出单簇容量")]
+    fn subdir_capacity_fails_fast() {
+        let mut b = FatImageBuilder::fat16();
+        b.add_subdir("/", "DIR");
+        for i in 0..15 {
+            b.add_file("/DIR", &format!("M{i:02}.TXT"), b"x");
+        }
+        b.build();
+    }
+
+    #[test]
+    #[should_panic(expected = "簇池不足")]
+    fn pool_exhaustion_fails_fast() {
+        let data = vec![0u8; 1007 * 512]; // FAT12 池 1006 簇，差一簇
+        FatImageBuilder::fat12()
+            .add_file("/", "BIG.BIN", &data)
+            .build();
     }
 }
