@@ -200,7 +200,7 @@ fn grade_deleted(
 }
 
 /// 读取文件内容（恰好 size 字节；设备边界/坏读早停 → 返回短于 size 的前缀，不伪造）。
-/// 策略：存活文件只信 FAT 链（链短/坏/环 → 诚实短前缀，绝不连续猜测）；删除项
+/// 策略：存活文件只信 FAT 链（链短/坏 → 诚实短前缀；环 → 按链读到 need，内容可能自重复）；删除项
 /// （M1a 语义：删除即清 FAT，链属他人）按连续簇回退。
 /// 注意：返回值只有字节——"是否走了连续假设"由 `entry.deleted` 推断（M1d UI 文案据此）。
 pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, FatError> {
@@ -222,8 +222,8 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
         }
         v
     } else {
-        // 只信链：坏 FAT 上连续猜读会全尺寸交付他人数据且质量恒 Complete，调用方无从发现
-        // ——宁可漏报不可错报（qual-t7 I1）。
+        // 只信链：坏 FAT 上连续猜读会交付他人数据且质量恒 Complete，调用方无从发现——宁可漏报不可错报；
+        // 环链只按链读不猜测、不挂起（qual-t7 复审）。
         let fat = Fat::new(dev, &bpb);
         let chain = fat.chain(entry.first_cluster).unwrap_or_default();
         chain[..need.min(chain.len())].to_vec()
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn read_file_terminates_on_chain_loop() {
-        // 活文件自环链：必须终止且不超读（chain() 自身有 len 上界）
+        // 活文件自环链：不挂起、不越读；按链读到 need（内容为簇 2 自重复——FAT 所指如此，非他人数据）
         let data: Vec<u8> = (0..1200u32).map(|i| (i % 241) as u8).collect();
         let image = xd_fixtures::FatImageBuilder::fat16()
             .add_file("/", "LOOP.BIN", &data)
@@ -615,7 +615,9 @@ mod tests {
         let entries = scan(&dev).unwrap();
         let e = entries.iter().find(|e| e.name == "LOOP.BIN").unwrap();
         let bytes = read_file(&dev, e).unwrap();
-        assert!(bytes.len() <= 1200);
+        assert_eq!(bytes.len(), 1200); // 环链长 count+2 ≥ need → 全尺寸（非短前缀）
+        assert_eq!(&bytes[..512], &data[..512]);
+        assert_eq!(&bytes[512..1024], &data[..512]); // 簇 2 自重复：锁定"按链读"语义
     }
 
     #[test]
