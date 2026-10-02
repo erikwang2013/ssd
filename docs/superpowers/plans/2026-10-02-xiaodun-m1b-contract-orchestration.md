@@ -1731,11 +1731,11 @@ impl CoreCtx {
 
 ```rust
 fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, Response> {
+    // 注意：`RpcError::invalid_params(&str)` 是 M0 既有签名（输出 "Invalid params: {message}" 前缀）
     match req.params.clone() {
-        Some(v) if !v.is_null() => {
-            serde_json::from_value(v).map_err(|_| err(req, RpcError::invalid_params()))
-        }
-        _ => Err(err(req, RpcError::invalid_params())),
+        Some(v) if !v.is_null() => serde_json::from_value(v)
+            .map_err(|_| err(req, RpcError::invalid_params("missing or malformed params"))),
+        _ => Err(err(req, RpcError::invalid_params("missing or malformed params"))),
     }
 }
 
@@ -1756,7 +1756,7 @@ fn scan_start(ctx: &CoreCtx, req: &Request) -> Response {
     if let Some(m) = &p.mode
         && m != "quick"
     {
-        return err(req, RpcError::invalid_params());
+        return err(req, RpcError::invalid_params("unsupported mode"));
     }
     let dev = match ctx.resolve_device(&p.device) {
         Ok(d) => d,
@@ -1796,7 +1796,7 @@ fn scan_results(ctx: &CoreCtx, req: &Request) -> Response {
         Err(r) => return r,
     };
     if !(1..=1000).contains(&p.limit) {
-        return err(req, RpcError::invalid_params()); // limit ∈ 1..=1000（契约）
+        return err(req, RpcError::invalid_params("limit out of range 1..=1000")); // 契约
     }
     match ctx.scans.results(p.task_id, p.offset, p.limit, p.deleted_only) {
         Ok((total, entries)) => ok(req, serde_json::json!({ "total": total, "entries": entries })),
@@ -2568,6 +2568,7 @@ bash scripts/e2e.sh
 6. **contingency 被触发**：CI（ci.yml:70-71）设了 `XD_DAEMON_BIN`，`ui/test/ipc_integration_test.dart:34` 会真起 daemon 打红 → 按预先授权改为 1（仅此一处；`protocol.dart` 与其它断言仍归 T5）。**里程碑门禁清单补 `dart format --check`**（ci.yml:66 既有闸，此前不在清单）。
 7. **发现⑤提前关闭**：`open_with_sysfs` 的 transport 经 `sysfs_transport()`（canonicalize class/block/<name> → classify_transport）与 device.list 同源；测试 `sysfs_transport_classifies_and_none_when_missing`（确定性假 sysfs 根）。M1d 计划对应前置项撤销（已回改 M1d 计划注释：遗留的是"复核"而非"实现"）。
 8. **git 事故（已恢复，如实记录）**：impl 的 amend 与 lead 的 docs 提交竞态——第一次 amend 卷入 lead 已 staged 的 4 份计划文档（悬空 d39dbef），修复后再次 amend 时又把 lead 已提交的 feb43d4（docs）`reset --soft` 撤回（内容零丢失，回工作树）。恢复：在终版 3fa947f 上重建 docs 提交（bd8f54b）+ `push --force-with-lease` 对齐远端（远端曾含悬空链，全部为自家提交、内容有本地副本）。**管线纪律更新（已写入团队管线记忆）**：代理永不 push、永不 amend/rebase/reset（修复轮一律追加提交）；lead 是唯一 push 者；lead 发"授权后续修改"消息前须确认自己不再动 git（本次竞态根因）。
+9. **lead 对齐抽查（T2 前）**：T1 落地后的 `api.rs` 里 `RpcError::invalid_params(&str)` 是 M0 原形（带参、输出 `Invalid params: {message}` 前缀），T5 计划原稿有 4 处无参调用会编译失败——计划已同步为带参调用（`"missing or malformed params"` / `"unsupported mode"` / `"limit out of range 1..=1000"`）；-32602 无 golden、文案前缀随各调用点，v1 README 不钉死文案 ✓。
 
 ---
 
