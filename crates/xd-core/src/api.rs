@@ -80,7 +80,7 @@ pub struct FsReadParams {
     pub length: u64,
 }
 
-/// `export.start` 参数（契约 v1.2）：`idxs` 非空且 ≤100000，`targetDir` 为绝对路径。
+/// `export.start` 参数（契约 v1.2）：`idxs` 去重后非空且 ≤100000，`targetDir` 为绝对路径。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportStartParams {

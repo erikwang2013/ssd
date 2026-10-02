@@ -369,6 +369,44 @@ fn error_constructor_messages_pin_contract_text() {
             message: "Internal error".into(),
         }
     );
+
+    // v1.2 五码：参数化反钉（qual-m1d-t1）——调用值刻意异于 golden 值，
+    // 构造器若退化为硬编码 golden 值，此处必红。
+    assert_eq!(
+        RpcError::target_on_source("/media/stick/Recovered"),
+        RpcError {
+            code: -32006,
+            message: "Target is on the source device: /media/stick/Recovered".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::target_not_writable("/tmp/ro"),
+        RpcError {
+            code: -32007,
+            message: "Target not writable: /tmp/ro".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::entry_not_found(7),
+        RpcError {
+            code: -32008,
+            message: "Entry not found: 7".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::entry_too_large(67108865), // 64MiB + 1：README「预览上限 64MiB」语义边界
+        RpcError {
+            code: -32009,
+            message: "Entry too large: 67108865".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::insufficient_space(999),
+        RpcError {
+            code: -32010,
+            message: "Insufficient space on target: need 999 bytes".into(),
+        }
+    );
 }
 
 #[test]
@@ -405,6 +443,18 @@ fn v12_request_goldens_typed_params() {
         .is_err()
     );
     assert!(serde_json::from_value::<ExportIdParams>(serde_json::json!({"export_id": 1})).is_err());
+    // 负值/别名反钉（qual-m1d-t1）：u64 必须拒绝负数；未知别名不得解码。
+    assert!(
+        serde_json::from_value::<ExportStartParams>(serde_json::json!({
+            "taskId": 1, "idxs": [-1], "targetDir": "/x"
+        }))
+        .is_err(),
+        "negative idx must be rejected"
+    );
+    assert!(
+        serde_json::from_value::<ExportIdParams>(serde_json::json!({ "eid": 1 })).is_err(),
+        "unknown alias must not decode"
+    );
 }
 
 #[test]

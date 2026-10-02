@@ -149,6 +149,10 @@ v0 字段不变，**新增 `transport`**：
   （`status` ∈ `"degraded"|"failed"`，≤1000 条，超限截断置 `itemsTruncated: true`）——
   成功条目不回传（UI 从 `succeeded` 计数展示），避免十万条通知爆流。
 
+**params 演进规则**（字段级治理，后续增量照此，T2/T3 加字段的据）：新增字段必须**可选**
+（`#[serde(default)]` 或 `Option<T>`，语义为「缺失 = 旧行为」）；**不得**删除或重命名既有字段；
+**不得**加 `deny_unknown_fields`——golden 只增不改（沿用本版先例）。
+
 ## golden 文件（36）
 
 examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.request.json`、
