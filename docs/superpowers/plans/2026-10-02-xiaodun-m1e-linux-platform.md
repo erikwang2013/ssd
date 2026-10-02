@@ -449,9 +449,20 @@ impl BlockDevice for LinuxBlockDevice {
 
 > **设计取舍（已定案）**：`name` = `vendor + " " + model`（vendor 非空且 model 未以 vendor 开头时拼接；model 缺失回退 kernel_name）。理由：内核把 model 截断到 16 字符，长型号需 vendor 补全辨识度；UI 列表直接可用。
 
-- [ ] **Step 4: 运行** → **12 passed**（xd-device 由 6 → 18；workspace 相应 +12）
+- [ ] **Step 4: 运行** → **12 passed**（xd-device 由 **4 → 16**；worktree workspace 88 → **100**）
 
 - [ ] **Step 5: Commit** `feat(device): Linux sysfs 枚举与只读块设备后端（可注入根）`
+
+**修订轮（执行侧，2026-10-02）**：实施提交 `b0c760c`（分支 m1e-linux）。偏离 3 条均机械性：
+① clippy::type_complexity → `type FakeEntry<'a> = (...)` 别名（无 lint 抑制）；② rustfmt 后处理；③ 本步计数勘误
+（计划原写"6→18"，实际基线 4 → 16，已就地更正）。
+**计划外实证（超出合成测试）**：`BlockEnumerator::new().list()` 对**真机 /sys** 跑通——sda
+"ATA ST2000LM015-2E81" 2000398934016B/Sata + sdb "ATA Samsung SSD 850" 500107862016B/Sata；
+loop0-7 与全部分区正确过滤；vendor 拼接实证有据（sysfs model 恰 16 字符截断 "ST2000LM015-2E81"，
+lsblk FULL 为 "ST2000LM015-2E8174"）；rdev→sysfs 往返对真实设备节点（8:0/8:16/8:1/8:22）逐一对上 lsblk -b。
+**咨询备注（无需改码，留档）**：a) `major_minor` 的 minor 掩码 `& !0xff` 对合成越界 dev_t（major ≥ 2^12）往返
+false——内核 major 12 位不可达；b) `list_skips_unreadable_entry_not_abort` 用 0o000 手法，root/CAP_DAC_OVERRIDE
+下会失效（CI 无暴露面）。
 
 ---
 
