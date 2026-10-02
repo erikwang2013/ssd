@@ -2381,7 +2381,69 @@ git commit -m "feat(fs-fat): 扫描（递归、删除找回、质量分级）"
             ext: "bin".into(),
         };
         let bytes = read_file(&dev, &e).unwrap(); // 不得 panic
-        assert!(bytes.len() < 266_240, "界截断：不得越界读，也不得伪造");
+        assert!(bytes.is_empty(), "界截断：不得越界读，也不得伪造（该几何簇全在设备外，确定性为空）");
+    }
+
+    #[test]
+    fn truncated_device_returns_read_prefix() {
+        // 坏道/设备截断：只交付已读前缀，不伪造、不拿残字节
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "DATA.BIN", &data).build();
+        let truncated = image[..26_312].to_vec(); // 数据区簇2全 + 簇3前200B（data_start=50扇区）
+        let (_f, dev) = dev_for(&truncated);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "DATA.BIN").unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes.len(), 712); // 512 + 200
+        assert_eq!(bytes, data[..712]);
+    }
+
+    #[test]
+    fn live_file_with_broken_chain_returns_short_prefix_not_guess() {
+        // qual-t7 I1：坏 FAT 上的活文件不得连续猜读（会全尺寸交付他人数据且质量恒 Complete）
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 251) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "DATA.BIN", &data).build();
+        let mut patched = image.clone();
+        patched[516..518].copy_from_slice(&0xFFFFu16.to_le_bytes()); // FAT[2]=EOC：链只剩首簇
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "DATA.BIN").unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert_eq!(bytes.len(), 512); // 诚实短前缀：不预测簇 3/4
+        assert_eq!(bytes, data[..512]);
+    }
+
+    #[test]
+    fn read_file_terminates_on_chain_loop() {
+        // 活文件自环链：必须终止且不超读（chain() 自身有 len 上界）
+        let data: Vec<u8> = (0..1200u32).map(|i| (i % 241) as u8).collect();
+        let image = xd_fixtures::FatImageBuilder::fat16().add_file("/", "LOOP.BIN", &data).build();
+        let mut patched = image.clone();
+        patched[516..518].copy_from_slice(&2u16.to_le_bytes()); // FAT[2]=2 自环
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let e = entries.iter().find(|e| e.name == "LOOP.BIN").unwrap();
+        let bytes = read_file(&dev, e).unwrap();
+        assert!(bytes.len() <= 1200);
+    }
+
+    #[test]
+    fn zero_size_or_missing_cluster_info_returns_empty() {
+        // size=0（空文件）与 first_cluster<2（簇信息缺失）→ Ok([])（字节层诚实为空）
+        let image = xd_fixtures::FatImageBuilder::fat16()
+            .add_file("/", "EMPTY.BIN", b"")
+            .add_file("/", "GONE.BIN", &[4u8; 512])
+            .delete("/", "GONE.BIN")
+            .build();
+        let mut patched = image.clone();
+        let de = patched.windows(32).position(|w| w[0] == 0xE5 && &w[8..11] == b"BIN").unwrap();
+        patched[de + 26..de + 28].copy_from_slice(&0u16.to_le_bytes());
+        let (_f, dev) = dev_for(&patched);
+        let entries = scan(&dev).unwrap();
+        let empty = entries.iter().find(|e| e.name == "EMPTY.BIN").unwrap();
+        assert_eq!(read_file(&dev, empty).unwrap(), Vec::<u8>::new());
+        let gone = entries.iter().find(|e| e.deleted).unwrap();
+        assert_eq!(read_file(&dev, gone).unwrap(), Vec::<u8>::new());
     }
 ```
 
@@ -2394,23 +2456,19 @@ Expected: 编译失败（`read_file` 未定义）。
 
 ```rust
 /// 读取文件内容（恰好 size 字节；设备边界/坏读早停 → 返回短于 size 的前缀，不伪造）。
-/// 策略：存活文件顺 FAT 链读；删除项（FAT 已清，链属他人）或环/坏链 → 按连续簇回退。
+/// 策略：存活文件只信 FAT 链（链短/坏/环 → 诚实短前缀，绝不连续猜测）；删除项
+/// （M1a 语义：删除即清 FAT，链属他人）按连续簇回退。
 /// 注意：返回值只有字节——"是否走了连续假设"由 `entry.deleted` 推断（M1d UI 文案据此）。
 pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, FatError> {
     if entry.size_bytes == 0 || entry.first_cluster < 2 {
         return Ok(Vec::new());
     }
     let bpb = bpb::parse(dev)?;
-    let fat = Fat::new(dev, &bpb);
-    let size = entry.size_bytes as usize;
+    let size = entry.size_bytes as usize; // 目录项来源恒 ≤ u32::MAX（FatEntry 由 scan 产出）
     let need = (size as u32).div_ceil(bpb.cluster_bytes()) as usize;
-    let chain = fat.chain(entry.first_cluster).unwrap_or_default(); // 坏链 → 空 → 走连续回退
-    let looped = chain.len() as u32 > bpb.data_cluster_count(); // 合法簇仅 count 个：> count ⟺ 必含环
-    let clusters: Vec<u32> = if !entry.deleted && !looped && chain.len() >= need {
-        chain[..need].to_vec()
-    } else {
-        // 删除项（M1a 语义下其链必属他人——删除即清 FAT）或环/坏链：按连续假设读。
-        // 界与 grade_deleted 同源（count+1）；u64 累积防野生 first_cluster 的 u32 加法溢出（qual-t6 I4）。
+    let clusters: Vec<u32> = if entry.deleted {
+        // 连续回退。界与 grade_deleted 同源（count+1）；u64 累积防野生 first_cluster 的
+        // u32 加法溢出（qual-t6 I4）。
         let max_cluster = bpb.data_cluster_count() as u64 + 1;
         let mut v = Vec::new();
         let mut c = entry.first_cluster as u64;
@@ -2419,13 +2477,19 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
             c += 1;
         }
         v
+    } else {
+        // 只信链：坏 FAT 上连续猜读会全尺寸交付他人数据且质量恒 Complete，调用方无从发现
+        // ——宁可漏报不可错报（qual-t7 I1）。
+        let fat = Fat::new(dev, &bpb);
+        let chain = fat.chain(entry.first_cluster).unwrap_or_default();
+        chain[..need.min(chain.len())].to_vec()
     };
-    let mut out = Vec::with_capacity(size);
+    let mut out = Vec::with_capacity(size.min(clusters.len() * bpb.cluster_bytes() as usize));
     let mut buf = vec![0u8; bpb.cluster_bytes() as usize];
     for c in clusters {
         let n = match dev.read_at(bpb.cluster_to_byte(c), &mut buf) {
             Ok(n) => n,
-            Err(_) => break, // 坏道/越界：保留已读前缀（与 scan 同规则，坏道跳过不中断）
+            Err(_) => break, // 坏读早停：保留已读前缀（与 scan 同规则），不影响其他条目
         };
         if n == 0 {
             break; // 该簇在设备外
@@ -2443,7 +2507,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &FatEntry) -> Result<Vec<u8>, Fat
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 50 passed（45 + 4 + 1：I4 野生簇回归）。
+Expected: 54 passed（45 + 4 + 1 + 修复轮 4）。
 
 - [ ] **Step 5: Commit**
 
@@ -2451,6 +2515,20 @@ Expected: 50 passed（45 + 4 + 1：I4 野生簇回归）。
 git add crates/xd-fs-fat
 git commit -m "feat(fs-fat): 文件读取（链读 + 连续回退，精确 size）"
 ```
+
+**修订轮（qual-t7，2026-10-02）**：质量审查 2 Important + 5 Minor，修复提交 `8e887d1`
+（"fix(fs-fat): 回退仅限删除项（live 坏链诚实短前缀）、删除侧免链走与容量收敛（qual-t7）"）：
+
+- **I1（规格变更，定案方案 a）**：**连续假设 ⟺ deleted**——回退仅限删除项；存活文件只信 FAT 链，
+  链短/坏/环 → 诚实短前缀（`chain[..need.min(len)]`）。缺陷原状：坏 FAT 上活文件被静默连续猜读，
+  **全尺寸交付他人数据且 quality 恒 Complete**，长度校验无从发现（qual 探针实证）。代价：坏 FAT 上
+  物理连续的活文件少读一段——宁可漏报。`looped` 变量随旧回退逻辑一并删除。
+- **I2**：删除项不再先走 `fat.chain()`（自环时白读 4178 次）；`Fat::new` 移入 live 分支。
+- **M1**：`with_capacity(size.min(簇数 × cluster_bytes))`——防 4GiB 文件整尺寸预分配被当先例。
+- **M3**：补 4 测试（截断设备前缀 712B / live 坏链 512B 不猜读 / 环终止 / size=0 与无簇信息）；
+  wild 断言收紧为 `is_empty()`。既有 5 测试零回归（live 测试链都是好的）。
+- **转注**：M2（手构 size>u32::MAX → 已加 doc 行"目录项来源恒 ≤ u32::MAX"）、M4（`RecoverQuality`
+  文档补活文件语义 → M1b）、M5（scan.rs 569 行 → M1b 拆 read.rs，见移交注 11）。
 
 ---
 
@@ -2505,7 +2583,7 @@ fn deleted_photo_recovered_byte_exact_from_image_file() {
 - [ ] **Step 2: 运行确认通过（全 crate 测试）**
 
 Run: `cargo test -p xd-fs-fat`
-Expected: 51 passed（50 + 1，含新 e2e）。
+Expected: 55 passed（54 + 1，含新 e2e）。
 
 （若 `xd_fs_fat::scan::scan` 路径过深，可在 `lib.rs` re-export：`pub use scan::{read_file, scan, FatEntry, RecoverQuality};`——**本步允许这一行改动**。）
 
@@ -2562,8 +2640,10 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
 1. **已删目录的呈现语义**：`is_dir` 忠实 attr 后，UI 过滤目录必须用 `is_dir`；已删目录 name 首字符丢失
    （无 LFN 时不可重建）、内容不枚举（M1a 版图）、quality 仍 Complete（is_dir 分支在先）——**不得把
    Complete 读成"目录内容可恢复"**。M1d 文案与过滤逻辑据此。
-2. **read_file 无"是否走连续回退"信号**：`entry.deleted` 即连续假设恢复；M1d UI 对删除项标注
-   连续假设恢复。返回值可能短于 `size_bytes`（设备边界/坏读早停），UI 以长度对比呈现完整度。
+2. **read_file 的连续假设 ⟺ deleted（qual-t7 I1 定案）**：删除项 = 连续假设恢复（M1d UI 据此标注）；
+   存活文件只信链，链短/坏/环 → 诚实短前缀（**绝不猜读**）、不再有"全尺寸交付他人数据"路径。
+   live 的 quality 在 scan 层仍恒 Complete（未删未覆盖语义），**读侧诚实靠长度对比**
+   （返回值可能短于 `size_bytes`：设备边界/坏读早停/坏链），UI 以长度呈现完整度。
 3. **grade_deleted 的 CPU 面**：无 FAT 缓存，每删除条目最坏 `count` 次 `read_at`（敌意镜像 × 条目数
    可达分钟级）。M1a 接受；M2 加预读缓存或全局读取预算（fat.rs 头已有 ponytail 升级路径注）。
 4. **grade_deleted `first_cluster + i` u32 加法**：溢出需 `is_free` 先在野生簇上成功（FAT 表项真实可读），
@@ -2580,6 +2660,13 @@ git commit -m "test(fs-fat): 端到端字节级找回 + 镜像生成示例"
    仍 `Ok([])`。需设备恰好结束在根区起点后 31 字节内，构造性极弱，M1a 接受。
 10. **（qual-t6 复审 Minor）** `InvalidBpb("根目录不可读")` 把设备短读也归入 BPB 错误（`FatError` 为
     `non_exhaustive`）：M1b 映射 UI 文案时考虑专用变体。
+11. **（qual-t7 M5）拆分欠账**：`scan.rs` 569 行 > 500 行规约（T7 由 439→569 引入）。M1b 做机械拆分：
+    `read_file` + 其测试整块迁 `src/read.rs`，scan.rs 留 `pub use crate::read::read_file;` 则 T8/后续
+    `xd_fs_fat::scan::read_file` 路径不变（纯移动）。**此欠账必须在 M1b 计划中立项**。
+12. **（qual-t7 转注）** M2：`read_file` 现假定 `size_bytes ≤ u32::MAX`（已加 doc 行）；手构更大值仅
+    短读不 panic（truncate 空操作）。M4：`RecoverQuality::Complete` 文档（scan.rs:14）仅述删除项语义，
+    活文件 Complete（未删/未覆盖）含义不同——M1b 补一句。T7 测试注释算术 512/513 off-by-one
+    （计划原文，实施者照抄正确）——M1b 拆分时顺手修正。
 
 ---
 
