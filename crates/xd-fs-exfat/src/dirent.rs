@@ -472,6 +472,20 @@ mod tests {
         vendor[0] = 0xE0;
         set.extend_from_slice(&vendor);
         let cs = entry_set_checksum16(&set); // 与实现同跳规则（跳过 2/3）
+        // T7 收尾：跨副本对拍——生产实现（本文件）与 xd-fixtures 同算法实现逐样本一致。
+        // 两份实现各自独立演化时此断言必红（测试侧 refix 走 fixtures 版；生产不可依赖 dev-dep）。
+        for sample in [
+            &[0x01u8][..],
+            &set[..], // 真实夹具 4 槽集（含跳位 2/3）
+            &[0x80, 0x01, 0xAA, 0xBB, 0x03],
+        ] {
+            assert_eq!(
+                entry_set_checksum16(sample),
+                xd_fixtures::entry_set_checksum(sample),
+                "SetChecksum 两副本对拍不一致（样本 {} 字节）",
+                sample.len()
+            );
+        }
         set[2..4].copy_from_slice(&cs.to_le_bytes());
         let mut data = vec![0x01u8; CB];
         data[..set.len()].copy_from_slice(&set);

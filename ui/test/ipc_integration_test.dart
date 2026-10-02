@@ -31,7 +31,9 @@ void main() {
     try {
       final ping = await client.ping();
       expect(ping.pong, isTrue);
-      expect(ping.protocol, 0);
+      // M1b：协议号 0→1 的机械波及（真 daemon 的活契约断言；CI 设 XD_DAEMON_BIN 时执行）。
+      // Dart 侧无协议常量（protocol 仅透传解码）；fake 断言已在 T5 同步为 1。
+      expect(ping.protocol, 1);
       final devices = await client.listDevices();
       // M1e 起 Linux 启动时枚举物理盘，总数依宿主而异；断言收敛为「镜像设备在列且正确」
       final images = devices.where((d) => d.kind == 'image').toList();

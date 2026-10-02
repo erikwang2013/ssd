@@ -26,7 +26,7 @@ proto/
 └── v1/                              # 新增：README.md + examples/*.json（golden）
 crates/
 ├── xd-core/
-│   ├── src/api.rs                   # PROTOCOL_VERSION=1；v1 类型（ScanStartParams/ScanState/ScanEntry…）
+│   ├── src/api.rs                   # PROTOCOL_VERSION=1；v1 类型（ScanState/ScanEntry/ScanProgress + 六个错误构造器；params 结构体归 T5）
 │   ├── src/notify.rs                # 新增：通知信封（无 id 的 JSON-RPC）
 │   ├── src/store.rs                 # 新增：SQLite（tasks/entries 两表；分页查询）
 │   ├── src/scan_task.rs             # 新增：状态机 + worker + 进度回调 + catch_unwind
@@ -229,6 +229,8 @@ contract_v1.rs 测试（Rust 侧）：对每个 golden 断言 decode 为强类�
 cargo add rusqlite -p xd-core --features bundled
 ```
 （随后把生成的 `rusqlite = "x.y"` 提为 workspace 依赖、xd-core 引 `workspace = true`——与仓库既有依赖风格一致。）
+
+> **执行后同步（T2）**：定版为 rusqlite **0.40.2**（bundled，libsqlite3-sys 0.38.2）。本任务正文代码**非 rustfmt-clean**——`store.rs` 以 rustfmt 后形态为准（语义经 token 级比对：7 处非空白差异全为尾逗号/let-else 展开，68/68 字符串常量逐字相同）。测试清单执行后为 **12 个**（计划 8 + `reinsert_same_key_replaces_row`〔INSERT OR REPLACE 同键替换〕/ `set_progress_roundtrips` / `unknown_state_reads_as_failed` / `entries_and_clear_are_task_scoped`——后三者为 qual 缺口补测，代码以 `store.rs` 为准）。
 
 - [ ] **Step 1: 写 store.rs（完整代码；新文件首行带水印头）**
 
@@ -753,6 +755,8 @@ git commit -m "feat(fs): 两引擎 scan_with_observer 流式回调（后序/终�
 - Modify: `crates/xd-fs-exfat/src/read.rs`（头注 + `read_file` 早分支 + 删旧回退块 + 两探针测试）
 - Modify: `crates/xd-fs-exfat/src/scan.rs`（`grade_deleted` 重写 + 一个分级测试）
 
+> **执行后同步（重要——本任务实现含三道追加界卫，代码以仓库为准）**：计划原稿只有「链不足 need 永不 Complete」。执行中经 impl 自抓 + spec/qual 三轮，`read_file`（deleted 早分支、live 链式分支）与 `grade_deleted`（非连续臂）落成**三道诚实性界卫**：①可达界卫（起点越界或 `need > max_cluster - fc + 1` → 空 / MaybeDamaged）；②链前缀回访检测（环/回折自证伪：deleted → 空交付，live → 截断至首回访点——**刻意不对称**，证据权威论）；③live 回访扫描界 `min(need, len)`（性能）。完整裁定链与变异实证见文末执行记录 T4。下方 Step 2/3 代码块为裁定前原稿，**以仓库 `read.rs`/`scan.rs` 现状为规格**。
+
 - [ ] **Step 1: read.rs —— 头注更新（第 2-7 行替换）**
 
 ```rust
@@ -986,20 +990,9 @@ pub struct ScanResultsParams {
     pub deleted_only: bool,
 }
 ```
-（`use serde::Deserialize;` 若未在 api.rs 中 import，按现状补。）`RpcError` 追加：
+（`use serde::Deserialize;` 若未在 api.rs 中 import，按现状补。）
 
-```rust
-    pub fn task_not_active(id: u64) -> Self {
-        Self { code: -32004, message: format!("Task not active: {id}") }
-    }
-    pub fn cannot_open(id: &str) -> Self {
-        Self { code: -32602, message: format!("Cannot open device: {id}") }
-    }
-    pub fn internal() -> Self {
-        Self { code: -32603, message: "Internal error".into() }
-    }
-```
-（构造器字段名以 api.rs 现状为准——`code`/`message`。）
+> **T1 执行后同步（见文末执行记录 ③）**：错误构造器六个**已全部在 T1 就位**（含 `task_not_active`/`cannot_open`/`internal`），T5 不得重复定义——本节此处的原始三枚构造器块已删除。
 
 - [ ] **Step 2: scan_task.rs（全代码；首行水印头）**
 
@@ -1469,10 +1462,12 @@ pub fn dev_from_bytes(bytes: &[u8]) -> (tempfile::NamedTempFile, Arc<dyn BlockDe
     (f, Arc::new(dev))
 }
 
-/// 小 exfat 夹具：2 live 文件 + 1 删除文件（名字/删除位可断言）。
+/// 小 exfat 夹具：2 live 文件 + 1 删除文件（**共 3 条目**——T5/T8 全链断言 `foundCount==3`、idx 集合 0..3；
+/// 计划初稿曾只放 2 条目，与断言不一致，已修正）。
 pub fn exfat_fixture() -> (tempfile::NamedTempFile, Arc<dyn BlockDevice>) {
     let image = xd_fixtures::ExfatImageBuilder::new()
         .add_file("/", "LIVE_A.TXT", b"aaaa")
+        .add_file("/", "LIVE_B.PNG", &[5u8; 100])
         .add_file("/", "DEL_ME.JPG", &[7u8; 9000])
         .delete("/", "DEL_ME.JPG")
         .build();
@@ -1742,11 +1737,11 @@ impl CoreCtx {
 
 ```rust
 fn parse_params<T: serde::de::DeserializeOwned>(req: &Request) -> Result<T, Response> {
+    // 注意：`RpcError::invalid_params(&str)` 是 M0 既有签名（输出 "Invalid params: {message}" 前缀）
     match req.params.clone() {
-        Some(v) if !v.is_null() => {
-            serde_json::from_value(v).map_err(|_| err(req, RpcError::invalid_params()))
-        }
-        _ => Err(err(req, RpcError::invalid_params())),
+        Some(v) if !v.is_null() => serde_json::from_value(v)
+            .map_err(|_| err(req, RpcError::invalid_params("missing or malformed params"))),
+        _ => Err(err(req, RpcError::invalid_params("missing or malformed params"))),
     }
 }
 
@@ -1767,7 +1762,7 @@ fn scan_start(ctx: &CoreCtx, req: &Request) -> Response {
     if let Some(m) = &p.mode
         && m != "quick"
     {
-        return err(req, RpcError::invalid_params());
+        return err(req, RpcError::invalid_params("unsupported mode"));
     }
     let dev = match ctx.resolve_device(&p.device) {
         Ok(d) => d,
@@ -1807,7 +1802,7 @@ fn scan_results(ctx: &CoreCtx, req: &Request) -> Response {
         Err(r) => return r,
     };
     if !(1..=1000).contains(&p.limit) {
-        return err(req, RpcError::invalid_params()); // limit ∈ 1..=1000（契约）
+        return err(req, RpcError::invalid_params("limit out of range 1..=1000")); // 契约
     }
     match ctx.scans.results(p.task_id, p.offset, p.limit, p.deleted_only) {
         Ok((total, entries)) => ok(req, serde_json::json!({ "total": total, "entries": entries })),
@@ -1918,6 +1913,21 @@ imports 更新：`use std::sync::Arc; use crate::api::{..., ScanStartParams, Tas
         assert_eq!(o.result["entries"][0]["name"], "DEL_ME.JPG");
         assert_eq!(o.result["entries"][0]["deleted"], true);
         assert_eq!(o.result["entries"][0]["quality"], "complete");
+        // qual-t3 纵深防御：observer 1:1 ⇒ idx 集合恰为 0..found_count（防回调重复致库内双行）
+        let Response::Ok(all) = handle_request(
+            &ctx,
+            &req_with(6, "scan.results", serde_json::json!({"taskId": 1, "offset": 0, "limit": 10})),
+        ) else {
+            panic!()
+        };
+        let mut idxs: Vec<u64> = all.result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["idx"].as_u64().unwrap())
+            .collect();
+        idxs.sort_unstable();
+        assert_eq!(idxs, vec![0, 1, 2], "idx 集合 == 0..found_count");
     }
 
     #[test]
@@ -1981,11 +1991,14 @@ imports 更新：`use std::sync::Arc; use crate::api::{..., ScanStartParams, Tas
         }
         let Response::Err(e) = handle_request(&ctx, &req_with(9, "scan.start", serde_json::json!({})));
         assert_eq!(e.error.code, -32602, "缺 device");
+        // qual-t1 裁定 (c)：-32602 的 message 逐字钉前缀（reason 不属契约、前缀属之）
+        assert_eq!(e.error.message, "Invalid params: missing or malformed params");
         let Response::Err(e2) = handle_request(
             &ctx,
             &req_with(9, "scan.results", serde_json::json!({"taskId": 1, "offset": 0, "limit": 0})),
         );
         assert_eq!(e2.error.code, -32602, "limit=0 越契约");
+        assert_eq!(e2.error.message, "Invalid params: limit out of range 1..=1000");
     }
 
     #[test]
@@ -2085,12 +2098,13 @@ imports 更新：`use std::sync::Arc; use crate::api::{..., ScanStartParams, Tas
 
 - [ ] **Step 7: 协议号波及面收尾（先 grep 再改，改完全量复跑）**
 
+> **T1 执行后同步（见文末执行记录 ①②）**：Rust 部分已完成——`crates/xd-daemon/tests/ipc.rs:79` 已改 1；`crates/xd-core/tests/contract.rs:47`（v0 ping 期望值用活常量，grep 曾漏）已改为封存字面量 0 并留注释。**T5 仅剩 Dart 侧**（下述 grep 去掉 `crates/` 路径）。
+
 ```bash
-grep -rn "protocol" ui/lib ui/test crates/xd-daemon/tests | grep -v "\.json"
+grep -rn "protocol" ui/lib ui/test | grep -v "\.json"
 ```
 - `ui/lib/core_client/protocol.dart`：协议常量/期望值 0 → 1（含 mismatch 判定逻辑的常量）
 - `ui/test/protocol_test.dart` / `ipc_integration_test.dart` / `home_page_test.dart`：断言与 fake 的 protocol 0 → 1（v0 golden 解码测试除外——v0 文件里 protocol 仍是 0，若某测试直接读 v0 golden 解码则保持 0）
-- `crates/xd-daemon/tests/ipc.rs:79`：`assert_eq!(resp["result"]["protocol"], 0)` → `1`
 
 - [ ] **Step 8: 门禁与提交**
 ```bash
@@ -2109,6 +2123,8 @@ git commit -m "feat(core): scan_task 编排（状态机/暂停取消/panic 隔�
 - Modify: `crates/xd-daemon/src/main.rs`
 - Modify: `crates/xd-daemon/tests/ipc.rs`（+`image:` 懒开拒绝断言）
 - （协议号断言已在 T5 Step 7 收尾）
+
+> **执行后同步（T6）**：计划代码块里 `Arc<Mutex<StdoutLock<'static>>>` **在 rustc 1.99 不可编译**（`StdoutLock` 因内含 `ReentrantLockGuard` 为 `!Send`，spec 已独立复现 E0277）——实现为 `Arc<Mutex<std::io::Stdout>>`（串行化+每行 flush 语义不变）；计划其余段落照旧。另 ipc.rs 增 5 行 `XDG_STATE_HOME` 隔离（防 daemon 测试在真实 HOME 建库）。
 
 - [ ] **Step 1: main.rs 改造（关键段落全代码）**
 
@@ -2287,7 +2303,8 @@ git commit -m "feat(daemon): 扫描线程接线（stdout 串行化/通知/--db/�
 - [ ] **Step 2: fat 拆分**：`scan.rs` 中 `read_file` 及其私有助手整体迁 `read.rs`；scan.rs 顶部留 `pub use crate::read::read_file;`（与 exfat 同款路径兼容）；`read_file` 的测试随迁 `read.rs` 的 `mod tests`。lib.rs 注册 `mod read;`（公开面不变）。
 - [ ] **Step 3: exfat 测试内移**：`scan.rs` 的 `mod tests` → `scan_tests.rs`，scan.rs 顶部 `#[cfg(test)] #[path = "scan_tests.rs"] mod tests;`（**不是** tests/ 外部目录——testutil 是 crate 内 cfg(test)）；`read.rs` 同法 → `read_tests.rs`。内移后 scan.rs、read.rs 各 ≤ 500 行（仓库线宽纪律）。
 - [ ] **Step 4: 助手去重**：`set_checksum`/`refix_deleted_checksum` 迁 `xd-fixtures`（`pub fn`，文档注释随迁，含"删除只清 bit7、不重算"语义）；exfat 各测试与 roundtrip 换 import，删本地副本。
-- [ ] **Step 5: 门禁与提交**（纯重构：测试全绿且**行为零变化**；测试绝对数略降只因副本合并——在提交信息里说明）
+- [ ] **Step 5: `linux.rs` 拆分（qual-t1 结构欠账：585 行 > 500 行规则，T1 +51）**：机械拆分——`crates/xd-device/src/linux.rs` 的枚举/归类（`BlockEnumerator`、`classify_transport`、`sysfs_transport`、transport 映射）迁 `crates/xd-device/src/linux/enumerate.rs`（或 `linux_enum.rs`，二者取一以 rustfmt/模块风格顺眼为准；`linux.rs` 保留 `pub use` 重导出 + `LinuxBlockDevice` 读取层）；`mod linux` 改为目录模块若选目录形态。**公开路径不变**（`xd_device::linux::*` 全部可用）。可读性优先，不做行为性重构。纯机械迁移 → 测试集合与计数**不得变化**（与 Step 4 的副本合并不同：本步是零计数变化）。
+- [ ] **Step 6: 门禁与提交**（纯重构：测试全绿且**行为零变化**；测试绝对数略降只因副本合并——在提交信息里说明；linux.rs 拆分项零计数变化）
 ```bash
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings && cargo fmt --check
@@ -2303,6 +2320,15 @@ git commit -m "refactor(fs): fat read_file 拆分/两引擎测试内移(#\[path\
 - Modify: `crates/xd-daemon/Cargo.toml`（dev-deps +`xd-fixtures`、`tempfile`；serde_json 已有）
 - Create: `crates/xd-daemon/tests/scan_ipc.rs`（全代码见下）
 - Modify: `scripts/e2e-loop.sh`（真实环回设备补 scan 断言块）
+
+> **T6 评审移交增补（spec-m1b-t6 + qual-m1b-t6 汇总，本任务必须覆盖）**：
+> 1. **`XDG_STATE_HOME`/`--db` 注入**：scan_ipc.rs 的每个 daemon spawn 必须带 `--db <tempdir>`（或注入 XDG）——否则测试在真实 HOME 落库（T6 的 ipc.rs 已踩过此坑）。
+> 2. **stderr 静默断言**：cancel 场景的 daemon 以 `stderr(Stdio::piped())` 捕获——断言无 `"panicked"` 字样（钉死 ScanCanceled hook 静默）；配套断言 cancel 后 `scan.finished state=canceled`（证明取消真发生而非没跑）。
+> 3. **`--db` 降级存活**：daemon 以 `--db <指向目录>` 启动 → ping 正常 + stderr 含 `任务库打开失败` + 进程不退出。
+> 4. **中断→failed 恢复**：kill daemon（SIGKILL）于扫描中 → 同 `--db` 重启 → `scan.status` 为 **failed**（recover_after_restart 护栏的 daemon 级钉死）；paused 任务则保留。
+> 5. **EACCES 端到端**：`chmod 000` 的**常规文件** + `unix:` id → `-32001 Device permission denied`（CI 非 root 可测；T6 spec 已手工验过一次）。
+> 6. `scan.progress` 发射分支（250ms 节流）目前无测试断言——大介质难入 CI，**裁定：以 `elapsedMs`/`readBytes` 语义断言替代**，发射分支不做 CI 钉死（真机手测清单记一笔即可）。
+> 7. **XDG 优先级护栏（qual-t6 变异 9 无归属）**：起 daemon（不传 `--db`）**同时注入 `XDG_STATE_HOME` 与 `HOME`** → 断言库落在 XDG 路径而非 HOME（5 行，用既有 spawn harness）。不加则"XDG 优先"永无 CI 护栏。
 
 - [ ] **Step 1: scan_ipc.rs（全代码；首行水印头）**
 
@@ -2380,8 +2406,10 @@ fn wait_notification(
 }
 
 fn exfat_image_bytes() -> Vec<u8> {
+    // 与 xd-core testutil::exfat_fixture 同构：3 条目（2 live + 1 删除）
     xd_fixtures::ExfatImageBuilder::new()
         .add_file("/", "LIVE_A.TXT", b"aaaa")
+        .add_file("/", "LIVE_B.PNG", &[5u8; 100])
         .add_file("/", "DEL_ME.JPG", &[7u8; 9000])
         .delete("/", "DEL_ME.JPG")
         .build()
@@ -2556,6 +2584,107 @@ bash scripts/e2e.sh
 5. (a) 裁定落码且探针 B/C 钉死；`read_file`/`grade_deleted` 同源语义。
 6. 懒打开唯一出口 + `image:` 拒绝（提权安全）；EACCES → -32001 契约码。
 7. 全量门禁（debug+release+clippy+fmt+flutter+e2e.sh+e2e-loop.sh 含扫描）绿。
+
+---
+
+## 执行记录
+
+### T1（契约 v1）—— impl-m1b-t1。提交沿革：`d67a858`（首版）→ `3fa947f`（终版，含裁定落地与发现⑤）→ `f5ec631`（水印头修复）；事故详见第 8 条。DONE_WITH_CONCERNS → spec 评审 **PASS**
+
+门禁：229 passed（+12）/ clippy clean / fmt clean / flutter +18~1（新 9，skip=无 XD_DAEMON_BIN 的既有 ipc_integration）/ analyze clean / release 档 exit 0。golden 21 个用 awk 从计划提取后 `diff -r` 逐字节比对（0 差异）。
+
+实施者发现 5 条（含 2 条计划自身缺陷），lead 裁定：
+
+1. **`xd-daemon/tests/ipc.rs`（:80）protocol 0→1**（计划排在 T5 且行号写 :79，与 T1 全绿门禁冲突）——**批准 T1 内改**；机械波及同 Step 5.5。T5 Step 7 Rust 部分就此完成。
+2. **`xd-core/tests/contract.rs`（:50）**（v0 ping 用例用活常量构造期望值；Step 5.5 与 T5 Step 7 的 grep 都漏）——**批准**：期望值改封存字面量 0 + 注释（v0 是历史快照；活契约往返由 contract_v1.rs/handlers v1 用例承担），保住「当前类型仍能 decode/re-encode v0 文件」的兼容路径。
+3. **T5 Step 1 重复定义三个错误构造器**（计划文本自冲突）——已删 T5 处代码块（六个全在 T1）。
+4. **文件结构注误把 ScanStartParams 归 T1**——已改注（params 归 T5，T1 未提前添加，正确）。
+5. **`linux.rs::open_with_sysfs` 是第 2 个 DeviceInfo 构造点**（计划计数错；`--device` 打开行 `transport: None`）——接受的后果：先开行在 device.list first-wins 去重时遮蔽枚举行的 transport。**裁定：升级路径（canonicalize sysfs → classify_transport，~3 行）延后到 M1d**（UI 真正显示 transport 时才有一致性诉求），记入 M1d 前置清单。
+
+**T1 终版补记（`3fa947f`，34 文件，Rust 230 / flutter +19 全过 0 skip）**：
+
+6. **contingency 被触发**：CI（ci.yml:70-71）设了 `XD_DAEMON_BIN`，`ui/test/ipc_integration_test.dart:34` 会真起 daemon 打红 → 按预先授权改为 1（仅此一处；`protocol.dart` 与其它断言仍归 T5）。**里程碑门禁清单补 `dart format --check`**（ci.yml:66 既有闸，此前不在清单）。
+7. **发现⑤提前关闭**：`open_with_sysfs` 的 transport 经 `sysfs_transport()`（canonicalize class/block/<name> → classify_transport）与 device.list 同源；测试 `sysfs_transport_classifies_and_none_when_missing`（确定性假 sysfs 根）。M1d 计划对应前置项撤销（已回改 M1d 计划注释：遗留的是"复核"而非"实现"）。
+8. **git 事故（已恢复，如实记录）**：impl 的 amend 与 lead 的 docs 提交竞态——第一次 amend 卷入 lead 已 staged 的 4 份计划文档（悬空 d39dbef），修复后再次 amend 时又把 lead 已提交的 feb43d4（docs）`reset --soft` 撤回（内容零丢失，回工作树）。恢复：在终版 3fa947f 上重建 docs 提交（bd8f54b）+ `push --force-with-lease` 对齐远端（远端曾含悬空链，全部为自家提交、内容有本地副本）。**管线纪律更新（已写入团队管线记忆）**：代理永不 push、永不 amend/rebase/reset（修复轮一律追加提交）；lead 是唯一 push 者；lead 发"授权后续修改"消息前须确认自己不再动 git（本次竞态根因）。
+9. **lead 对齐抽查（T2 前）**：T1 落地后的 `api.rs` 里 `RpcError::invalid_params(&str)` 是 M0 原形（带参、输出 `Invalid params: {message}` 前缀），T5 计划原稿有 4 处无参调用会编译失败——计划已同步为带参调用（`"missing or malformed params"` / `"unsupported mode"` / `"limit out of range 1..=1000"`）；-32602 无 golden、文案前缀随各调用点，v1 README 不钉死文案 ✓。
+
+**spec 评审（spec-m1b-t1）——结论 PASS**（对 `3fa947f`；悬空 `d67a858` 仅作对照快照）。关键证据：21 golden 从计划 heredoc 独立重提取三方逐字节全等（并验证 heredoc 自 `837f7f8` 未变）；独立探针 `/tmp/di-probe` 18/18（六构造器文案逐字、transport None 无键/Some 有键、ScanEntry 无 byteOffset、通知信封）；门禁亲跑 230 passed/0 failed/0 ignored、CI 等价 `XD_DAEMON_BIN` 下 flutter +19 全过 0 skip；5 条发现复核全部成立、无报告出入。非阻断发现及处置：
+
+- **A（已修，`f5ec631`）**：`notify.rs:1` 字面 `// WATERMARK` 占位（全仓唯一无水印头 .rs；`apply-copyright.sh` prepend 式不会清它）→ 按「head -1 现文件」逐字节置换真水印头 + `cmp` 验证 + 零行为变化复跑。**纪律遵守：追加提交、未 amend、未 push。**
+- **B（本次订正）**：记录标题 SHA 与行号漂移（`:47→:50`、`:79→:80`、Dart `:34→:36`）已在上文修正。
+- provenance 对 api.rs 已过期——按 Task 9 Step 3 约定归发版时重签，非 T1 门禁（仅记录）。
+
+**qual 评审（qual-m1b-t1）——结论 ISSUES（非阻塞）→ 补丁 `a563cb1` → 复审增量 APPROVED（T1 关闭，232/0，树净）**。变异表：10 条 9 KILL + 1 等价变异体（#6 `#[serde(default)]` 对 `Option` 冗余——serde 隐式缺失=None，保留作自文档）；加分变异 **11 存活 = 真缺口**（`enumerate` 的 transport 赋值零覆盖）。三个探针结论：ping 归一行删掉仍全绿（独立价值仅自洽，净覆盖由 `ping_returns_pong_and_protocol` 兜底）；三态无关歧义（missing/null→None、编码一律省略键，单向 daemon→UI + README 声明充分）；notify.rs 水印首行与 api.rs 逐字节相同。补丁（`a563cb1`，4 文件，232 测试）：
+- (b) `enumerate_classifies_transport_from_sysfs`（假 sysfs 根含 `/usb` → list() 断言 `Some("usb")`）；实施者手工复验变异 11 → 该测红 → 还原。
+- (a) `scan_state_all_variants_serialize_to_contract_literals`（pending/failed 字面量补齐）+ 订正 `contract_v1.rs` 假注释「全量覆盖」。
+- (d) Dart 侧 golden 集合钉死（21 名单全等）。
+- (c) README 补 -32602 文案说明（`Invalid params: <reason>` 中 reason 不属契约；`Cannot open device: <id>` 固定文案）——**其逐字测试归 T5**（无 producer 时不可钉；已加入 T5 测试清单）。
+- 结构欠账（预存）：`linux.rs` 585 行超 500 行规则（T1 +51）——已加入 **T7** 拆分项。
+
+### T2（xd-core::store）—— impl-m1b-t2。提交沿革：`89ad76e`（首版）→ `3a920ef`（spec 缺口补测）→ `399b36e`（qual 缺口补测 + 两注释）→ `a597db4`（注释措辞修正）。DONE → spec **PASS** → qual **APPROVED**（T2 关闭，244/0）
+
+- **计划偏差（仅格式）**：任务正文非 rustfmt-clean（超长签名/`params!` 超 100 列/单行 let-else）与 `cargo fmt --all --check` 门禁冲突 → `cargo fmt --all`（仅 store.rs）。spec 独立复核：token 级比对 7 处非空白差异全为 rustfmt 产物；**68/68 字符串常量（含全部 SQL 文本）字节级相同**——声明成立。
+- **spec 发现**：`INSERT OR REPLACE` 同键替换行为无测试（计划指定、行为正确）→ 补 `reinsert_same_key_replaces_row`（实施者并做 INSERT→非 REPLACE 有牙自证）。附加审计：schema 内省与计划列集精确相等（**无 byte_offset/scan_mode 等未来列** ✓）；外部写入未知 state → `task()` 降级 Failed 不 panic（探针验证）。
+- **qual 变异表（11+3+4 条，收官口径）**：8 KILL；`ORDER BY idx` 删除 **≈等价变异体**（EXPLAIN：PK 索引天然 (task_id,idx) 序；保留作契约保证）；对称交换 `Canceled↔Completed` **预期 NO-KILL**（库内往返自洽；wire 值由 T5 pin）；`u64::MAX` 等极值 round-trip 逐位全等 ✅。真缺口 3 个（set_progress 零覆盖 / 未知态降级无测 / 跨任务隔离弱）→ 全部补测并以定向变异（`?1=?1`、列交换、`unwrap_or` 互换）四条独立复杀闭合。
+- **质量裁定**：`Mutex` 中毒保持 `unwrap`（fail-stop；无用户代码临界区）——注释措辞「监督重启」经 qual 指出无据后改为「任务态由 `mark_interrupted`/`recover_after_restart` 兜底」（`a597db4`）；SQL 注入面=0（`format!` 仅插值编译期常量 `filter`，其余全参数绑定）。
+- **前向残项（记录，不处理）**：`'pending'` 目前无 DB 生产路径（M1c 引入时随测试补）；DB 状态字面量无独立测试（wire 归 T5、字面量由 M1c 迁移测试覆盖——裁定确认无新增风险）。
+
+### T3（两引擎 `scan_with_observer`）—— impl-m1b-t3。提交沿革：`604ba92`（主）→ `c39f746`（卷标 1:1 强化）。DONE → spec **PASS** → qual **APPROVED**（T3 关闭，249/0）
+
+- **插入点（判别核心）**：exfat `scan.rs:184-185`、fat `scan.rs:202-203`——均位于目录递归 if 块之后、`out[pushed].quality` 降级写回之后、循环体末尾（后序 + 终值）。spec 独立探针：回调数==表长且多重集相等；三层 exfat 序列 `DEEP.TXT→B→MID.TXT→A→ROOT.TXT`；两引擎降级目录回调即 `MaybeDamaged`。
+- **偏差（全机械）**：fat 实际 API `fat16()/add_subdir`；8 参函数补 `#[allow(clippy::too_many_arguments)]`（-D warnings 必需，spec 已用合成函数复现 8/7 错误）；exfat 三个既有测试调用点补 `&mut |_| {}`。
+- **qual 变异表（8 条）**：前序化/透传断链/降级前回调 **双引擎全 KILL**；**重复回调 6a/6b KILL**（精确序列断言已覆盖"每条目恰一次"——T5 `found_count` 虚增风险在引擎层已守）；`scan()` 内联 = 等价变异（观察者 noop 不可观测）；fat 卷标项不进回调流 = 语义差但裁定可接受 → **已补 `observer_stream_matches_table_with_volume_label`**（1:1 计数，真实盘必走路径；质询者亲验双态：干净绿/变异红——该测为 qual 自验代码，落码后免复审增量，理由记录于此）。
+- **质量裁定**：`&mut dyn FnMut(&Entry)` 保留（收益=公共签名不泄类型参数；探问词"递归单态化"论据不成立，qual 纠正，源码无此措辞）；fat 8 参不抽 context struct（exfat 9 参先例；参数全为穿透借用）；头注"后序/终值"与实现逐条一致且对 T5 承重。
+- **T5 纵深防御（已入计划）**：集成测试断言 `results` 的 idx 集合 == `0..found_count`。
+
+### T4（(a) 裁定 + 三道诚实性界卫）—— impl-m1b-t4。提交沿革：`15d8481`（(a) 落码）→ `f680e93`（可达界卫）→ `d100766`（deleted 前缀回访）→ `6a0be97`（live 回访截断）→ `7d43f37`（G1 判别测试 + 性能界 need + 文档 + G2/G3）→ `4e0ddc8`（G2/G3 判别力补强）。DONE_WITH_CONCERNS → spec **PASS** → qual ISSUES → 补丁 → 增量复审 → 定向补强（T4 关闭，262/0；workspace 249 → 262，+13 测试）
+
+**裁定链（本任务的核心产出，全部有 mutant 实证支撑）**：
+1. **(a) 本体**：deleted+!contiguous 只沿 stale 链（探针 B/C：链被清→4096 诚实前缀；链簇被占→截断）。**spec 三维对照证明判据价值**：pre-T4 对探针 B 交付 9000B **错位数据**且评 Complete；mid（(a) 但无界卫）在泛化构型交付 12288B=同一簇×3 且评 Complete。
+2. **可达界卫**（impl 自抓）：`need > max_cluster - fc + 1` → 物理不可能（fc 近堆尾 + DL 污染 + 环链可达 254 长）。qual 首轮发现**现有 loop 测试被回访检测双重兜住、界卫无判别输入**（真缺口）→ G1 用**非回访链**（253→6→7）补测，read/scan 各一，独立复杀"恰两红且环测仍绿"。
+3. **链前缀回访检测**（spec 抓 + lead 裁定）：环/回折 → 交付重复簇字节（伪造序）。裁定用**前缀去重**而非 `len>reachable`（后者误伤 need=1 合法单簇交付）；deleted → 空（整链不可信证据），live → 截断至首回访点（FAT 权威、逐跳可信至首次矛盾）——**刻意不对称**，四处文档一致（证据权威论措辞，`grep 实指`=0）。
+4. **live 车道同病收口**（impl 自抓）：live 自环此前同样重复交付 → 回访截断；quality 维持 entry 层 checksum 语义（scan.rs 分级梯已注释；M1c 若升级链感知分级需注意 I/O 放大）。
+5. **性能**（qual 抓）：live 回访扫描原为**全链 O(n²)**（1M 簇链 ≈5×10¹¹ 比较）→ 界 `min(need, len)`，qual 穷举 32,800 (chain,need) 对证明逐点等价。
+
+**变异实证汇总**：spec+qual 合计 KILL ≈ 20 个变异（含早分支回退连续、位图门控、live/deleted 车道混淆、链不足 Complete 等），等价变异 1（scan 连续臂界卫仅短路——`is_free` Err 已兜）、1 处判别力归属修正（G2 末簇→三簇中段；G3 设备尾巧合→堆中段，均以 qual 预定义 M1/M2 复刻双红收口）。**既有 15 个删除/分级测试逐函数体比对零改动、行为零变化**（spec 独立验证）。
+
+### T5（scan_task 编排 + 路由 + 协议号收尾）—— impl-m1b-t5。提交沿革：`f2bf297`（主）→ `c1c6cf2`（FAT 冒烟+窄窗注记）→ `00a84eb`（spec 收尾：restart 护栏/README 三处/模块头）→ `ce56d21`（qual 收尾：两缺口补测/线程命名/残留）。DONE → spec **PASS**（flake 0/40）→ qual ISSUES → 补丁 → 定点自证（T5 关闭，283/0；workspace 262 → 283）
+
+**产物**：`scan_task.rs`（公开 API/状态机，285 行）+ `scan_worker.rs`（worker 内部，183 行）+ `testutil.rs`；handlers 六路由 + CoreCtx Arc 化；Dart fake 收尾。
+
+**计划缺陷（实施者实修，均编译/门禁所迫）**：计划测试代码两处 `let Response::Err(..) = …;` 缺 `else`（E0005）；clippy 两处（`type_complexity` → `ActiveHandle`；`new_ret_no_self` → `SlowDev::wrap`）；golden 往返两处对不上（真 ImageFileDevice 的 id 含绝对路径 → info 桩；`total:42` 需 40 条填充）；cancel 测试原设计会 flake（cancel 同步置态 vs finished 异步）→ 改轮询事件本体；daemon `main.rs` Arc 最小迁移被迫前置（workspace 编译要求）；v0 golden `error_method_not_found` message 修正（scan.start 转正）——v0 封存声明的唯一例外（README 已注）。
+
+**裁定**：FAT 臂零覆盖（实施者自发现）→ 补 `fat_path_smoke_run_worker_and_fat_to_entry_mapping`（映射全字段）；cancel↔resume 窄窗 → **文档化不修**（地面真相一致、不可确定性测试；注记抽至 `Ctrl` doc 覆盖 pause/cancel/resume 三分支）；`restart` 双 worker 脚枪 → 加护栏 + 有牙测试（拒绝无副作用：resume 仍走完）；节流不 pin（无可判别观测手段）；worker 线程命名 `scan-{id}`（stderr 归因）。
+
+**qual 变异表（13 条）**：8 KILL（cancel 检查/paused 驻停/idx 偏移/错误码互换/limit 界/spawn 登记/downcast/restart 护栏）；2 真缺口当场补测并定点自证（`mode` 校验、"已打开优先"）；等价 1（null params）；无判别 2（节流=性能非正确性；worker 终局条件写=竞态护栏类，与窄窗同族可接受）。**flake 压力 0/40**（串行 20 + 并发 20 进程次）。
+
+**前向注记**：`tasks` map 持有 `Arc<dyn BlockDevice>` 至 daemon 退出（M1c 续跑复用；USB 安全弹出前的句柄策略归 M1d/M2）；`mode:"deep"` 现拒绝、M1c 转正时其断言改合法路径；`elapsedMs`=墙钟（README 已改）。
+
+### T6（daemon 并发接线）—— impl-m1b-t6，提交 `af472ff`。DONE → spec **PASS** → qual **APPROVED**（T6 关闭，283/0）
+
+- **计划-现实修正（1 项，最关键）**：`Arc<Mutex<StdoutLock<'static>>>` 在 rustc 1.99 **不可编译**（`StdoutLock` 含 `ReentrantLockGuard` ⇒ `!Send`；spec 独立复现 E0277，正对照 `Mutex<Stdout>` 通过）→ 实现为 `Arc<Mutex<Stdout>>`（同一把锁串行化整行 + flush）。**计划文本已改**（本任务头注）。
+- **必要性偏差（1 项）**：ipc.rs 注入 `XDG_STATE_HOME=<per-test tempdir>`——否则 daemon 测试在真实 `~/.local/state/xiaodun/tasks.db` 建库（隔离 HOME 复跑验证：目录全空；真实 HOME 零污染）。
+- **spec 证据（节选）**：hook 装点早于一切 worker spawn（唯一 spawn 点只经 serve 到达）；50 并发扫描 + 651 响应 stdout 压测 **751 行逐行 JSON 零坏行**；`image:` 拒绝以 **FIFO + /proc/pid/fd 双证零触碰**；**真 EACCES 端到端**（chmod 000 + unix: → -32001）当场验证；--db 四态 + 旧库续用（scanning→failed、paused 保留）。
+- **qual 变异表（9 条）**：套件 10 轮全绿；**7 条探针杀**（hook 反转/`--db` exit/image 放行/recover 删除/EACCES 降级/HOME 优先反转/…）；等价 1（hook 装载点前移——无 worker 能先于 serve）；护栏 1（XDG 注入，套件不可红，如实记录）。6 条套件零覆盖 → 5 条已入 T8 增补清单、**XDG 优先级入 T8 item 7**。
+- **性能账（域外观察，转 M1c）**：`insert_entries` 每条目一事务 + `synchronous=FULL` ≈ **6.9ms/条目 fsync**（513 条目 ext4 3539ms vs tmpfs 59ms）；M1c 大扫描前应评估批量提交或 WAL+synchronous=NORMAL（与"崩溃保部分结果"语义权衡）——已写入 M1c 计划。
+- **接受性 nit（记录不修）**：`image:`/未知 scheme 拒绝分支无 stderr 留痕（另一分支有）；「真 panic 仍打印」在 daemon 无可达 panic 路径，T8 只钉可观测半边（cancel 静默）。
+
+### T7（结构欠账纯重构）—— impl-m1b-t7。提交沿革：`e90b41b`（主：fat 拆分/测试内移/助手去重/linux 拆分）→ `c33e606`（收尾：fat 测试内移/线宽注/校验和对拍互锁）。DONE → spec **PASS** → qual **APPROVED**（T7 关闭，283/0 精确守恒）
+
+- **三位一体零变化证据**：函数体**逐字节相同**（fat read_file 含 doc；linux 迁出条目除 4 处 `pub(crate)`〔sysfs_transport/transport_str/compose_disk_name/is_listable_name，仅白盒测试与父模块所需〕无任何可见性变化）；公开面 25 条路径对快照逐条编译状态一致（唯二差异=计划授权的 fixtures +2 导出，dev-dep-only）；测试名集合双向差集为空（283 条）。**qual 差分字节探针**（最强证据）：14 组夹具（fat12/16/32 存活/删除/复用/污染/截断 + exfat 链式/VDL/自环/污染）在重构前快照与现树两侧跑 scan+read 全输出（含内容 sha256）**逐字节相同**（65 行同 sha256），负控变异立即显差——非空转。
+- **校验和对拍互锁（c33e606 新增资产）**：生产 `dirent.rs entry_set_checksum16` ↔ `xd_fixtures::entry_set_checksum` 在既有测试内对拍（3 样本含 128B 真实集），spec/qual 各自独立双向变异均红；qual M5 结论：**互锁须留真实集样本**（1 字节样本对移位漂移不可见），语料本身另有端到端兜底。
+- **线宽规则澄清（写入本计划口径）**：500 行约束针对**生产源文件**；`*_tests.rs` 测试体集中不受约束（刻意的源文件线宽控制另一半，exfat 两测试文件头注已写明）。最终行数：exfat scan 299/read 235、fat scan 242/read 222、linux 420/enumerate 205。
+- **导入解析漂移审计**：全仓无 glob 重导出；`xd_fixtures::refix_deleted_checksum` 仅 dev-dep（`cargo build --workspace` 绿、构建图零 fixtures）；无同名不同项。
+- **测试路径改名**：9 条 fat read 测试 `scan::tests::*` → `read::tests::*`（实现真迁移，1:1）——全仓 grep 文档/CI/README 零外部引用 ✓。
+- 四份新文件（fat read.rs/scan_tests.rs、exfat scan_tests/read_tests、linux/enumerate.rs）真水印头 cmp 通过；`apply-copyright.sh` 幂等 stamped 0。
+
+### T8（e2e 集成 + 环回设备）—— impl-m1b-t8。提交沿革：`efb9803`（主：scan_ipc.rs 8 测 + e2e-loop scan 块）→ `b7af460`（e2e-loop 步骤 2 补 --db）→ `28332e6`（EXIT trap 兜底）。DONE → spec **FAIL（1 阻断）** → 修复 → 条件 PASS（T8 关闭，291/0）
+
+- **8 枚测试全员落地**（计划 3 + 增补 2/3/4/5/7；增补 1 由统一 spawn 底盘保证）：全链分页/过滤/重启持久（含 **idx 集合纵深防御**）、image 拒绝、pause 二态、**cancel 严格 canceled + stderr 无 panicked**、--db 降级存活、**SIGKILL 中断→failed + paused 保留**、EACCES 端到端 -32001、XDG 优先。
+- **慢扫镜像**：FAT16 根区 511 条 0xE5 删除项（513 条目）；spec 量化：ext4 ≈3.9-4.0s vs tmpfs ≈56-61ms；**cancel 余量 ≈55ms（测试实际只耗 2-10ms）**、tmpfs 下严格 cancel 20/20 + 全套件 10/10——**不 flake，维持严格断言**（二态/加条目/换盘三方案均不值）。sigkill 守卫诊断性非承重（晚杀必红反证）。EACCES 测本机 uid=1000 真跑（未 skip）。
+- **spec 阻断项（已修）**：e2e-loop EXIT trap 对 root 属主 `$tmpdb` 以用户身份 `rm` EPERM → `set -e` 下**断言全过仍 exit 1**（docker 复现链条；CI 会红、挡 T9）→ `28332e6`：`sudo rm … || true` + 其余清理同款兜底；docker 前后对照 EXIT 1→0 实证。**同一脚本第二处污染（步骤 2 无 --db）由实施者自抓并修（`b7af460`）**——现两个 spawn 点均带 --db。
+- **裁定**：不采纳"先普通 rm 再 sudo"叠层（`sudo -n true` 门在先，无 sudo 时 trap 未设置——现形态对所有可达路径正确，记录备查）。
+- **T9 移交**：真机手测清单已定位（`docs/security/linux-privilege-model.md` §5，:81-92）——T9 在末条后追加「真机扫描/取消/进度条」一条。
 
 ---
 

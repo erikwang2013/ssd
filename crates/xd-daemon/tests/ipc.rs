@@ -7,6 +7,8 @@ struct Daemon {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// T6 起 daemon 无 `--db` 时会自建状态库；测试一律重定向 XDG_STATE_HOME，不碰真实 $HOME。
+    _state: tempfile::TempDir,
 }
 
 /// root 宿主上 daemon 的 `--image` 会走 PKEXEC_UID 校验（privcheck，失败关闭）；以测试进程自身
@@ -27,8 +29,10 @@ fn inject_pkexec_uid(cmd: &mut Command) {
 
 impl Daemon {
     fn start(args: &[&str]) -> Self {
+        let state = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_xd-daemon"));
         cmd.args(args)
+            .env("XDG_STATE_HOME", state.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -49,6 +53,7 @@ impl Daemon {
             child,
             stdin,
             stdout,
+            _state: state,
         }
     }
 
@@ -76,7 +81,8 @@ fn ping_over_stdio() {
     let resp = d.call(r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":null}"#);
     assert_eq!(resp["id"], 1);
     assert_eq!(resp["result"]["pong"], true);
-    assert_eq!(resp["result"]["protocol"], 0);
+    // M1b：协议号 0→1 的机械波及（同 T1 Step 5.5 的 ping golden 改指；计划的 T5 Step 7 原列此项）
+    assert_eq!(resp["result"]["protocol"], 1);
 }
 
 #[test]
@@ -100,7 +106,8 @@ fn device_list_with_image() {
 #[test]
 fn unknown_method_returns_error_with_same_id() {
     let mut d = Daemon::start(&[]);
-    let resp = d.call(r#"{"jsonrpc":"2.0","id":9,"method":"scan.start","params":null}"#);
+    // M1b：`scan.start` 已路由（无 params 走 -32602）——改钉真正不存在的方法名。
+    let resp = d.call(r#"{"jsonrpc":"2.0","id":9,"method":"no.such.method","params":null}"#);
     assert_eq!(resp["id"], 9);
     assert_eq!(resp["error"]["code"], -32601);
 }

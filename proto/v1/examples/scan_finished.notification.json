@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"scan.finished","params":{"taskId":1,"state":"completed","foundCount":42,"elapsedMs":5000}}

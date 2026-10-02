@@ -1,0 +1,789 @@
+# 小盾 M1d：扫描/预览/恢复三页 + 恢复导出（M1 收口）实施计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 完成 M1 的端到端产品面——契约 v1.2（`fs.read` / `export.*` / 目标盘错误码）、后端补齐（分片读取含雕刻件回读、**导出落盘 + 目标盘三重校验 + root 降权子进程**）、Flutter 三页向导（扫描控制 / 结果浏览 / 预览）+ 恢复导出与报告 + 通知流路由 + EACCES 引导。
+
+**Architecture:** Dart 层只做 UI 状态机与 transport（设计 §6 铁律：任何扫描/恢复逻辑不进 Dart）。恢复导出由 daemon 以**子进程**（`--export-worker`，stdin 收任务、stdout 回进度/条目）执行：**先开源设备 fd（此时仍是原权限）→ 目标盘校验 → root 模式下 `setresuid` 降到调用者 → 以普通身份写文件**——特权不落写到用户目录、子进程崩溃隔离于父。
+
+**关键裁定：**
+1. **目标盘"不落回源设备"校验**用内核事实：`st_dev(目标目录)` 与源块设备的 `st_rdev` 直接比较（root 降权前做）；**镜像文件源不做此校验**（目标是普通文件生态，写目标不碰镜像内容——但会在文档注明"恢复目标勿选镜像所在盘的满盘"）。
+2. **大文件支持**：引擎新增 `read_file_range`（分片读取），预览/导出都不再整文件物化；`fs.read` 契约限单片 ≤1MiB，导出内部片 4MiB。
+3. **`fs.read` 上限**：条目 `size_bytes > 64MiB` → `-32009`（UI 文案"文件过大，暂不支持预览"；**导出不受此限**——导出走流式）。
+4. **导出报告**：完成通知带计数 + **降级/失败条目清单**（≤1000，截断置 `itemsTruncated`）；成功条目不回传（UI 从计数展示）——避免十万条通知爆流。
+5. UI 文案铁律（(a) 裁定后的准确表述）：删除+连续（exFAT）= 规范保证；删除+非连续 = 按删除链、可能不完整；**不得对任何条目称"连续假设"**；雕刻件 = "仅雕刻 · 可能不完整"；VDL 未初始化区不预览不导出（引擎已保证）。
+6. `file_selector`（官方）与 `rustix`（目标盘校验/降权）为本切片新增依赖。
+7. **承接 M1b T1 发现⑤（已提前关闭）**：`open_with_sysfs` 的 `transport` 归类已在 M1b T1 终版（`3fa947f`）随 `sysfs_transport()` 完成并有测试；本切片只需在 UI 展示 transport 时**复核**一致性（先开行与枚举行同源），无实现工作。
+
+**前置：** M1b（契约 v1/scan_task/store）、M1c（carving/深扫/检查点）已合入。
+
+---
+
+## 文件结构
+
+```
+crates/
+├── xd-carving/src/{jpeg.rs, png.rs, lib.rs}     # 核心循环重构为 collector 形态 + read_back
+├── xd-fs-fat/src/read.rs                        # +read_file_range
+├── xd-fs-exfat/src/read.rs                      # +read_file_range
+├── xd-core/src/fs_read.rs                       # 新增：三分支（live/删除/carved）分片读取
+├── xd-core/src/export.rs                        # 新增：ExportManager（父进程侧）
+├── xd-core/src/store.rs                         # +entry(task_id, idx)
+├── xd-core/src/{api.rs, handlers.rs}            # v1.2 类型/路由/错误码
+└── xd-daemon/src/{main.rs, export_worker.rs}    # --export-worker 子进程模式
+proto/v1/                                        # README v1.2 + 5 个新 golden + 5 个错误 golden
+ui/
+├── lib/core_client/{core_client.dart, ipc_transport.dart, protocol.dart}
+├── lib/features/{scan/, results/, preview/, recover/}
+├── lib/main.dart                                # 向导路由
+└── test/{protocol_v12_test.dart, scan_page_test.dart, results_page_test.dart, preview_page_test.dart, recover_page_test.dart, export_flow_integration_test.dart}
+docs/security/linux-privilege-model.md           # 导出降权子进程模型
+```
+
+---
+
+### Task 1: 契约 v1.2（fs.read / export.* / 五个错误码）
+
+**Files:**
+- Modify: `proto/v1/README.md`（"v1.2 增量"小节）
+- Create: `proto/v1/examples/{fs_read.request.json, fs_read.response.json, export_start.request.json, export_start.response.json, export_progress.notification.json, export_finished.notification.json, export_cancel.request.json, export_cancel.response.json, error_target_on_source.response.json, error_target_not_writable.response.json, error_entry_not_found.response.json, error_entry_too_large.response.json, error_insufficient_space.response.json}`
+- Modify: `crates/xd-core/src/api.rs`（params 结构体 + 5 个错误构造器）、`crates/xd-core/tests/contract_v1.rs`
+
+**契约 v1.2 权威定义（README 与 golden 据此）：**
+
+```jsonc
+// 方法
+fs.read   {taskId, idx, offset, length}          // length ∈ 1..=1048576
+          → {bytesBase64, eof}                    // eof = 已交付到该条目可得数据的末端（损坏件可能 < sizeBytes）
+export.start {taskId, idxs:[...], targetDir}      // idxs 非空、≤100000；targetDir 绝对路径
+          → {exportId, fileCount, estimatedBytes} // estimatedBytes = Σ size_bytes（上界；降级件实际可能更短）
+export.cancel {exportId} → {exportId, state:"canceled"|"completed"}  // 终态幂等原样返回
+// 通知
+export.progress {exportId, done, total, writtenBytes, elapsedMs}   // 节流同 scan.progress
+export.finished {exportId, succeeded, degraded, failed, canceled, targetDir, items, itemsTruncated}
+//   items: [{idx, name, status:"degraded"|"failed", reason}]（仅降级/失败，≤1000 条；超限截断置 true）
+// 错误
+-32006 TargetOnSourceDevice  "Target is on the source device: <dir>"
+-32007 TargetNotWritable     "Target not writable: <dir>"
+-32008 EntryNotFound         "Entry not found: <idx>"
+-32009 EntryTooLarge         "Entry too large: <sizeBytes>"
+-32010 InsufficientSpace     "Insufficient space on target: need <n> bytes"
+```
+
+- [ ] **Step 1: golden（逐字写入）**
+```bash
+mkdir -p proto/v1/examples
+cat > proto/v1/examples/fs_read.request.json <<'EOF'
+{"jsonrpc":"2.0","id":21,"method":"fs.read","params":{"taskId":1,"idx":0,"offset":0,"length":16}}
+EOF
+cat > proto/v1/examples/fs_read.response.json <<'EOF'
+{"jsonrpc":"2.0","id":21,"result":{"bytesBase64":"aGVsbG8sIHhpYW9kdW4h","eof":true}}
+EOF
+cat > proto/v1/examples/export_start.request.json <<'EOF'
+{"jsonrpc":"2.0","id":22,"method":"export.start","params":{"taskId":1,"idxs":[0,1],"targetDir":"/home/user/Recovered"}}
+EOF
+cat > proto/v1/examples/export_start.response.json <<'EOF'
+{"jsonrpc":"2.0","id":22,"result":{"exportId":1,"fileCount":2,"estimatedBytes":16007}}
+EOF
+cat > proto/v1/examples/export_progress.notification.json <<'EOF'
+{"jsonrpc":"2.0","method":"export.progress","params":{"exportId":1,"done":1,"total":2,"writtenBytes":12000,"elapsedMs":300}}
+EOF
+cat > proto/v1/examples/export_finished.notification.json <<'EOF'
+{"jsonrpc":"2.0","method":"export.finished","params":{"exportId":1,"succeeded":1,"degraded":1,"failed":0,"canceled":false,"targetDir":"/home/user/Recovered","items":[{"idx":0,"name":"IMG_0001.JPG","status":"degraded","reason":"short read"}],"itemsTruncated":false}}
+EOF
+cat > proto/v1/examples/export_cancel.request.json <<'EOF'
+{"jsonrpc":"2.0","id":23,"method":"export.cancel","params":{"exportId":1}}
+EOF
+cat > proto/v1/examples/export_cancel.response.json <<'EOF'
+{"jsonrpc":"2.0","id":23,"result":{"exportId":1,"state":"canceled"}}
+EOF
+cat > proto/v1/examples/error_target_on_source.response.json <<'EOF'
+{"jsonrpc":"2.0","id":22,"error":{"code":-32006,"message":"Target is on the source device: /mnt/usb/Recovered"}}
+EOF
+cat > proto/v1/examples/error_target_not_writable.response.json <<'EOF'
+{"jsonrpc":"2.0","id":22,"error":{"code":-32007,"message":"Target not writable: /root/nope"}}
+EOF
+cat > proto/v1/examples/error_entry_not_found.response.json <<'EOF'
+{"jsonrpc":"2.0","id":21,"error":{"code":-32008,"message":"Entry not found: 999"}}
+EOF
+cat > proto/v1/examples/error_entry_too_large.response.json <<'EOF'
+{"jsonrpc":"2.0","id":21,"error":{"code":-32009,"message":"Entry too large: 1073741824"}}
+EOF
+cat > proto/v1/examples/error_insufficient_space.response.json <<'EOF'
+{"jsonrpc":"2.0","id":22,"error":{"code":-32010,"message":"Insufficient space on target: need 16007 bytes"}}
+EOF
+```
+（`fs_read.response` 的 `bytesBase64` 是 `hello, xiaodun!`（16 字节）的 base64——golden 契约里 `eof:true` 表示 16 字节已到条目尾。）
+
+- [ ] **Step 2: api.rs 类型与错误构造器**
+
+```rust
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadParams {
+    pub task_id: u64,
+    pub idx: u64,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportStartParams {
+    pub task_id: u64,
+    pub idxs: Vec<u64>,
+    pub target_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportIdParams {
+    pub export_id: u64,
+}
+```
+`RpcError` 追加（消息文案即契约）：
+```rust
+    pub fn target_on_source(dir: &str) -> Self   { /* -32006 "Target is on the source device: {dir}" */ }
+    pub fn target_not_writable(dir: &str) -> Self{ /* -32007 "Target not writable: {dir}" */ }
+    pub fn entry_not_found(idx: u64) -> Self     { /* -32008 "Entry not found: {idx}" */ }
+    pub fn entry_too_large(size: u64) -> Self    { /* -32009 "Entry too large: {size}" */ }
+    pub fn insufficient_space(need: u64) -> Self { /* -32010 "Insufficient space on target: need {need} bytes" */ }
+```
+
+- [ ] **Step 3: contract_v1.rs 断言扩展**：13 个新 golden 的 envelope 解码 + params 强类型解码（`FsReadParams`/`ExportStartParams`/`ExportIdParams` 逐字段）+ 5 个错误 golden 文案逐字。
+
+- [ ] **Step 4: 门禁与提交**
+```bash
+cargo test -p xd-core --locked && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo fmt --check
+git add -A proto/v1 crates/xd-core
+git commit -m "feat(proto): v1.2 契约——fs.read/export.* 与五个目标盘/条目错误码（13 golden）"
+```
+
+---
+
+### Task 2: 分片读取（引擎 read_file_range + 雕刻回读 + xd-core::fs_read）
+
+**Files:**
+- Modify: `crates/xd-fs-fat/src/read.rs`（+`read_file_range`）
+- Modify: `crates/xd-fs-exfat/src/read.rs`（+`read_file_range`）
+- Modify: `crates/xd-carving/src/{jpeg.rs, png.rs, lib.rs}`（collector 化 + `read_back`）
+- Create: `crates/xd-core/src/fs_read.rs`（三分支路由；+lib.rs 注册）
+- Modify: `crates/xd-core/Cargo.toml`（+`base64`（workspace 定版：`cargo add base64 -p xd-core`）、+`xd-carving` path）
+
+**语义（三引擎一致）：** `read_file_range(dev, entry, offset, length)` 返回**从 offset 起的至多 length 字节**（越尾短交付=诚实；offset ≥ 可得长度 → 空）；绝不物化整文件；内部按簇流式。
+
+- [ ] **Step 1: exfat `read_file_range`（全代码；fat 侧同构，契约测试同款）**
+
+```rust
+/// 分片读取：交付 `[offset, offset+length)` ∩ `[0, min(VDL,DL))` 的字节（流式，绝不物化整文件）。
+/// 拓扑与 `read_file` 完全同源（live 链式只信链；删除+连续=规范保证；删除+非连续=只沿 stale 链）。
+pub fn read_file_range(
+    dev: &dyn BlockDevice,
+    entry: &ExfatEntry,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, ExfatError> {
+    let size = entry.size_bytes.min(entry.data_length); // 交付上界（T4 保证 VDL ≤ DL；直构也不越 DL）
+    if offset >= size || length == 0 || entry.first_cluster < 2 {
+        return Ok(Vec::new());
+    }
+    let take = length.min(size - offset);
+    let boot = boot::parse(dev)?;
+    let fat = Fat32::new(dev, &boot);
+    let cb = boot.cluster_bytes();
+    let bitmap = if entry.deleted {
+        load_bitmap(dev, &boot, &fat)
+    } else {
+        None
+    };
+    // 簇序列（与 read_file 同裁定）：
+    let clusters: Vec<u32> = if entry.deleted && !entry.contiguous {
+        let chain = fat.chain(entry.first_cluster).unwrap_or_default();
+        let n = entry.data_length.div_ceil(cb).min(chain.len() as u64) as usize;
+        chain[..n].to_vec()
+    } else if !entry.deleted && !entry.contiguous {
+        let chain = fat.chain(entry.first_cluster).unwrap_or_default();
+        let n = entry.data_length.div_ceil(cb).min(chain.len() as u64) as usize;
+        chain[..n].to_vec()
+    } else {
+        let need = entry.data_length.div_ceil(cb);
+        match resolve_clusters(&boot, &fat, entry.first_cluster, need, entry.contiguous) {
+            Some(Resolved::Contiguous { first, n }) => {
+                (0..n).map(|i| (first as u64 + i) as u32).collect()
+            }
+            Some(Resolved::Chain(c)) => c,
+            None => return Ok(Vec::new()),
+        }
+    };
+    // 跳过 offset 之前的整簇，簇内偏移用首簇截断读
+    let skip_bytes = offset;
+    let mut out = Vec::with_capacity(take.min(4 * 1024 * 1024) as usize);
+    let mut produced: u64 = 0; // 对应 clusters 从头累计的逻辑字节数
+    let mut buf = vec![0u8; cb as usize];
+    for c in clusters {
+        if produced >= offset + take {
+            break;
+        }
+        if let Some(b) = bitmap.as_ref()
+            && !matches!(b.is_free(c), Ok(true))
+        {
+            break; // 删除项被占用簇即止（与 read_file 同）
+        }
+        let n = match dev.read_at(boot.cluster_to_byte(c), &mut buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let chunk_start = produced;
+        let chunk_end = produced + n as u64;
+        produced = chunk_end;
+        if chunk_end <= skip_bytes {
+            continue;
+        }
+        let from = skip_bytes.saturating_sub(chunk_start) as usize;
+        let to = buf
+            .len()
+            .min(((offset + take).saturating_sub(chunk_start)) as usize);
+        if from < to.min(n) {
+            out.extend_from_slice(&buf[from..to.min(n)]);
+        }
+        if n < buf.len() {
+            break;
+        }
+    }
+    Ok(out)
+}
+```
+测试（exfat，全代码语义；fat 同构）：
+```rust
+    #[test]
+    fn ranged_read_matches_full_read_slices() {
+        // 三种拓扑 × 五组 (offset,len)：range 结果 == read_file 的对应切片
+        // 构型：live 连续(V.BIN 9000)、live 链式(F.BIN [7,6,8])、删除连续(G.BIN)、删除 stale 链(G.BIN chained)
+        let cases: [(u64, u64); 5] = [(0, 10), (4090, 20), (4096, 1), (8192, 9000), (8999, 2)];
+        for (off, len) in cases { ... assert_eq!(range, &full[off.min(full.len() as u64) as usize..(off+len).min(full.len() as u64) as usize]) }
+    }
+
+    #[test]
+    fn ranged_read_offset_beyond_end_is_empty() { ... }
+
+    #[test]
+    fn ranged_read_deleted_stale_chain_stops_at_occupied() {
+        // 删除+非连续+簇被复用：range 读取与 read_file 同样在占用簇处截断（跨 offset 也一样）
+    }
+```
+
+- [ ] **Step 2: xd-carving collector 化 + `read_back`**
+
+重构 `jpeg.rs`/`png.rs`：抽出收集版核心，两形态共用（**不得复制走链逻辑**）：
+```rust
+/// 核心：从游标走链，`sink` 收每段字节；返回 (总长, 是否完整)。
+/// `carve_jpeg` = sink 丢弃；`collect_jpeg` = sink 攒入 Vec（上限 `take`）。
+fn walk_jpeg(cur: &mut Cursor<'_>, max_len: u64, sink: &mut dyn FnMut(&[u8])) -> Option<Carved>
+pub fn collect_jpeg(cur: &mut Cursor<'_>, max_len: u64) -> Option<(Vec<u8>, bool)>
+```
+（PNG 同构，`Crc32` 不受 sink 影响。）lib.rs 新增：
+```rust
+/// 雕刻件回读：从 `byte_offset` 在原 run 内重走到 `need` 字节（重走是确定性的——同样的设备、
+/// 同样的规则；run 界由调用方用 `unallocated_runs` 重新定位）。
+pub fn read_back(
+    dev: &dyn BlockDevice,
+    run_end: u64,
+    byte_offset: u64,
+    kind: Signature,
+    need: u64,
+) -> Option<Vec<u8>>
+```
+其中 `kind` 由 `ext` 反推（"jpg"→Jpeg/"png"→Png；lib.rs 提供 `Signature::from_ext`）。测试：`read_back_slices_match_original`（plant → carve → 对 carved 记录 read_back 全量/切片 == 原字节；含 truncated 件）。**run_end 的重新定位在 xd-core::fs_read**：`xd_fs_*::freespace::unallocated_runs` → 找包含 `byte_offset` 的 run → 取其 end。
+
+- [ ] **Step 3: xd-core::fs_read（全代码）**
+
+```rust
+// © 2026 erik · https://erik.xyz · erik@erik.xyz
+//! 条目分片读取（预览/导出共用）：live/删除 → 引擎 `read_file_range`；雕刻 → carving 回读。
+//! 契约上限 `MAX_READ = 1MiB` 由 handlers 校验；内部调用方可放宽（导出 4MiB 片）。
+
+use std::ops::Range;
+use base64::Engine as _;
+use xd_device::BlockDevice;
+
+use crate::api::ScanEntry;
+use crate::scan_task::FsKind;
+
+pub const MAX_READ: u64 = 1024 * 1024;
+
+pub enum ReadError {
+    TooLarge(u64),
+    Internal(String),
+}
+
+/// 读取 `[offset, offset+length)`；返回 (bytes, eof)。
+/// eof = 交付已到该条目**可得数据的末端**（损坏/短链件可能 < sizeBytes——UI 以此判"可能不完整"）。
+pub fn read_entry_range(
+    dev: &dyn BlockDevice,
+    fs: FsKind,
+    entry: &ScanEntry,
+    offset: u64,
+    length: u64,
+) -> Result<(Vec<u8>, bool), ReadError> {
+    let bytes = match entry.byte_offset {
+        Some(bo) => {
+            let runs = unallocated_runs(dev, fs).map_err(|e| ReadError::Internal(e.to_string()))?;
+            let run = runs
+                .iter()
+                .find(|r: &&Range<u64>| r.contains(&bo))
+                .ok_or_else(|| ReadError::Internal("carved offset outside free space".into()))?;
+            let kind = xd_carving::Signature::from_ext(&entry.ext)
+                .ok_or_else(|| ReadError::Internal("unknown carved ext".into()))?;
+            xd_carving::read_back(dev, run.end, bo, kind, offset + length)
+                .map(|all| {
+                    let s = (offset as usize).min(all.len());
+                    let e = ((offset + length) as usize).min(all.len());
+                    all[s..e].to_vec()
+                })
+                .unwrap_or_default()
+        }
+        None => {
+            let want = offset + length; // 引擎内自行 clamp；大文件分片不物化
+            match fs {
+                FsKind::Fat => {
+                    let e = to_fat_entry(entry);
+                    xd_fs_fat::read::read_file_range(dev, &e, offset, length)
+                        .map_err(|e| ReadError::Internal(e.to_string()))?
+                }
+                FsKind::Exfat => {
+                    let e = to_exfat_entry(entry);
+                    xd_fs_exfat::read::read_file_range(dev, &e, offset, length)
+                        .map_err(|e| ReadError::Internal(e.to_string()))?
+                }
+            }
+            .into_iter()
+            .take(length as usize)
+            .collect()
+        }
+    };
+    let end = offset + bytes.len() as u64;
+    let eof = bytes.len() as u64 < length || end >= entry.size_bytes;
+    Ok((bytes, eof))
+}
+
+pub fn to_base64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+```
+`to_fat_entry`/`to_exfat_entry`：从 `ScanEntry` 反构造引擎条目（字段齐全：fat 需 name/path/size_bytes/first_cluster/deleted/is_dir/quality/ext；exfat 需 + data_length/contiguous——**ScanEntry 缺 data_length/contiguous！** 反构造只能 `data_length = size_bytes, contiguous = ???`——拓扑信息在 ScanEntry 里丢了！
+**裁定**：`ScanEntry` 增 `contiguous: Option<bool>`（v1.2 增量，skip_serializing_if，与 byteOffset 同款）——雕刻/无意义件为 None；quick 扫描落库时写实值。`data_length` 不进契约（读取用 `size_bytes` 为上界；exfat 交付上界 = min(VDL,DL)= size_bytes 本来就是交付长度 ✓ `read_file_range` 用 `entry.size_bytes` 作 size、`data_length` 仅参与簇数计算——反构造时 `data_length = size_bytes` 会把簇数算少吗？need = dl.div_ceil(cb)；dl=VDL≤DL 时 need 可能小于真实 need（尾部 [VDL,DL) 不交付 ✓ 无碍：交付长度按 size，簇数只影响上界请求，少了 1 簇只可能少读"永不交付"的尾部 ✓ 安全）。
+**但 contiguous 必须真值**（拓扑裁定开关）→ ScanEntry.contiguous 必要性成立，M1b 的映射函数补写、store 补列（schema v5！）/读写/测试更新。
+
+- [ ] **Step 4: store schema v5 + 映射更新**
+`entries` 加列 `contiguous INTEGER`（可空；迁移模版同前，user_version=5）。`ScanEntry` 加字段 `#[serde(default, skip_serializing_if="Option::is_none")] pub contiguous: Option<bool>`；M1b 的 `fat_to_entry`/`exfat_to_entry` 填 `Some(e.contiguous)`（fat 无 contiguous 概念 → **fat 恒 Some(true)?** 不——fat 的读取拓扑由 deleted 决定，ScanEntry.contiguous 对 fat 无意义 → fat 填 `None`（即"无此概念"，读取时 fat 分支不用它）✓ 语义记入 README 字段注释）；carved 映射填 None。既有 golden 不受影响（缺省省略）✓。store 读写列；测试：contiguous roundtrip（Some(true)/Some(false)/None 三态）。
+
+- [ ] **Step 5: fs_read 测试（xd-core，全代码要点）**
+1. `reads_live_and_deleted_via_engine`：exfat 夹具（live A.TXT + 删除 DEL_ME.JPG）→ 建 task/entries（走真实 scan：`ScanManager` completed 后取条目）→ `read_entry_range` 切片 == 已知字节（小文件整读 + 中段切片 + offset 越尾空 + eof 语义逐一）。
+2. `reads_carved_entry_back`：T6 深扫夹具（mini_jpeg 埋点）完成深扫 → carved 条目 → 全量回读 == 原 mini_jpeg 字节。
+3. `eof_false_mid_file_true_at_end`。
+4. `unknown_ext_carved_errors`（反向构造 ext="xyz" 的 carved 条目 → Internal）。
+
+- [ ] **Step 6: 门禁与提交**
+```bash
+cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo fmt --check
+git add -A crates Cargo.toml Cargo.lock
+git commit -m "feat(core): 分片读取全链（引擎 read_file_range/carving 回读/fs_read 路由，schema v5 contiguous）"
+```
+
+---
+
+### Task 3: 恢复导出（父侧 ExportManager + `--export-worker` 降权子进程）
+
+**Files:**
+- Create: `crates/xd-core/src/export.rs`（+lib.rs 注册；Cargo.toml +`rustix`（features `["fs","process"]`；`cargo add` 定版））
+- Create: `crates/xd-daemon/src/export_worker.rs`（+main.rs 分派 `--export-worker`）
+- Modify: `crates/xd-core/src/{store.rs（+`entry(task,idx)`、+`open_read_only`）, handlers.rs（export.start/cancel 路由 + fs.read 路由）}`
+- Modify: `docs/security/linux-privilege-model.md`（导出降权模型节）
+- Create: `crates/xd-daemon/tests/export_ipc.rs`
+
+**降权子进程模型（写入 security 文档）：** 父（可能是 root）`spawn 自身 --export-worker` → 子**先按父权限开源设备 fd/做目标盘校验** → root 且 `PKEXEC_UID` 存在时 `setresuid(PKEXEC_UID)`（gid 从 /etc/passwd 尽力解析；解析不到只降 uid 并 stderr 留痕）→ **此后所有文件写入均以普通用户身份**。父只转发子 stdout 的 JSON 行；子崩溃/被杀 = 导出终止，已写文件保留。取消 = SIGTERM 子进程。
+
+- [ ] **Step 1: 父侧 export.rs（关键全代码）**
+
+```rust
+// © 2026 erik · https://erik.xyz · erik@erik.xyz
+//! 恢复导出（父进程侧）：校验 → 起 `--export-worker` 子进程 → 转发进度/条目/终报。
+//! 目标盘三重校验（存在/异设备/余量）在父侧先做（同步错误码），子在降权前复核（权威）。
+
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use serde_json::{Value, json};
+
+use crate::api::ScanEntry;
+use crate::notify::notification;
+use crate::scan_task::NotifyFn;
+use crate::store::Store;
+
+pub const MAX_IDXS: usize = 100_000;
+pub const MAX_REPORT_ITEMS: usize = 1000;
+
+#[derive(Debug)]
+pub enum ExportError {
+    TaskNotFound(u64),
+    EntryNotFound(u64),
+    NoEntries,
+    TargetOnSource(String),
+    TargetNotWritable(String),
+    InsufficientSpace(u64),
+    Internal(String),
+}
+
+pub struct ExportStarted {
+    pub export_id: u64,
+    pub file_count: u64,
+    pub estimated_bytes: u64,
+}
+
+struct Job {
+    canceled: Arc<AtomicBool>,
+    child: Mutex<Option<Child>>,
+}
+
+pub struct ExportManager {
+    store: Arc<Store>,
+    notify: NotifyFn,
+    jobs: Mutex<HashMap<u64, Job>>,
+    next_id: AtomicU64,
+}
+
+impl ExportManager {
+    pub fn new(store: Arc<Store>, notify: NotifyFn) -> Self { ... }
+
+    /// `source_rdev`: 源为物理块设备时 `Some((major, minor))`（镜像源为 None，不做同盘校验——
+    /// 写目标是文件生态，不触碰镜像内容）。
+    pub fn start(
+        &self,
+        task_id: u64,
+        idxs: &[u64],
+        target_dir: &str,
+        source_rdev: Option<(u64, u64)>,
+        db_path: Option<&std::path::Path>,
+        export_id_next: &AtomicU64, // 由 CoreCtx 持有（daemon 单例计数器放 manager 内即可——实现放 self.next_id）
+    ) -> Result<ExportStarted, ExportError> { ... }
+}
+```
+实现要点（计划即规范，实施者按此补全函数体与 `#[cfg(unix)]` 界限）：
+1. `idxs` 去重非空、≤ MAX_IDXS，否则 `NoEntries`/`Internal`（handlers 侧把空/超限映射为 -32602）。
+2. 逐 idx `store.entry(task_id, idx)` → 缺任一 → `EntryNotFound`；`estimated = Σ size_bytes`。
+3. 目标校验（unix）：
+   - `PathBuf::from(target_dir)`：不存在/非目录 → `TargetNotWritable(dir)`。
+   - `source_rdev = Some(rdev)` 时：`rustix::fs::stat(target)` 的 `st_dev`（拆 major/minor）== rdev → `TargetOnSource(dir)`。
+   - `rustix::fs::statvfs(target)` → `f_bavail * f_frsize < estimated` → `InsufficientSpace(estimated)`。
+4. 起子进程：`Command::new(std::env::current_exe()?)` `.arg("--export-worker").arg("--db").arg(db_path).arg("--task").arg(task_id.to_string()).arg("--export-id").arg(id).arg("--target").arg(target_dir)`，`pkexec_uid` 时 `.env("PKEXEC_UID", uid)`（继承即可——子自行读）；stdin piped（写 idxs JSON 数组后 `drop(stdin)`），stdout piped，stderr 继承（留痕）。
+5. 转发线程：`BufReader::new(child.stdout).lines()` → 按 `type` 分派：
+   - `"progress"` → 节流 ≥250ms 转发 `export.progress`（字段透传）；
+   - `"item"` → 收进 `items`（≤MAX_REPORT_ITEMS，超出置 `items_truncated`）；
+   - `"fatal"` → 记 reason；子 exit 后终报 `failed = total - (succeeded + degraded)`。
+6. 子退出后（或收到 `"finished"`）发 `export.finished`（含 canceled 标志）；`jobs` 移除。
+7. `pub fn cancel(&self, export_id) -> Result<&'static str /*state*/, ExportError>`：置 canceled → `child.kill()`；未知 id → 借用 `TaskNotFound(export_id)`? 用独立 `ExportNotFound`？——**裁定：未知 exportId → -32003 复用"Task not found"不合适**；新增无？——为省码位：未知 exportId 在 handlers 映射为 -32008 `EntryNotFound`？也不合适。**最终**：`export.cancel` 未知 id → `-32602`（参数指向不存在的运行中导出，重试语义即"已完成/不存在"）；已终态 → 幂等 `{"state":"completed"}`；运行中 → kill → `{"state":"canceled"}`。记入 README。
+
+- [ ] **Step 2: 子进程 export_worker.rs（关键全代码）**
+
+```rust
+// © 2026 erik · https://erik.xyz · erik@erik.xyz
+//! `--export-worker`：导出执行体。**权限序**：开源设备（父权限）→ 校验 → root 降权 → 写文件。
+//! stdout 只出 JSON 行（progress/item/fatal/finished），stderr 留痕；退出码 0=正常（含逐件失败），2=致命。
+
+pub fn run(args: ExportArgs) -> i32 {
+    let store = match Store::open_read_only(&args.db) { ... };
+    let row = store.task(args.task)?; // 取 device_id/fs
+    let dev = open_device_by_id(&row.device_id)?;           // ① 父权限
+    let fs = FsKind::from_str(&row.fs)?;
+    let entries: Vec<ScanEntry> = /* stdin 读 idxs → store.entry 逐取 */;
+    check_target(&dev, &row, &args.target, entries sum)?;   // ② 复核（同父侧三重）
+    if effective_uid()? == 0 && let Some(uid) = pkexec_uid() { drop_to_user(uid)?; } // ③ 降权
+    let mut out = std::io::stdout().lock();
+    let mut ok = 0u64; let mut degraded = 0u64; let mut failed = 0u64; let mut written = 0u64;
+    let mut used: HashMap<String, u32> = HashMap::new();
+    for e in &entries {
+        let name = unique_name(&mut used, file_name_for(e));
+        let path = PathBuf::from(&args.target).join(name);
+        match export_one(&dev, fs, e, &path) {
+            Ok(w) if w == e.size_bytes => ok += 1,
+            Ok(w) => { degraded += 1; item_line(&mut out, e, "degraded", "short read"); }
+            Err(reason) => { failed += 1; item_line(&mut out, e, "failed", &reason); }
+        }
+        written += ...; progress_line(&mut out, ...);
+        if parent_died(&mut out) { /* stdout EPIPE → 父没了：退出 */ return 0; }
+    }
+    finished_line(&mut out, ok, degraded, failed, false);
+    0
+}
+```
+`export_one`：`create` 文件（`OpenOptions::new().write(true).create_new(true)`，name 已去重）→ 4MiB 片循环 `xd_core::fs_read::read_entry_range(dev, fs, e, off, 4MiB)` 写盘 → 短交付（`eof && 已写 < size_bytes`）→ `Ok(已写)`（degraded）；读错误 → `Err`。**VDL/损坏语义直接来自 read_entry_range 的 eof** ✓。`file_name_for`：名字空（雕刻）→ `carved_{idx:06}.{ext}`；否则 `sanitize(name)`（拒绝 `/`、`\`、`..`、控制字符 → 替换 `_`）。`drop_to_user`：`rustix::process::setresuid(uid,uid,uid)` + `/etc/passwd` 解析 gid `setresgid`（解析不到则只降 uid + stderr 警告）。
+`Store::open_read_only`：`Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)`。
+`open_device_by_id`：`image:` → `ImageFileDevice::open`；`unix:` → `LinuxBlockDevice::open`（cfg linux）——**注意此路径不经 RPC，设备 id 来自自家 store，无越权面**（写进函数头注）。
+
+- [ ] **Step 3: handlers 路由**
+- `"fs.read"`：params 校验（length 1..=MAX_READ 否则 -32602）→ 任务行 → `entry = store.entry` 缺 → -32008 → size > 64MiB → -32009 → resolve_device(row.device_id)（复用懒打开；EACCES → -32001）→ `read_entry_range` → `{bytesBase64, eof}`。
+- `"export.start"`：idxs 空/超限 → -32602；任务/条目校验 → 错误映射（-32006/-32007/-32010/-32008）；成功 → `{exportId, fileCount, estimatedBytes}`。**source_rdev** 由 `resolve_device` 返回的设备算出：给 `BlockDevice` 增**默认方法** `fn source_rdev(&self) -> Option<(u64, u64)> { None }`（xd-device trait 加默认实现；LinuxBlockDevice 覆写为 stat /dev 节点）——**不动既有实现**（默认 None ✓ 铁律不破）。
+- `"export.cancel"` → 状态机见 Step 1 第 7 条。
+- CoreCtx 增 `exports: Arc<ExportManager>`（`with_scan` 一并注入；`CoreCtx::new` 默认内存库 + no-op notify）。
+
+- [ ] **Step 4: export_ipc.rs 集成测试（daemon 全代码要点）**
+1. `exports_all_bytes_exactly`：exfat 夹具（2 文件）→ scan → export.start 到 tempdir → 轮询 export.finished → 断言 `succeeded==2`；**逐字节比对**两文件内容 == 原始数据；文件名 == 原名。
+2. `degraded_reported_for_damaged_deleted`：删除文件 + 篡改位图（簇被复用）→ 导出 → `degraded==1` + item.reason=="short read" + 写出的文件长度 == 实交付长度（短于 sizeBytes）。
+3. `target_checks`：不存在目录 → -32007；余量不足（targetDir 指向 tmpfs 小盘？改用 estimated 巨大夹具不便——**用 `targetDir` 指向 1KiB 的 tmpfs？CI 无权限** → 改为：mock 不可行，**校验函数单测**（xd-core::export 内 `#[cfg(test)]` 对 `check_*` 纯函数注入 statvfs/rdev 假值）覆盖 -32010 与 -32006；集成只测 -32007 与 happy path。（**-32006 的真集成留给 e2e-loop.sh：环回设备挂载后导出到挂载点 → -32006**，见 T9。）
+4. `cancel_stops_export`：大夹具（十几 MiB）→ export.start → 立即 cancel → 终报 canceled==true（允许 `{canceled, 已完成}` 二态的竞态容忍写法，同 pause 先例）。
+
+- [ ] **Step 5: 门禁与提交**
+```bash
+cargo test --workspace --locked && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo fmt --check
+git add -A crates docs/security Cargo.toml Cargo.lock
+git commit -m "feat(export): 恢复导出——父侧校验/转发 + --export-worker 降权子进程（逐件报告/取消/三重目标校验）"
+```
+
+---
+
+### Task 4: Dart 传输层 v1.2（参数化调用 + 通知流 + pkexec 启动）
+
+**Files:**
+- Modify: `ui/lib/core_client/{protocol.dart, core_client.dart, ipc_transport.dart}`
+- Create: `ui/test/fake_core_client.dart`（测试公用 Fake，实现全部接口）
+- Modify: `ui/test/{protocol_v1_test.dart（如存在则并入 protocol_v12_test.dart 新文件）, ipc_integration_test.dart, home_page_test.dart}`
+- Create: `ui/test/protocol_v12_test.dart`
+
+- [ ] **Step 1: protocol.dart —— v1.2 模型（全代码要点）**
+```dart
+class ScanEntry {
+  const ScanEntry({required this.idx, required this.name, required this.path, required this.ext,
+    required this.sizeBytes, required this.deleted, required this.isDir, required this.quality,
+    required this.firstCluster, this.byteOffset, this.contiguous});
+  final int idx; final String name; final String path; final String ext;
+  final int sizeBytes; final bool deleted; final bool isDir;
+  final String quality; // complete | maybeDamaged | carved
+  final int firstCluster; final int? byteOffset; final bool? contiguous;
+  factory ScanEntry.fromJson(Map<String, dynamic> j) => ...;
+  String get displayName => name.isEmpty ? 'carved_${idx.toString().padLeft(6, '0')}.$ext' : name;
+}
+
+class ScanStartResult { final int taskId; final String fs; final int totalBytes; }
+class ScanStatusResult { final int taskId; final String state; final int readBytes; final int foundCount; final int elapsedMs; }
+class ScanResultsPage { final int total; final List<ScanEntry> entries; }
+class FsReadResult { final Uint8List bytes; final bool eof; } // base64Decode
+class ExportStartResult { final int exportId; final int fileCount; final int estimatedBytes; }
+class ExportReportItem { final int idx; final String name; final String status; final String? reason; }
+class ExportFinished { final int exportId; final int succeeded; final int degraded; final int failed;
+  final bool canceled; final String targetDir; final List<ExportReportItem> items; final bool itemsTruncated; }
+```
+
+- [ ] **Step 2: core_client.dart 抽象扩展（全代码）**
+```dart
+abstract class CoreClient {
+  Future<PingResult> ping();
+  Future<List<DeviceInfo>> listDevices();
+  Future<ScanStartResult> scanStart(String device, {String mode = 'quick'});
+  Future<ScanStatusResult> scanStatus(int taskId);
+  Future<ScanResultsPage> scanResults(int taskId, {int offset = 0, int limit = 200, bool deletedOnly = false});
+  Future<void> scanPause(int taskId);
+  Future<void> scanResume(int taskId);
+  Future<void> scanCancel(int taskId);
+  Future<FsReadResult> fsRead(int taskId, int idx, {int offset = 0, int length = 1048576});
+  Future<ExportStartResult> exportStart(int taskId, List<int> idxs, String targetDir);
+  Future<void> exportCancel(int exportId);
+  /// 服务端通知（无 id 行）：scan.progress/scan.finished/export.progress/export.finished。
+  Stream<Map<String, dynamic>> get notifications;
+  Future<void> close();
+}
+```
+
+- [ ] **Step 3: ipc_transport.dart —— 参数化 `_call` + 通知流 + pkexec（全代码要点）**
+```dart
+  final StreamController<Map<String, dynamic>> _notifications =
+      StreamController<Map<String, dynamic>>.broadcast();
+  @override
+  Stream<Map<String, dynamic>> get notifications => _notifications.stream;
+
+  Future<Map<String, dynamic>> _call(String method, [Object? params]) { ... encodeRequest(id, method, params: params) ... }
+
+  void _onLine(String line) {
+    ... jsonDecode ...
+    final id = message['id'];
+    if (id is! int) { _notifications.add(message); return; }   // 无 id = 通知（契约）
+    ...
+  }
+
+  /// pkexec 启动（EACCES 引导路径）：polkit 弹窗认证后以 root 拉起同参数 daemon。
+  /// 未验证（需真机 polkit + 安装后的 policy 文件）；开发树直连路径不受影响。
+  static Future<IpcCoreClient> startPrivileged({
+    required String daemonPath, List<String> extraArgs = const [],
+  }) async {
+    final process = await Process.start('pkexec', [daemonPath, ...extraArgs]);
+    return IpcCoreClient._(process);
+  }
+```
+`close()` 增 `_notifications.close()`。
+既有 `_call('ping')` / `_call('device.list')` 调用点适配新签名（`params: null` → 省略）。
+
+- [ ] **Step 4: fake_core_client.dart（测试公用）**：内存态实现：可注入 fixtures（devices/entries/progress 脚本）、记录调用序列、可手动 `emitNotification(...)`；`exportStart` 返回可配置结果。既有 home_page_test 换用 Fake（替代内联假客户端）。
+
+- [ ] **Step 5: protocol_v12_test.dart**：解码 M1d 全部 golden（typed 模型逐字段）；`displayName` 对雕刻件命名；`FsReadResult` base64 解码 == `hello, xiaodun!`。`ipc_integration_test.dart` 增：`scan_*`/`fs.read` 真 daemon 往返（沿用其既有的 XD_DAEMON_BIN 守卫模式）。
+
+- [ ] **Step 6: 门禁与提交**
+```bash
+cd ui && /home/erik/flutter/bin/flutter test --no-pub && /home/erik/flutter/bin/flutter analyze
+git add -A ui
+git commit -m "feat(ui): 传输层 v1.2——参数化调用/通知流/pkexec 启动 + v1.2 模型与 Fake"
+```
+
+---
+
+### Task 5: 扫描页（模式选择 / 真实进度 / 暂停恢复取消 / EACCES 引导）
+
+**Files:**
+- Create: `ui/lib/features/scan/scan_page.dart`（+`scan_controller.dart`）
+- Modify: `ui/lib/home_page.dart`（设备项 onTap → 进入 ScanPage）、`ui/lib/main.dart`（路由）
+- Create: `ui/test/scan_page_test.dart`
+
+**ScanController（ChangeNotifier；Dart 只做状态机——设计 §6 铁律）：** 状态 `idle → starting → scanning ↔ paused → completed/canceled/failed`；订阅 `client.notifications` 分派 `scan.progress`/`scan.finished`（按 taskId 过滤）；**通知 + 轮询兜底**（通知丢失/迟到不影响正确性：扫描中每 1s `scanStatus` 对账）；`percent = totalBytes==0 ? null : readBytes/totalBytes`（quick 也拿到了 totalBytes——显示确定进度；深扫为真百分比）。
+
+- [ ] **Step 1: scan_page.dart 结构（规范级）**
+```
+Scaffold(appBar: 设备名 + 返回)
+├── 模式选择：SegmentedButton [快速扫描 / 深度扫描]（扫描中禁用）
+│     深度模式副文案：「在未分配空间按文件签名找回（照片/图片）；无文件名，结果标注『仅雕刻』」
+├── 主按钮：开始扫描（starting/scanning 时禁用）
+├── 进度区（scanning/paused）：
+│     LinearProgressIndicator(value: percent)   # percent 可空 → 不确定态
+│     行：已扫 readBytes / totalBytes · 已找到 foundCount · 用时 elapsedMs
+│     按钮行：[暂停]/[恢复] · [取消]（取消二次确认对话框）
+├── 完成态：[查看结果 (N)] 主按钮 → ResultsPage(taskId)
+└── 失败/取消态：状态文案 + [重新扫描]
+```
+- [ ] **Step 2: EACCES 引导（ScanController）**：`scanStart` 抛 `RpcException(-32001)` → UI 对话框：「需要管理员权限访问该设备」[取消] [授权后重试]；重试 = `IpcCoreClient.startPrivileged(daemonPath: 原路径, extraArgs: 原参数)` 重启客户端（`onClientReplaced` 回调让 main.dart 换用新 client）→ 重试 scanStart。**集成测试无法覆盖 pkexec（需真机 polkit）——widget 测试用 Fake 注入 -32001 → 断言对话框出现与重试调用序列**。
+- [ ] **Step 3: scan_page_test.dart（Fake 驱动，全代码要点）**
+1. 初始 idle：模式可切换；点开始 → Fake 记录 `scanStart(dev, mode:'deep')`（断言 mode 透传）。
+2. 注入 progress(30%) + status 对账 → 进度条 value≈0.3、计数文本正确；注入 finished(completed) → [查看结果] 出现且计数==foundCount。
+3. 暂停→恢复：按钮文案切换、调用序列 `scanPause`/`scanResume` 各一次。
+4. 取消：确认对话框 → `scanCancel` 被调、状态 canceled。
+5. -32001：对话框出现；[授权后重试] → Fake 记录了一次 privileged 重启 + 再次 scanStart。
+6. 通知过滤：注入**其他 taskId** 的 progress 不得影响本页状态。
+- [ ] **Step 4: 门禁与提交**（flutter test+analyze；commit `feat(ui): 扫描页（模式/进度/暂停取消/EACCES 引导）`）
+
+---
+
+### Task 6: 结果浏览页（虚拟化分页 / 过滤 / 多选 / 质量徽标）
+
+**Files:**
+- Create: `ui/lib/features/results/{results_page.dart, results_controller.dart, entry_tile.dart}`
+- Create: `ui/test/results_page_test.dart`
+
+**ResultsController：** 分页状态机——`pageSize=200`，`loadMore()` 在滚动到 80% 时触发（`ScrollController`）；`total` 来自首页响应；`deletedOnly` 与 `quality` 过滤切换时**重置分页**（offset=0 清列表）；`selected: Set<int>`（idx）多选；服务端排序即 `idx` 序（无本地排序）。
+
+- [ ] **Step 1: 页面结构（规范级）**
+```
+Scaffold(appBar: '扫描结果' + 计数 'N 项')
+├── 过滤行：FilterChip[全部|仅删除] · FilterChip[完整|可能损坏|仅雕刻]（可组合；切换即重置）
+├── ListView.builder（itemCount = entries.length + 1；末项 = 加载指示/已到底）
+│     EntryTile：leading=类型图标（jpg/png→image 图标）· title=displayName · 
+│       subtitle='路径 · 大小' · trailing=质量徽标（完整=绿/可能损坏=橙/仅雕刻=蓝灰）
+│       雕刻件：subtitle 无路径，徽标旁注「仅雕刻 · 可能不完整」
+├── 多选模式（长按进入）：Checkbox + 底部 [恢复所选 (K) → RecoverPage(taskId, idxs)]
+└── 点击条目 → PreviewPage(taskId, entry)
+```
+- [ ] **Step 2: 文案铁律检查表（写进 results_page.dart 头注，widget 测试逐条断言）**
+  1. 删除+**连续**（exFAT）：「已删除 · 簇未被占用（完整性高）」；
+  2. 删除+**非连续**（`contiguous==false`）：「已删除 · 按删除链恢复，可能不完整」；
+  3. **任何文案不得出现"连续假设"**（grep 断言测试：源码不含该四字）；
+  4. carved → 仅「仅雕刻 · 可能不完整」；
+  5. live+complete → 不加任何警示。
+- [ ] **Step 3: results_page_test.dart**
+1. 首屏 200 条（Fake 提供 450 条）→ 滚动触发 loadMore → 断言 `scanResults(offset:200)` 被调、第三页合计 450。
+2. 切换「仅删除」→ 重置调用 `scanResults(offset:0, deletedOnly:true)`、列表替换。
+3. 质量过滤徽标与文案逐条对上（Step 2 五条 —— 五组构造条目注入 Fake，断言 tile 文案）。
+4. 多选：选 2 条 → 底部按钮文本「恢复所选 (2)」→ 点击导航参数 `(taskId, [idx...])`。
+5. 空结果/加载失败：空态文案 + 重试按钮。
+- [ ] **Step 4: 门禁与提交**（commit `feat(ui): 结果页（分页/过滤/多选/质量徽标与铁律文案）`）
+
+---
+
+### Task 7: 预览页（图片/文本/信息；雕刻件回读）
+
+**Files:**
+- Create: `ui/lib/features/preview/{preview_page.dart, preview_controller.dart}`
+- Create: `ui/test/preview_page_test.dart`
+
+**PreviewController：** 按 ext 分派：图片（jpg/jpeg/png）→ **分片拉全量**（1MiB/次循环到 eof，上限 32MiB——超限显示"文件过大，暂不支持预览"）→ `Image.memory`（含 `errorBuilder`：数据坏时显示"数据损坏，无法预览"而非红屏）；文本（txt/log/md/json…）→ 前 256KiB → `SelectableText`（utf8 allowMalformed）；其它 → 仅信息卡。信息卡恒显：名称/路径/大小/删除状态/质量徽标/`byteOffset`（雕刻件展示"偏移"）；**exFAT VDL 说明**：若 `sizeBytes < 实际可读` 无从得知（契约不含 DL）→ 不显示猜测，仅对短交付显示「实际数据短于声明大小」。
+
+- [ ] **Step 1: 页面结构（规范级）**：AppBar=displayName；body=加载态→内容；底部信息卡；[恢复此文件] 按钮 → RecoverPage(taskId,[idx])。
+- [ ] **Step 2: preview_page_test.dart**
+1. 图片：Fake 分两片返回 TINY_PNG（68B）→ 断言两次 `fsRead`（offset 0/68? 第二片 length 到 eof）、`Image.memory` 出现（`find.byType(Image)`）。
+2. 损坏图片：返回随机字节 → errorBuilder 文案出现。
+3. >32MiB：Fake 报 sizeBytes 大 → 不调用 fsRead、显示"文件过大"。
+4. 文本：返回 UTF-8 中文 → SelectableText 内容匹配。
+5. 雕刻件：displayName==carved_*、信息卡含"偏移"字段与"仅雕刻"。
+6. eof 提前（短交付）：「实际数据短于声明大小」提示出现。
+- [ ] **Step 3: 门禁与提交**（commit `feat(ui): 预览页（图片/文本/信息，雕刻回读与损坏兜底）`）
+
+---
+
+### Task 8: 恢复页（目标选择 / 导出进度 / 报告）
+
+**Files:**
+- Modify: `ui/pubspec.yaml`（+`file_selector`（官方，desktop 支持））
+- Create: `ui/lib/features/recover/{recover_page.dart, recover_controller.dart, report_view.dart}`
+- Create: `ui/test/recover_page_test.dart`
+
+**RecoverController：** `selectTarget()` 用 `file_selector.getDirectoryPath()`；`start()` → `exportStart(taskId, idxs, dir)`；订阅 `export.progress/finished`（按 exportId 过滤）；状态机 `picking → exporting → done(report)|failed|canceled`。目标目录展示预估大小 = `estimatedBytes`；报告页：`succeeded/degraded/failed` 三计数 + 降级/失败清单（reason 文案）+「打开目标文件夹」按钮（`Process.start('xdg-open', [dir])`——桌面 Linux；其他平台 no-op + 文案）。
+
+- [ ] **Step 1: 页面结构（规范级）**
+```
+Scaffold('恢复文件')
+├── 卡片：源任务(T) · 已选 K 项 · 预计 K_b 字节
+├── 目标目录行：路径或「选择目标文件夹…」[选择]（选择后显示 remount 提示：勿选源设备所在盘）
+├── [开始恢复]（未选目录禁用）
+├── 进度区：LinearProgressIndicator(done/total) + '已完成 done/total · writtenBytes'
+│     [取消恢复]
+└── 报告视图（done）：三计数块 + 清单（status 图标/名称/reason）+ [打开目标文件夹] [完成]
+```
+- [ ] **Step 2: recover_page_test.dart**
+1. 未选目录禁用；Fake 返回目录 → 启用；点开始 → `exportStart(taskId, idxs, dir)` 参数断言。
+2. 注入 progress(1/2) → 进度 50%；注入 finished(succeeded1/degraded1/items=[...]) → 报告三计数与清单内容逐字；canceled=true → 「已取消」标题且计数保留。
+3. 错误码映射：Fake 抛 `RpcException(-32006)` → 文案「目标不能是源设备所在的盘，请换一个文件夹」；-32010 → 「目标盘剩余空间不足」。
+4. 取消按钮 → `exportCancel` 调用。
+- [ ] **Step 3: 门禁与提交**（commit `feat(ui): 恢复页（目标选择/导出进度/报告与错误引导）`）
+
+---
+
+### Task 9: 全链路集成测试 + 出口验收
+
+**Files:**
+- Create: `ui/test/export_flow_integration_test.dart`
+- Modify: `.github/workflows/ci.yml`（flutter job 增 `cargo build -p xd-daemon` 前置 + `XD_DAEMON_BIN` 环境）
+- Modify: `scripts/e2e-loop.sh`（环回设备挂载后：export 到挂载点 → 断言 -32006；export 到 tmp → 文件字节比对）
+- Modify: 设计文档/README/计划执行记录
+
+- [ ] **Step 1: export_flow_integration_test.dart（真 daemon，XD_DAEMON_BIN 守卫，全流程）**
+构造 exfat 镜像（Dart 无法建 exfat → **改用既有的测试夹具镜像**：测试从 `crates/xd-fixtures` 预生成的镜像文件？CI 无该文件——**方案：测试前置调用 daemon 自身的……不行。裁定：集成测试把「生成镜像」交给一个 Rust 小工具**：`cargo run -p xd-fixtures --example make_carve_fixture -- <path>`（M1d 增一个 example：生成含 live/删除/雕刻埋点的标准镜像）。测试流程：生成镜像 → 起 daemon → scan(quick) → results → fsRead 首条 → 与实际字节比对 → export ≥1 条到 tempdir → 文件存在且字节精确 → 报告 succeeded≥1。**雕刻链路**：scan(deep) → results 过滤 quality==carved → fsRead 回读 == 埋点原字节。
+- [ ] **Step 2: e2e-loop.sh 增段**：`mount /dev/loopN /mnt/xd-test` → export.start targetDir=/mnt/xd-test/rec → 断言 `-32006`；umount；再 export 到 `$(mktemp -d)` → 断言文件可比对。CI 已有该脚本（Linux 作业）✓。
+- [ ] **Step 3: 全量门禁**：`cargo test --workspace --locked`（debug+release）/clippy/fmt + `cd ui && flutter test && flutter analyze` + `bash scripts/e2e.sh` + `bash scripts/e2e-loop.sh` + 集成测试（daemon binary + XD_DAEMON_BIN）。
+- [ ] **Step 4: 变异抽检**（kill 即通过；逐条记录）：1) `fs_read` 的 `eof` 恒 true/恒 false → 测试 kill；2) `read_file_range` 的 `skip_bytes` 忽略（从 0 读）→ `ranged_read_matches_full_read_slices` kill；3) 雕刻 `read_back` 的 run 界忽略（用设备尾）→ 截断件回读测试 kill；4) 导出重名去重删 → 重名测试 kill；5) 名字 sanitize 删（`..` 直通）→ sanitize 单测 kill；6) 降权调用删（root 直写）→ **单测无法在非 root 验证**：`drop_to_user` 抽纯函数（目标 uid 决策）+ e2e 记录「未验证（需真机 root/pkexec）」；7) `export.cancel` 的 kill 删 → cancel 测试 kill。
+- [ ] **Step 5: 文档与合入**：security 文档（降权子进程模型 + 未验证边界）、README 功能表（三页 + 导出打勾）、设计文档 §4.5 实现注记、计划执行记录；合入 main + push + **CI 逐 job 验证**（`gh run view <id> --json jobs`）；provenance 与发版归用户触发的发布流程。
+
+---
+
+## 验收定义（M1d Done 的判据）
+
+1. 契约 v1.2 双侧断言（13 新 golden + 5 错误码）；Dart typed 模型全覆盖。
+2. 预览/导出全程**分片**读取（引擎 `read_file_range` + 雕刻 `read_back`），无整文件物化路径（>64MiB 预览拒绝有码；导出流式无上限）。
+3. 导出：逐字节精确（集成断言）、降级/失败逐件报告、取消可用、目标盘三重校验（存在/异设备/余量）——异设备校验在 e2e-loop 真环回设备上验证 `-32006`。
+4. 降权子进程模型：非 root 路径全测试覆盖；root/pkexec 路径**标注未验证（需真机）**并与 security 文档一致。
+5. UI 三页 + 报告页：widget 测试覆盖状态机与铁律文案（含"连续假设"零出现的 grep 断言）；集成测试全流程（镜像 → 扫描 → 预览 → 导出）在 CI 可复跑。
+6. 全量门禁绿（rust debug+release、clippy、fmt、flutter test+analyze、e2e.sh、e2e-loop.sh）。
+
+---
+
+© 2026 erik · https://erik.xyz · erik@erik.xyz

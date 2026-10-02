@@ -136,11 +136,14 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon XD_IMAGE=/tmp/xiaodun.img flutt
 ### daemon 命令行
 
 ```
-xd-daemon [--image <path>]...
+xd-daemon [--image <path>]... [--db <path>]
 ```
 
 - 从 stdin 逐行读 JSON-RPC 2.0 请求，逐行向 stdout 回响应；日志与诊断一律走 stderr
 - `--image` 可重复，把镜像文件注册为只读设备（M0 的设备来源）
+- `--db`：扫描任务与结果库（缺省 `$XDG_STATE_HOME/xiaodun/tasks.db`，回退 `~/.local/state/…`；
+  打不开则降级内存库并 stderr 留痕——重启后结果不保留）
+- 扫描经 `scan.start/status/results/pause/resume/cancel` 驱动，`scan.progress/finished` 为服务端通知（契约见 `proto/v1/README.md`）
 - 参数错误或镜像打不开：stderr 输出原因并以退出码 2 结束
 
 ```bash
@@ -171,10 +174,15 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真实 d
 
 ## 项目状态
 
-**M0 地基完成**（v0.1.0）——Rust 核心（IPC 契约 v0、只读镜像后端、stdio daemon）与
-Flutter 骨架（协议模型、设备列表页）已端到端打通，CI 三平台矩阵就位。
-下一步：M1（FAT/exFAT 快速扫描、照片雕刻、Windows 提权打包）。目标：全端 1.0
-约 9-12 个月（5-6 人团队，4 条工作流并行）。
+**M1 进行中**。已完成并发布：
+- **M0 地基**（v0.1.0）：契约 v0、只读镜像后端、stdio daemon、Flutter 骨架、CI 三平台矩阵
+- **M1a / M1a2 / M1e**（v0.2.0）：FAT12/16/32 与 exFAT 只读引擎、Linux 平台层（枚举/提权/打包）
+- **M1b**（本次合入）：契约 v1（`scan.*` 事件流）+ 扫描编排端到端——状态机（暂停/恢复/取消）、
+  崩溃隔离（worker panic 不落 daemon）、SQLite 流式落盘（重启可查/中断恢复）、daemon 并发接线
+  （stdout 串行化、`--db`、懒打开防提权面）
+
+M1 剩余切片：照片雕刻（JPEG/PNG）、扫描/预览/恢复三页 UI、Windows/macOS 平台层与打包。
+目标：全端 1.0 约 9-12 个月（5-6 人团队，4 条工作流并行）。
 
 ---
 

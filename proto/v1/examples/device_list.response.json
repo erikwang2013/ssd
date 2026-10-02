@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":2,"result":{"devices":[{"id":"image:test.img","name":"test.img","kind":"image","sizeBytes":4096,"removable":false,"fsGuess":null},{"id":"unix:/dev/sdb","name":"USB Disk","kind":"physical","sizeBytes":3907029168,"removable":true,"fsGuess":null,"transport":"usb"}]}}

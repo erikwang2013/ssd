@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":5,"method":"scan.results","params":{"taskId":1,"offset":0,"limit":2,"deletedOnly":false}}
