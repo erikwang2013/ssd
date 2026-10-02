@@ -230,6 +230,8 @@ cargo add rusqlite -p xd-core --features bundled
 ```
 （随后把生成的 `rusqlite = "x.y"` 提为 workspace 依赖、xd-core 引 `workspace = true`——与仓库既有依赖风格一致。）
 
+> **执行后同步（T2）**：定版为 rusqlite **0.40.2**（bundled，libsqlite3-sys 0.38.2）。本任务正文代码**非 rustfmt-clean**——`store.rs` 以 rustfmt 后形态为准（语义经 token 级比对：7 处非空白差异全为尾逗号/let-else 展开，68/68 字符串常量逐字相同）。测试清单执行后为 **12 个**（计划 8 + `reinsert_same_key_replaces_row`〔INSERT OR REPLACE 同键替换〕/ `set_progress_roundtrips` / `unknown_state_reads_as_failed` / `entries_and_clear_are_task_scoped`——后三者为 qual 缺口补测，代码以 `store.rs` 为准）。
+
 - [ ] **Step 1: 写 store.rs（完整代码；新文件首行带水印头）**
 
 ```rust
@@ -2586,6 +2588,14 @@ bash scripts/e2e.sh
 - (d) Dart 侧 golden 集合钉死（21 名单全等）。
 - (c) README 补 -32602 文案说明（`Invalid params: <reason>` 中 reason 不属契约；`Cannot open device: <id>` 固定文案）——**其逐字测试归 T5**（无 producer 时不可钉；已加入 T5 测试清单）。
 - 结构欠账（预存）：`linux.rs` 585 行超 500 行规则（T1 +51）——已加入 **T7** 拆分项。
+
+### T2（xd-core::store）—— impl-m1b-t2。提交沿革：`89ad76e`（首版）→ `3a920ef`（spec 缺口补测）→ `399b36e`（qual 缺口补测 + 两注释）→ `a597db4`（注释措辞修正）。DONE → spec **PASS** → qual **APPROVED**（T2 关闭，244/0）
+
+- **计划偏差（仅格式）**：任务正文非 rustfmt-clean（超长签名/`params!` 超 100 列/单行 let-else）与 `cargo fmt --all --check` 门禁冲突 → `cargo fmt --all`（仅 store.rs）。spec 独立复核：token 级比对 7 处非空白差异全为 rustfmt 产物；**68/68 字符串常量（含全部 SQL 文本）字节级相同**——声明成立。
+- **spec 发现**：`INSERT OR REPLACE` 同键替换行为无测试（计划指定、行为正确）→ 补 `reinsert_same_key_replaces_row`（实施者并做 INSERT→非 REPLACE 有牙自证）。附加审计：schema 内省与计划列集精确相等（**无 byte_offset/scan_mode 等未来列** ✓）；外部写入未知 state → `task()` 降级 Failed 不 panic（探针验证）。
+- **qual 变异表（11+3+4 条，收官口径）**：8 KILL；`ORDER BY idx` 删除 **≈等价变异体**（EXPLAIN：PK 索引天然 (task_id,idx) 序；保留作契约保证）；对称交换 `Canceled↔Completed` **预期 NO-KILL**（库内往返自洽；wire 值由 T5 pin）；`u64::MAX` 等极值 round-trip 逐位全等 ✅。真缺口 3 个（set_progress 零覆盖 / 未知态降级无测 / 跨任务隔离弱）→ 全部补测并以定向变异（`?1=?1`、列交换、`unwrap_or` 互换）四条独立复杀闭合。
+- **质量裁定**：`Mutex` 中毒保持 `unwrap`（fail-stop；无用户代码临界区）——注释措辞「监督重启」经 qual 指出无据后改为「任务态由 `mark_interrupted`/`recover_after_restart` 兜底」（`a597db4`）；SQL 注入面=0（`format!` 仅插值编译期常量 `filter`，其余全参数绑定）。
+- **前向残项（记录，不处理）**：`'pending'` 目前无 DB 生产路径（M1c 引入时随测试补）；DB 状态字面量无独立测试（wire 归 T5、字面量由 M1c 迁移测试覆盖——裁定确认无新增风险）。
 
 ---
 
