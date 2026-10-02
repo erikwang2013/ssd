@@ -398,6 +398,21 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_classifies_transport_from_sysfs() {
+        // 假根路径含 /usb → list() 内 canonicalize → classify_transport 应判 Usb
+        // （qual 变异 11 回归：把该归类改成常量 Other 时本测试必须红）。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("usb1");
+        let entry = root.join("class/block/sdb");
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(entry.join("size"), "1000\n").unwrap();
+        let disks = BlockEnumerator::with_root(&root).list().unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].transport, Transport::Usb);
+        assert_eq!(disks[0].device_info().transport.as_deref(), Some("usb"));
+    }
+
+    #[test]
     fn sysfs_transport_classifies_and_none_when_missing() {
         // 假根路径含 /usb（classify_transport 为纯字符串判定）→ 确定性验证
         // canonicalize → classify_transport → 契约字符串 全链；缺失条目 → None。

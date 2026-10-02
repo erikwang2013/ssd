@@ -123,6 +123,38 @@ void expectRpcError(String file, int code, String message) {
 }
 
 void main() {
+  test('golden set is exactly the 21 contract files', () {
+    // 与 Rust 侧 golden_set_is_exactly_the_21_contract_files 对称：
+    // 新增/删除契约文件必须同步两侧测试（flutter test 的 cwd 为 ui/）。
+    final names = Directory(
+      '../proto/v1/examples',
+    ).listSync().map((e) => e.uri.pathSegments.last).toList()..sort();
+    final expected = [
+      'device_list.request.json',
+      'device_list.response.json',
+      'error_device_permission.response.json',
+      'error_task_not_active.response.json',
+      'error_unsupported_fs.response.json',
+      'ping.request.json',
+      'ping.response.json',
+      'scan_cancel.request.json',
+      'scan_cancel.response.json',
+      'scan_finished.notification.json',
+      'scan_pause.request.json',
+      'scan_pause.response.json',
+      'scan_progress.notification.json',
+      'scan_results.request.json',
+      'scan_results.response.json',
+      'scan_resume.request.json',
+      'scan_resume.response.json',
+      'scan_start.request.json',
+      'scan_start.response.json',
+      'scan_status.request.json',
+      'scan_status.response.json',
+    ]..sort();
+    expect(names, expected);
+  });
+
   test('ping request/response goldens decode (protocol=1)', () {
     expect(
       jsonDecode(encodeRequest(id: 1, method: 'ping', params: null)),

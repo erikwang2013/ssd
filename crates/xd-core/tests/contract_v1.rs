@@ -189,12 +189,35 @@ fn scan_finished_notification_matches_golden() {
     assert_eq!(n["method"], serde_json::json!("scan.finished"));
     let state: ScanState = serde_json::from_value(n["params"]["state"].clone()).unwrap();
     assert_eq!(state, ScanState::Completed);
-    // 小写枚举往返（ScanState 全量变体在 pause/resume/cancel 测试中另有覆盖）
+    // 小写枚举往返（六变体全量字面量见 scan_state_all_variants_serialize_to_contract_literals）
     assert_eq!(serde_json::to_value(state).unwrap(), n["params"]["state"]);
     assert_eq!(
         xd_core::notify::notification("scan.finished", n["params"].clone()),
         n
     );
+}
+
+#[test]
+fn scan_state_all_variants_serialize_to_contract_literals() {
+    // v1 契约状态字面量全量（README 状态表）；golden 覆盖 scanning/paused/canceled/completed，
+    // pending/failed 无 golden——双向往返逐字钉死，防枚举变体改名或漏映射。
+    for (state, literal) in [
+        (ScanState::Pending, "pending"),
+        (ScanState::Scanning, "scanning"),
+        (ScanState::Paused, "paused"),
+        (ScanState::Canceled, "canceled"),
+        (ScanState::Completed, "completed"),
+        (ScanState::Failed, "failed"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            serde_json::json!(literal)
+        );
+        assert_eq!(
+            serde_json::from_value::<ScanState>(serde_json::json!(literal)).unwrap(),
+            state
+        );
+    }
 }
 
 #[test]

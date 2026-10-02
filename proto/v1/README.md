@@ -93,7 +93,9 @@ v0 字段不变，**新增 `transport`**：
 | -32004 | 任务状态不允许该操作（`Task not active: <taskId>`） |
 | -32603 | 内部错误（`Internal error`） |
 
-错误 `message` 文案属契约一部分，两侧测试逐字断言。
+错误 `message` 文案属契约一部分，两侧测试逐字断言。特例：`-32602` 的 `message` 形如
+`Invalid params: <reason>`（`reason` 为诊断文本，**不属契约**）；`Cannot open device: <id>`
+为固定文案。
 
 ## golden 文件（21）
 
