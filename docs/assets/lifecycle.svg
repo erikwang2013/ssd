@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 620" width="960" height="620" role="img" aria-label="小盾生命周期：Flutter UI 进程与 xd-daemon 进程从启动、握手、运行到退出的完整生命周期，以及崩溃与 EOF 退出路径">
+  <title>小盾 · 生命周期（UI ↔ daemon）</title>
+  <defs>
+    <marker id="la" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#2E6BE6"/>
+    </marker>
+    <marker id="lag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#9AA7BD"/>
+    </marker>
+  </defs>
+
+  <rect x="8" y="8" width="944" height="604" rx="18" fill="#F7F9FD" stroke="#E3E9F4"/>
+
+  <text x="40" y="46" font-size="20" font-weight="700" fill="#16233F" font-family="system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif">小盾 · 生命周期（UI ↔ daemon）</text>
+  <text x="928" y="46" font-size="11.5" text-anchor="end" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">两个进程，stdio 直连，互不拖垮</text>
+
+  <!-- Lane 1: UI -->
+  <rect x="32" y="72" width="896" height="182" rx="12" fill="#FBFCFE" stroke="#DCE4F2"/>
+  <text x="52" y="98" font-size="12.5" font-weight="700" fill="#2E6BE6" font-family="system-ui, 'PingFang SC', sans-serif">Flutter UI 进程（普通权限）</text>
+
+  <rect x="48" y="118" width="190" height="86" rx="10" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="143" y="146" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">① 启动</text>
+  <text x="143" y="168" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">main() 读环境变量</text>
+  <text x="143" y="185" font-size="10" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">XD_DAEMON_BIN · XD_IMAGE</text>
+
+  <line x1="238" y1="161" x2="261" y2="161" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+
+  <rect x="263" y="118" width="190" height="86" rx="10" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="358" y="146" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">② 拉起 daemon</text>
+  <text x="358" y="168" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">IpcCoreClient.start()</text>
+  <text x="358" y="185" font-size="10" text-anchor="middle" fill="#B4562A" font-family="system-ui, 'PingFang SC', sans-serif">失败 → 错误态 UI</text>
+
+  <line x1="453" y1="161" x2="476" y2="161" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+
+  <rect x="478" y="118" width="190" height="86" rx="10" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="573" y="146" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">③ 运行期</text>
+  <text x="573" y="168" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">请求往返（见「请求周期」图）</text>
+  <text x="573" y="185" font-size="10" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">ping · device.list</text>
+
+  <line x1="668" y1="161" x2="691" y2="161" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+
+  <rect x="693" y="118" width="190" height="86" rx="10" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="788" y="146" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">④ 退出</text>
+  <text x="788" y="168" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">窗口关闭 / 进程结束</text>
+  <text x="788" y="185" font-size="10" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">stdin 管道随之关闭</text>
+
+  <!-- Lane 2: daemon -->
+  <rect x="32" y="288" width="896" height="182" rx="12" fill="#FBFCFE" stroke="#DCE4F2"/>
+  <text x="52" y="314" font-size="12.5" font-weight="700" fill="#2E6BE6" font-family="system-ui, 'PingFang SC', sans-serif">xd-daemon 进程（M1 起以特权运行）</text>
+
+  <rect x="48" y="334" width="190" height="86" rx="10" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="143" y="362" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">① 启动</text>
+  <text x="143" y="384" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">--image 注册镜像设备</text>
+  <text x="143" y="401" font-size="10" text-anchor="middle" fill="#B4562A" font-family="system-ui, 'PingFang SC', sans-serif">参数错误 → exit 2</text>
+
+  <line x1="238" y1="377" x2="261" y2="377" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+
+  <rect x="263" y="334" width="190" height="86" rx="10" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="358" y="362" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">② stdio 主循环</text>
+  <text x="358" y="384" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">逐行读 → handle_request</text>
+  <text x="358" y="401" font-size="10" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">逐行写 stdout · 诊断走 stderr</text>
+
+  <line x1="453" y1="377" x2="476" y2="377" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+
+  <rect x="478" y="334" width="190" height="86" rx="10" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="573" y="362" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">③ 服务运行期</text>
+  <text x="573" y="384" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">每请求回一行响应</text>
+  <text x="573" y="401" font-size="10" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">解析失败 → -32700（流存活）</text>
+
+  <line x1="668" y1="377" x2="691" y2="377" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+
+  <rect x="693" y="334" width="190" height="86" rx="10" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="788" y="362" font-size="12.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">④ 退出</text>
+  <text x="788" y="384" font-size="10.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">stdin EOF → 干净退出</text>
+  <text x="788" y="401" font-size="10" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">exit 0（e2e 实测）</text>
+
+  <!-- 跨进程箭头 -->
+  <line x1="358" y1="204" x2="358" y2="332" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+  <text x="370" y="244" font-size="10.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">Process.start</text>
+  <text x="370" y="260" font-size="10" fill="#7C8DB0" font-family="ui-monospace, monospace">stdio 管道直连</text>
+
+  <line x1="788" y1="204" x2="788" y2="332" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#la)"/>
+  <text x="800" y="244" font-size="10.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">stdin EOF</text>
+  <text x="800" y="260" font-size="10" fill="#7C8DB0" font-family="ui-monospace, monospace">管道关闭触发</text>
+
+  <!-- 退出路径说明 -->
+  <rect x="32" y="492" width="896" height="104" rx="12" fill="#FFFFFF" stroke="#C6D8F7" stroke-width="1.4"/>
+  <text x="52" y="520" font-size="12.5" font-weight="700" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">退出与兜底</text>
+  <text x="52" y="544" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">· daemon 退出（EOF 正常 / 崩溃）→ 客户端 exitCode 回调 _onExit → 所有 pending 请求以 StateError 唤醒 → UI 错误态（可重试）</text>
+  <text x="52" y="566" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">· UI 先于 daemon 结束 → stdin EOF 让 daemon 自行干净退出，不留孤儿进程；测试 watchdog 30 秒兜底防挂死</text>
+  <text x="52" y="586" font-size="11" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 起：daemon 崩溃可由 UI 重启并自检查点续跑（任务状态机）</text>
+</svg>

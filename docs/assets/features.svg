@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 504" width="960" height="504" role="img" aria-label="小盾功能设计：设备与介质、扫描引擎、预览、恢复导出四个功能域，标注 M0 已实现与后续里程碑">
+  <title>小盾 · 功能设计</title>
+
+  <rect x="8" y="8" width="944" height="488" rx="18" fill="#F7F9FD" stroke="#E3E9F4"/>
+
+  <text x="40" y="46" font-size="20" font-weight="700" fill="#16233F" font-family="system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif">小盾 · 功能设计</text>
+  <text x="928" y="42" font-size="11.5" text-anchor="end" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">✓ = M0 已实现（实线）　其余为规划（虚线，标注里程碑）</text>
+
+  <!-- 列头 -->
+  <rect x="32" y="70" width="212" height="42" rx="11" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.5"/>
+  <text x="138" y="97" font-size="14" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">设备与介质</text>
+
+  <rect x="260" y="70" width="212" height="42" rx="11" fill="#EAF7EF" stroke="#34C77B" stroke-width="1.5"/>
+  <text x="366" y="97" font-size="14" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">扫描引擎</text>
+
+  <rect x="488" y="70" width="212" height="42" rx="11" fill="#F1EDFB" stroke="#8B6BE0" stroke-width="1.5"/>
+  <text x="594" y="97" font-size="14" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">预览</text>
+
+  <rect x="716" y="70" width="212" height="42" rx="11" fill="#FFF7E0" stroke="#E0A82E" stroke-width="1.5"/>
+  <text x="822" y="97" font-size="14" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">恢复导出</text>
+
+  <!-- 设备与介质 -->
+  <rect x="32" y="126" width="212" height="52" rx="10" fill="#FFFFFF" stroke="#2E6BE6" stroke-width="1.4"/>
+  <text x="46" y="148" font-size="11.5" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">✓ 只读镜像设备后端</text>
+  <text x="46" y="166" font-size="9.5" fill="#7C8DB0" font-family="ui-monospace, monospace">M0 · ImageFileDevice</text>
+
+  <rect x="32" y="188" width="212" height="52" rx="10" fill="#FFFFFF" stroke="#2E6BE6" stroke-width="1.4"/>
+  <text x="46" y="210" font-size="11.5" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">✓ 只读块设备抽象</text>
+  <text x="46" y="228" font-size="9.5" fill="#7C8DB0" font-family="ui-monospace, monospace">M0 · BlockDevice（无写接口）</text>
+
+  <rect x="32" y="250" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="46" y="272" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">物理设备枚举 · 提权</text>
+  <text x="46" y="290" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · U盘 / 相机卡 / 硬盘</text>
+
+  <rect x="32" y="312" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="46" y="334" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">Android root 块设备</text>
+  <text x="46" y="352" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M4 · /dev/block 直扫</text>
+
+  <rect x="32" y="374" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="46" y="396" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">iOS 备份解析</text>
+  <text x="46" y="414" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M4 · 非扫盘，独立技术线</text>
+
+  <!-- 扫描引擎 -->
+  <rect x="260" y="126" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="274" y="148" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">快速扫描 FAT / exFAT</text>
+  <text x="274" y="166" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · 删除记录恢复</text>
+
+  <rect x="260" y="188" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="274" y="210" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">快速扫描 NTFS / ext4</text>
+  <text x="274" y="228" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M2 · 含覆盖率评估</text>
+
+  <rect x="260" y="250" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="274" y="272" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">APFS 快照恢复</text>
+  <text x="274" y="290" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M3 · 成功率最高路径</text>
+
+  <rect x="260" y="312" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="274" y="334" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">深度雕刻（无元数据恢复）</text>
+  <text x="274" y="352" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 照片 → M2 视频/文档</text>
+
+  <rect x="260" y="374" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="274" y="396" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">恢复质量分级</text>
+  <text x="274" y="414" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · 完整 / 可能损坏 / 仅雕刻</text>
+
+  <!-- 预览 -->
+  <rect x="488" y="126" width="212" height="52" rx="10" fill="#FFFFFF" stroke="#8B6BE0" stroke-width="1.4"/>
+  <text x="502" y="148" font-size="11.5" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">✓ 设备列表页（三态）</text>
+  <text x="502" y="166" font-size="9.5" fill="#7C8DB0" font-family="ui-monospace, monospace">M0 · 加载 / 错误重试 / 列表</text>
+
+  <rect x="488" y="188" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="502" y="210" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">照片网格预览</text>
+  <text x="502" y="228" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · 按需读源盘片段</text>
+
+  <rect x="488" y="250" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="502" y="272" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">文本 / 文件信息</text>
+  <text x="502" y="290" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1</text>
+
+  <rect x="488" y="312" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="502" y="334" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">视频首帧</text>
+  <text x="502" y="352" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M2</text>
+
+  <!-- 恢复导出 -->
+  <rect x="716" y="126" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="730" y="148" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">结果浏览（虚拟化）</text>
+  <text x="730" y="166" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · 万级结果流畅翻页</text>
+
+  <rect x="716" y="188" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="730" y="210" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">异设备导出校验</text>
+  <text x="730" y="228" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · 不落回源设备（红线）</text>
+
+  <rect x="716" y="250" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="730" y="272" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">恢复报告</text>
+  <text x="730" y="290" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M1 · 成功 / 降级 / 失败清单</text>
+
+  <rect x="716" y="312" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="730" y="334" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">免费预览 / 付费导出</text>
+  <text x="730" y="352" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M3 · 商业模式</text>
+
+  <rect x="716" y="374" width="212" height="52" rx="10" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.4" stroke-dasharray="6 5"/>
+  <text x="730" y="396" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">先镜像后恢复</text>
+  <text x="730" y="414" font-size="9.5" fill="#9AA7BD" font-family="ui-monospace, monospace">M5 · 专业版预留</text>
+
+  <text x="480" y="466" font-size="11.5" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">M0 交付的是地基：契约 + 只读设备抽象 + 端到端链路；扫描、预览、恢复自 M1 起逐平台落地</text>
+</svg>

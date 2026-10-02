@@ -46,32 +46,117 @@
 3. TRIM 已执行——部分 SSD 与支持 TRIM 的卡删除后物理不可逆
 4. 覆盖写入过多——发现数据丢失后请**立即停止写入该介质**，这是成功率的头号因素
 
-## 架构
+## 架构设计
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" width="920" alt="小盾架构设计图">
+</p>
+
+核心思路：**UI 与引擎彻底分离**。
+
+- **Flutter UI（普通权限）**只做状态机与展示；所有扫描/恢复逻辑经 `CoreClient` 抽象下行
+- **桌面端**引擎跑在独立的特权 daemon 进程里（stdio 行式 JSON-RPC），UI 崩溃或 daemon 崩溃互不拖垮
+- **移动端**（M4）进程内嵌 FFI——iOS 不允许 spawn 子进程
+- **`proto/v0` 是唯一契约**：Rust 与 Dart 两侧对同一组 golden 样例做解码 + 编码双向断言，改契约必须三处同步
+- **只读铁律由类型系统保证**：`BlockDevice` 没有任何写接口
+
+## 功能设计
+
+<p align="center">
+  <img src="docs/assets/features.svg" width="920" alt="小盾功能设计图">
+</p>
+
+四个功能域按里程碑推进：M0 交付地基（契约 + 只读设备抽象 + 端到端链路），
+扫描、预览、恢复自 M1 起逐平台落地。
+
+## 生命周期
+
+<p align="center">
+  <img src="docs/assets/lifecycle.svg" width="920" alt="小盾生命周期图">
+</p>
+
+两个进程、一条 stdio 管道：UI 拉起 daemon → 握手 → 请求往返 → UI 退出时
+管道关闭、daemon 自行干净退出（不留孤儿进程）；daemon 若异常退出，
+所有 pending 请求以错误唤醒，UI 落错误态可重试。
+
+## 请求周期
+
+<p align="center">
+  <img src="docs/assets/request-cycle.svg" width="920" alt="小盾请求周期图">
+</p>
+
+一次请求就是一行 JSON 的往返：UI 写入 stdin → daemon 逐行处理 → stdout 回写
+→ 客户端按 id 匹配 Completer。10 秒无响应触发超时路径，UI 落错误态。
+
+## 项目结构
 
 ```
-Flutter UI（普通权限）
-  ├─ 桌面：spawn 特权 daemon ← JSON-RPC over stdio / 本地 socket
-  └─ 移动：进程内嵌 FFI（flutter_rust_bridge）
-        │
-        ▼
-Rust core（纯库：零 IPC、零平台耦合）
-```
-
-核心与界面彻底分离：引擎按文件系统拆 crate（NTFS / APFS / ext4 / FAT），
-桌面端引擎跑在独立的特权进程中，界面保持普通权限，崩溃隔离、扫描任务可
-后台续跑。
-
-## 仓库结构
-
-```
-crates/     # Rust workspace：core、device、按 FS 拆分引擎、carving、daemon、ffi
-proto/      # 唯一 IPC 契约（JSON-RPC schema）
-ui/         # Flutter app（全平台同一套）
-fixtures/   # 合成测试镜像 + 生成脚本
-docs/       # 文档与设计
+xiaodun/
+├── crates/                     # Rust workspace
+│   ├── xd-core/                #   RPC 信封 + 处理器（ping / device.list）
+│   ├── xd-device/              #   只读块设备抽象 + 镜像后端（BlockDevice / ImageFileDevice）
+│   ├── xd-daemon/              #   桌面特权进程（stdio JSON-RPC 服务）
+│   └── xd-ffi/                 #   移动端 FFI 占位（M4 接入 flutter_rust_bridge）
+├── proto/v0/                   # IPC 契约 + 5 个 golden 样例（唯一事实源）
+│   └── examples/               #   Rust / Dart 双侧测试的共同断言目标
+├── ui/                         # Flutter 应用（全平台同一套）
+│   ├── lib/core_client/        #   CoreClient 抽象 · 协议模型 · IpcTransport
+│   ├── lib/home_page.dart      #   设备列表页（三态）
+│   └── test/                   #   golden 契约测试 + widget / 集成测试
+├── fixtures/                   # 确定性测试镜像生成脚本
+├── scripts/                    # 端到端冒烟（scripts/e2e.sh）
+├── docs/                       # 设计文档 · 实施计划 · 图示素材
+└── .github/workflows/          # CI：Rust 三平台矩阵 + Flutter job
 ```
 
 详细设计见 [设计文档](docs/superpowers/specs/2026-10-02-xiaodun-design.md)。
+
+## 使用说明
+
+### 环境要求
+
+- **Rust** stable（edition 2024，≥ 1.97）
+- **Flutter** 3.47.5 stable（CI 固定此版本；其他版本未验证）
+
+### 运行桌面应用
+
+```bash
+# 1. 构建 daemon
+cargo build -p xd-daemon
+
+# 2. 生成一个测试镜像（M1 前没有真实设备枚举，先用镜像演示）
+bash fixtures/gen_image.sh /tmp/xiaodun.img 1048576
+
+# 3. 启动 UI：XD_DAEMON_BIN 指向 daemon，XD_IMAGE 把镜像注册为设备
+cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon XD_IMAGE=/tmp/xiaodun.img flutter run -d linux
+```
+
+（Windows 下两个环境变量改用 `$env:XD_DAEMON_BIN = "..\target\debug\xd-daemon.exe"` 语法设置。）
+
+### daemon 命令行
+
+```
+xd-daemon [--image <path>]...
+```
+
+- 从 stdin 逐行读 JSON-RPC 2.0 请求，逐行向 stdout 回响应；日志与诊断一律走 stderr
+- `--image` 可重复，把镜像文件注册为只读设备（M0 的设备来源）
+- 参数错误或镜像打不开：stderr 输出原因并以退出码 2 结束
+
+```bash
+# 直接试一条请求
+echo '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' | ./target/debug/xd-daemon
+```
+
+### 测试
+
+```bash
+cargo test --workspace        # Rust：契约 golden + 处理器 + 集成（含真实二进制黑盒）
+bash scripts/e2e.sh           # 端到端冒烟：构建 → 生成镜像 → 发请求 → 断言
+
+cd ui && flutter test         # UI：协议 golden + widget 测试
+cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真实 daemon 握手用例
+```
 
 ## 路线图
 
@@ -90,16 +175,3 @@ docs/       # 文档与设计
 Flutter 骨架（协议模型、设备列表页）已端到端打通，CI 三平台矩阵就位。
 下一步：M1（FAT/exFAT 快速扫描、照片雕刻、Windows 提权打包）。目标：全端 1.0
 约 9-12 个月（5-6 人团队，4 条工作流并行）。
-
-### M0 快速上手
-
-```bash
-# Rust 侧：全部测试 + 端到端冒烟
-cargo test --workspace
-bash scripts/e2e.sh
-
-# UI 侧：构建 daemon，以镜像设备启动桌面应用（Windows 请用 $env: 语法设置这两个环境变量）
-cargo build -p xd-daemon
-bash fixtures/gen_image.sh /tmp/xiaodun.img 1048576
-cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon XD_IMAGE=/tmp/xiaodun.img flutter run -d linux
-```

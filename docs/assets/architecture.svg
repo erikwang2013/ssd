@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 704" width="960" height="704" role="img" aria-label="小盾架构设计：Flutter UI 经 CoreClient 抽象分桌面 IPC 与移动 FFI 两条通道，向下为 daemon、core、device 三层引擎，右侧为契约与设计原则">
+  <title>小盾 · 架构设计（M0）</title>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#2E6BE6"/>
+    </marker>
+    <marker id="arrGray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 Z" fill="#9AA7BD"/>
+    </marker>
+  </defs>
+
+  <rect x="8" y="8" width="944" height="688" rx="18" fill="#F7F9FD" stroke="#E3E9F4"/>
+
+  <text x="40" y="48" font-size="20" font-weight="700" fill="#16233F" font-family="system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif">小盾 · 架构设计</text>
+
+  <!-- 图例 -->
+  <line x1="628" y1="40" x2="664" y2="40" stroke="#2E6BE6" stroke-width="1.8"/>
+  <text x="672" y="44" font-size="11.5" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">M0 已实现</text>
+  <line x1="768" y1="40" x2="804" y2="40" stroke="#9AA7BD" stroke-width="1.8" stroke-dasharray="5 4"/>
+  <text x="812" y="44" font-size="11.5" fill="#8B97AC" font-family="system-ui, 'PingFang SC', sans-serif">M1+ / M4 规划</text>
+
+  <!-- Flutter UI -->
+  <rect x="60" y="76" width="560" height="92" rx="12" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.6"/>
+  <text x="340" y="112" font-size="16" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">Flutter UI（普通权限）</text>
+  <text x="340" y="138" font-size="12" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">设备选择 · 扫描(M1) · 预览(M1) · 恢复(M1)</text>
+  <text x="596" y="100" font-size="11" text-anchor="end" fill="#7C8DB0" font-family="ui-monospace, monospace">ui/</text>
+
+  <!-- CoreClient 抽象 -->
+  <line x1="340" y1="168" x2="340" y2="196" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="352" y="188" font-size="11" fill="#5B6B85" font-family="ui-monospace, monospace">CoreClient 抽象</text>
+
+  <!-- 两个 transport -->
+  <rect x="60" y="200" width="270" height="92" rx="12" fill="#EAF1FF" stroke="#2E6BE6" stroke-width="1.6"/>
+  <text x="195" y="226" font-size="13.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">IpcCoreClient（桌面）</text>
+  <text x="195" y="248" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">spawn daemon · stdio 行式 JSON-RPC</text>
+  <text x="195" y="266" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">10s 超时 · 断连兜底 · close()</text>
+
+  <rect x="350" y="200" width="270" height="92" rx="12" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="485" y="226" font-size="13.5" font-weight="700" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">FfiCoreClient（移动 · M4）</text>
+  <text x="485" y="248" font-size="11" text-anchor="middle" fill="#8B97AC" font-family="system-ui, 'PingFang SC', sans-serif">进程内 flutter_rust_bridge</text>
+  <text x="485" y="266" font-size="11" text-anchor="middle" fill="#8B97AC" font-family="system-ui, 'PingFang SC', sans-serif">iOS 不允许 spawn 子进程</text>
+
+  <!-- IPC → daemon -->
+  <line x1="195" y1="292" x2="195" y2="330" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="207" y="316" font-size="10.5" fill="#5B6B85" font-family="ui-monospace, monospace">stdio：每行一条 JSON（stdout 纯净）</text>
+
+  <!-- daemon -->
+  <rect x="60" y="334" width="270" height="96" rx="12" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.6"/>
+  <text x="195" y="362" font-size="13.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">xd-daemon（特权进程）</text>
+  <text x="195" y="383" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">--image 注册镜像 · stdio 主循环</text>
+  <text x="195" y="400" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">诊断走 stderr · 提权(M1)</text>
+  <text x="195" y="420" font-size="10.5" text-anchor="middle" fill="#7C8DB0" font-family="ui-monospace, monospace">crates/xd-daemon</text>
+
+  <!-- xd-ffi (planned) -->
+  <rect x="350" y="334" width="270" height="96" rx="12" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="485" y="362" font-size="13.5" font-weight="700" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">xd-ffi（cdylib 占位）</text>
+  <text x="485" y="383" font-size="11" text-anchor="middle" fill="#8B97AC" font-family="system-ui, 'PingFang SC', sans-serif">M4 接入，与 daemon 共用 xd-core</text>
+  <text x="485" y="400" font-size="10.5" text-anchor="middle" fill="#9AA7BD" font-family="ui-monospace, monospace">crates/xd-ffi</text>
+
+  <!-- daemon → core -->
+  <line x1="195" y1="430" x2="195" y2="468" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="207" y="454" font-size="10.5" fill="#5B6B85" font-family="ui-monospace, monospace">handle_request(&amp;ctx, &amp;req)</text>
+
+  <!-- xd-core -->
+  <rect x="60" y="472" width="270" height="88" rx="12" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.6"/>
+  <text x="195" y="500" font-size="13.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">xd-core</text>
+  <text x="195" y="521" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">api：RPC 信封 · 错误码（-32700/-32601）</text>
+  <text x="195" y="538" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">handlers：ping · device.list</text>
+
+  <!-- core → device -->
+  <line x1="195" y1="560" x2="195" y2="598" stroke="#2E6BE6" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="207" y="584" font-size="10.5" fill="#5B6B85" font-family="ui-monospace, monospace">BlockDevice trait（只读）</text>
+
+  <!-- xd-device -->
+  <rect x="60" y="602" width="270" height="84" rx="12" fill="#DCE9FF" stroke="#2E6BE6" stroke-width="1.6"/>
+  <text x="195" y="630" font-size="13.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">xd-device</text>
+  <text x="195" y="651" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">BlockDevice（无任何写接口）</text>
+  <text x="195" y="668" font-size="11" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">ImageFileDevice（只读镜像后端）</text>
+
+  <!-- 介质 -->
+  <rect x="350" y="602" width="270" height="84" rx="12" fill="#F2F5FA" stroke="#9AA7BD" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="485" y="628" font-size="13.5" font-weight="700" text-anchor="middle" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">介质</text>
+  <text x="485" y="649" font-size="11" text-anchor="middle" fill="#8B97AC" font-family="system-ui, 'PingFang SC', sans-serif">M0：镜像文件（测试/开发全脱开硬件）</text>
+  <text x="485" y="668" font-size="11" text-anchor="middle" fill="#8B97AC" font-family="system-ui, 'PingFang SC', sans-serif">M1+：U盘 · 相机卡 · 硬盘（虚线）</text>
+
+  <!-- proto 契约 -->
+  <rect x="660" y="200" width="240" height="120" rx="12" fill="#FFF7E0" stroke="#E0A82E" stroke-width="1.6"/>
+  <text x="780" y="228" font-size="13.5" font-weight="700" text-anchor="middle" fill="#6B4E00" font-family="system-ui, 'PingFang SC', sans-serif">proto/v0（IPC 契约）</text>
+  <text x="780" y="250" font-size="11" text-anchor="middle" fill="#8A6A1A" font-family="system-ui, 'PingFang SC', sans-serif">唯一事实源 · JSON-RPC 2.0</text>
+  <text x="780" y="270" font-size="11" text-anchor="middle" fill="#8A6A1A" font-family="system-ui, 'PingFang SC', sans-serif">5 个 golden 样例</text>
+  <text x="780" y="290" font-size="11" text-anchor="middle" fill="#8A6A1A" font-family="system-ui, 'PingFang SC', sans-serif">Rust / Dart 双侧断言</text>
+  <line x1="660" y1="240" x2="620" y2="226" stroke="#E0A82E" stroke-width="1.3" stroke-dasharray="5 4"/>
+  <line x1="660" y1="270" x2="620" y2="356" stroke="#E0A82E" stroke-width="1.3" stroke-dasharray="5 4"/>
+
+  <!-- 设计原则 -->
+  <rect x="660" y="348" width="240" height="338" rx="12" fill="#FFFFFF" stroke="#C6D8F7" stroke-width="1.4"/>
+  <text x="780" y="378" font-size="13.5" font-weight="700" text-anchor="middle" fill="#16233F" font-family="system-ui, 'PingFang SC', sans-serif">设计原则</text>
+  <text x="680" y="408" font-size="11.5" fill="#2E6BE6" font-weight="700" font-family="system-ui, 'PingFang SC', sans-serif">① 只读铁律</text>
+  <text x="680" y="427" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">BlockDevice 无写接口，</text>
+  <text x="680" y="444" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">导出校验不落回源设备。</text>
+  <text x="680" y="474" font-size="11.5" fill="#2E6BE6" font-weight="700" font-family="system-ui, 'PingFang SC', sans-serif">② 进程隔离</text>
+  <text x="680" y="493" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">daemon 崩溃不拖 UI，</text>
+  <text x="680" y="510" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">pending 请求以错误唤醒。</text>
+  <text x="680" y="540" font-size="11.5" fill="#2E6BE6" font-weight="700" font-family="system-ui, 'PingFang SC', sans-serif">③ 契约冻结</text>
+  <text x="680" y="559" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">改契约 = 改 golden +</text>
+  <text x="680" y="576" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">两侧测试，防漂移。</text>
+  <text x="680" y="606" font-size="11.5" fill="#2E6BE6" font-weight="700" font-family="system-ui, 'PingFang SC', sans-serif">④ UI 只做状态机</text>
+  <text x="680" y="625" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">扫描/恢复逻辑不进 Dart，</text>
+  <text x="680" y="642" font-size="11" fill="#5B6B85" font-family="system-ui, 'PingFang SC', sans-serif">全部经 CoreClient 下行。</text>
+</svg>
