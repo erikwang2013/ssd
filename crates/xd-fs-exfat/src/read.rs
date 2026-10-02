@@ -310,9 +310,9 @@ mod tests {
 
     #[test]
     fn deleted_contiguous_middle_occupied_truncates_prefix() {
-        // qual-t4 G2：连续删除项中段簇被复用（位图置位）→ 逐簇门控截断在 4096B、分级降级
-        // （连续车道的位图把关，与链式车道的 stale 链把关分属两路）
-        let data: Vec<u8> = (0..8192u32).map(|i| (i % 239) as u8).collect();
+        // qual-t4 G2（minor 补强：占 3 簇的**中段**）：逐簇门控必须 stop 不能 skip——跳过被占簇
+        // 续读会交付 8192 = 簇 6+8 错位数据；分级同步降级（连续车道=位图把关，链式车道=stale 链把关）
+        let data: Vec<u8> = (0..12288u32).map(|i| (i % 239) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
             .add_file("/", "G.BIN", &data)
             .delete("/", "G.BIN")
@@ -619,12 +619,13 @@ mod tests {
 
     #[test]
     fn live_polluted_lengths_stay_chain_bounded() {
-        // qual-t4 G3：live 链式单簇 [253]、VDL/DL 均污染成 12288（need=3）→ 交付只来自链上实簇：
+        // qual-t4 G3：live 链式单簇 [100]、VDL/DL 均污染成 12288（need=3）→ 交付只来自链上实簇：
         // 恰 4096B（== 真数据），绝不按 DL 放大或连续猜读（链界住）。live 无 refix → 质量断言略。
-        // （若只污染 DL，VDL=4096 会先行截断，"恰 4096"就丧失判别力——故两条长度一起污染）
+        // （只污染 DL 时 VDL 先行截断，"恰 4096"丧失判别力——两条长度一起污染；簇位取堆中段 100，
+        // 101/102 在设备内可读 ⇒ 判别落在簇源=链，不靠"簇在设备外早停"）
         let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let image = xd_fixtures::ExfatImageBuilder::new()
-            .add_file_in_clusters("/", "L.BIN", &data, &[253], false)
+            .add_file_in_clusters("/", "L.BIN", &data, &[100], false)
             .build();
         let mut patched = image.clone();
         let stream = SET + 32;
