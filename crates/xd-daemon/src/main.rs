@@ -6,6 +6,8 @@
 //! （缺省 XDG state 路径，打开失败降级内存库并 warn）。
 
 #[cfg(target_os = "linux")]
+mod export_worker;
+#[cfg(target_os = "linux")]
 mod privcheck;
 
 use std::io::{BufRead, Write};
@@ -36,12 +38,25 @@ fn default_db_path() -> Option<PathBuf> {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // 导出子进程模式（父 daemon `spawn 自身 --export-worker …` 拉起）：首参即分派，
+    // 不进常规 arg 循环（参数集与 CLI 不重叠）；语义与权限序见 export_worker 模块头注。
+    if argv.first().map(String::as_str) == Some("--export-worker") {
+        match export_worker::parse_args(&argv[1..]) {
+            Ok(a) => std::process::exit(export_worker::run(a)),
+            Err(msg) => {
+                eprintln!("error: --export-worker: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
     let mut db_path: Option<PathBuf> = None;
     // 提权兜底路径（pkexec 以 root 拉起）的准入判定，见 docs/security/linux-privilege-model.md。一次 /proc 读。
     #[cfg(target_os = "linux")]
     let euid = privcheck::effective_uid();
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--image" => {
