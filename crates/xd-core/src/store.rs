@@ -1,6 +1,14 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 //! 扫描任务与结果的 SQLite 持久化（设计 §4.4.4：流式落盘、分页查询、崩溃/重启后可查）。
-//! 单进程单连接（`Mutex<Connection>`）：daemon 是唯一写者，不开 WAL。
+//! 单进程单连接（`Mutex<Connection>`）：daemon 是唯一写者。
+//!
+//! **写放大与崩溃语义（T7 阶段三量化选型 b）：** `journal_mode=WAL` + `synchronous=NORMAL`。
+//! 旧配置（DELETE 日志 + FULL）每条目一次 fsync ≈ 7.2ms → ext4 实测 513 条目 **139 条/秒**
+//! （3.68s，与 qual-m1b-t6 的 6.9ms 同源）；WAL+NORMAL 同调用形态 **12512 条/秒**（41ms，90×），
+//! 优于 worker 侧小批量（64 条/事务）形态的 7075 条/秒。崩溃语义声明：
+//! **daemon 进程崩溃零丢失**（已提交事务在 WAL 里，重开即恢复）；**掉电/OS 崩溃可能丢最后一次
+//! checkpoint 之后的提交**（库恒一致；扫描结果可由重扫再得——源设备只读，结果非独有数据）。
+//! 内存库不受影响（pragma 落 "memory" 模式）。
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -94,6 +102,10 @@ impl Store {
 
     fn init(&self) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
+        // 写放大（T7 阶段三量化选型 b，理由与崩溃语义见模块头注）：条目插入走 WAL 提交
+        //（无逐条 fsync）——ext4 实测 139 → 12512 条/秒。内存库上此 pragma 落 "memory" 模式，
+        // 语义不变。
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tasks (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -369,6 +381,48 @@ mod tests {
             first_cluster: 6 + idx as u32,
             byte_offset: None,
         }
+    }
+
+    #[test]
+    fn wal_normal_crash_semantics_declared() {
+        // T7 阶段三选型 b 的可执行声明（模块头注的崩溃语义）：
+        // 1) 文件库必须真在 WAL + synchronous=NORMAL——谁退回 DELETE/FULL（139 条/秒），此测先红；
+        // 2) daemon 进程崩溃零丢失：连接**未干净关闭**（mem::forget 模拟 —— WAL 未 checkpoint
+        //    回主库）后重开，已提交条目即见（WAL 恢复）。别拿它声明掉电语义：掉电可能丢最后
+        //    checkpoint 之后的提交（库恒一致；条目可由重扫再得）。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.db");
+        let id = {
+            let s = Store::open(&path).unwrap();
+            let (mode, sync): (String, i64) = s
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT (SELECT * FROM pragma_journal_mode), (SELECT * FROM pragma_synchronous)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(mode, "wal", "文件库必须在 WAL（写放大修复的承重点）");
+            assert_eq!(
+                sync, 1,
+                "synchronous=NORMAL=1；FULL=2 会把每条目 fsync 带回来"
+            );
+            let id = s.create_task("d", "exfat", "deep", 9).unwrap();
+            s.insert_entries(id, &[entry(0, "LANDED.JPG", true)])
+                .unwrap();
+            std::mem::forget(s); // 崩溃模拟：不关闭连接（无 checkpoint、无 journal 清理）
+            id
+        };
+        let s2 = Store::open(&path).unwrap();
+        let (total, page) = s2.entries(id, 0, 10, false).unwrap();
+        assert_eq!(
+            (total, page[0].name.as_str()),
+            (1, "LANDED.JPG"),
+            "已提交条目必须跨未干净关闭存活（WAL 恢复）"
+        );
+        assert_eq!(s2.task(id).unwrap().unwrap().state, ScanState::Scanning);
     }
 
     #[test]

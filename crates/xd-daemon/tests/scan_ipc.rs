@@ -6,8 +6,11 @@
 //! 存活；4) SIGKILL 中断 → failed（paused 保留）；5) EACCES → -32001；7) XDG 优先于 HOME。
 //! 6) 的裁定：progress 发射分支（250ms 节流）不做 CI 钉死——只做 `elapsedMs` 语义 + 数量 ≤ 条目数
 //! 的弱判别（真机手测清单另记）；大介质难入 CI。
-//! 慢镜像（[`slow_fat_image_bytes`]，每条目一次 fsync，ext4 上 ~3.5s）是 IPC 层撑开「扫描中」
-//! 窗口的唯一手段（T5 的 SlowDev 是进程内 testutil，IPC 层不可用）。
+//! 慢镜像（[`slow_fat_image_bytes`]，513 条目的 FAT16）是 IPC 层撑开「扫描中」窗口的唯一手段
+//! （T5 的 SlowDev 是进程内 testutil，IPC 层不可用）。**窗口量级（T7 阶段三后）**：落库
+//! 12512 条/秒（WAL+NORMAL，见 `store.rs` 头注）⇒ 513 条目 ≈ 41ms，仍 ≫ 一次 IPC 往返
+//! （亚毫秒）——cancel/SIGKILL 的时序裕度 ~100×。旧注释曾记「每条目 fsync ~3.5s」，那是
+//! T7 前 DELETE+FULL 的账，已随选型 b 作废。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -125,7 +128,8 @@ fn exfat_image_bytes() -> Vec<u8> {
 
 /// 慢扫镜像：FAT16 基础镜像（DCIM 一级子目录 + 一条删除文件），再把根目录区补满
 /// 511 条 `0xE5` 首字节的删除项（槽 0 留给 builder 写的 DCIM）——共 513 条目。
-/// 每条目在 worker 里一次 fsync 落库（T6 实测 ~6.9ms/条，ext4 全图 ~3.5s）：
+/// 每条目在 worker 里一次落库（T7 阶段三后 12512 条/秒 ⇒ 全图 ~41ms；T7 前的 DELETE+FULL
+/// 是 ~6.9ms/条、全图 ~3.5s——窗口量级仍 ≫ IPC 往返，见文件头注）：
 /// cancel（增补 2）/ SIGKILL（增补 4）的「扫描中」窗口 ≫ 一次 IPC 往返，靠它成立。
 fn slow_fat_image_bytes() -> Vec<u8> {
     let mut b = xd_fixtures::FatImageBuilder::fat16();
@@ -295,7 +299,7 @@ fn pause_resume_over_ipc() {
 }
 
 /// 增补 2：cancel 于扫描中 → ScanCanceled hook 静默（stderr 无 `panicked`）+ finished=canceled
-/// 证明取消真发生。慢镜像（本机实测：513 条目 / 3.5s）把「扫描中」窗口撑到 ≫ 一次 IPC 往返，
+/// 证明取消真发生。慢镜像（513 条目 ≈ 41ms 纯落库，T7 阶段三量化）把「扫描中」窗口撑到 ≫ 一次 IPC 往返，
 /// 故严格断言 canceled（非二态）；cancel 通常在**首个检查点**即落地（foundCount 尚 0）——
 /// 响应 ok=canceled + finished=canceled 即证明 worker 在场且被取消，而非跑完或没跑。
 #[test]
@@ -440,6 +444,7 @@ fn sigkill_mid_scan_leaves_failed_and_keeps_paused() {
             "慢镜像未撑住窗口：kill 前已有任务跑完（{v}）"
         );
     }
+    // 窗口量级：A 的 513 条目 ≈ 41ms 落库（WAL+NORMAL）vs kill 紧随响应（µs 级）——裕度 ~100×。
     child.kill().unwrap(); // Unix 上即 SIGKILL
     let _ = child.wait();
 
