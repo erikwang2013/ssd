@@ -2539,9 +2539,31 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 - [ ] **Step 4: 运行** → **13 passed**（累计 crate **55**；本任务 12 + live 校验和降级 1）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 扫描与质量分级（位图权威/texFAT 选表/根失败即 Err）`
 
+**执行记录（2026-10-02）**：实施提交 `1363d7f`（55/168；偏离 3 条：let-chain×2、删未用 `FAT_B`、fmt——**T6 需重引入 `FAT_B`**）。
+
+**修复轮（qual-t5，2026-10-02）**：质量审查 2 Important + 6 Minor + 补发 R1/R2/R3，修复提交 `9a7c3b1` + 终修 `d82b5bd`：
+
+- **I1（分配放大）**：`grade_deleted` 连续回退仅受 count（≤4.29e9）与 u64 dl 约束、无闸（`read_subdir_bytes` 有 64MiB 帽而它没有）——
+  污染 dl 可放大到 GB 级分配（实测 2e7 簇→80MB/2.6s，外推 17GB）。修：**起点界卫 + `need > reachable` 界卫 + 流式 is_free
+  （不物化簇表）**；微基准 100M 簇旧 400MB/329ms → 新 42ns 零分配。**实施者补的起点界卫**（fc>count+1 时原式
+  减法 debug 下溢）经测试第二臂钉住。差分探针 15/15 证明新旧语义等价。
+- **I2（T5/T6 判据分歧）**：T6 计划 `chain_free` 查**整条链**而 T5 只判 `chain[..need]`——分歧行（链尾占用）T5 说
+  Complete、T6 却回退连续丢一半数据。**T6 计划文本已修（见 Task 6 修订注）**；T5 侧链切片语义由终修测试钉住。
+- **M1 根双读**：`load_bitmap_from_specials`（scan 复用根快照）+ `load_bitmap` wrapper 留 T6；记账设备测试证明根各读 1 次。
+- **M3（live 目录坏校验和）**：裁定**保持 Complete**（子项枚举成功已独立验证流扩展；时间戳/名字损坏不影响可恢复性）+ 注释 + 测试钉住。
+- **M5**：+8 测试（MAX_DEPTH/ENTRIES 直调语义、40 层深嵌套 e2e、bitmap dl 双向越界、read_subdir 双闸、I1 构型、M1 记账、M3、终修两件）。
+- **M6**：两处不可达注释（fc<2 臂、入口 MAX_ENTRIES）。
+- **转注（M1b/M2/M1d）**：多簇子目录链回退覆盖边界（builder 恒 1 簇）；隐藏文件 ext 惯例（`.gitignore→"gitignore"`，与 M1a 注 5 同源）；
+  `RecoverQuality/ExfatEntry` 文档补全两引擎同批（M1b）；fixtures 未来可 re-export `entry_set_checksum` 去重测试折叠器。
+- **决策（qual R1.6）**：**不给 `ExfatEntry` 加 `name_verified` 字段**——该信号混淆"跳过校验"与"校验失配"两态，
+  M1b 若需 UI 角标先拆两态再设计。T6 字段消费：`size_bytes/data_length/first_cluster/contiguous/deleted`。
+- **T6 必办**：移除 `load_bitmap` 的 `#[allow(dead_code)]`（暂置因 -D warnings）。
+
+计数：crate **65**、workspace **178**（T5 关闭时）。
+
 ---
 
-### Task 6: xd-fs-exfat —— 文件读取（read_file，追加到 scan.rs）
+### Task 6: xd-fs-exfat —— 文件读取（read.rs 拆分版）
 
 **策略（对齐 M1a 判例 + brief §4.2）**：
 - `size = ValidDataLength`（交付长度；`[VDL,DL)` **绝不交付**——那是未初始化区）；`need` 由 `DataLength` 定拓扑。
@@ -2550,7 +2572,57 @@ fn grade_deleted(boot: &ExfatBoot, fat: &Fat32, bitmap: Option<&Bitmap>, e: &Par
 - 删除链式 → 链可用且簇空闲（位图为准）→ 用 stale 链；否则连续；再按位图**截断到首个被占用簇之前**（保守前缀）。
 - 读循环：Err/0 → break；短读只收前缀；`truncate(size)`；`with_capacity(size.min(簇数×cb))`。
 
-- [ ] **Step 1: 测试（追加到 scan.rs 测试模块）**
+**修订注（qual-t5 后，派发前必读）**——下方 Step 1/3 代码块为 T6 初稿，按下列修订落地：
+
+1. **拆分（qual-t5 M2/R3）**：新建 `crates/xd-fs-exfat/src/read.rs` = `read_file` + 其 9 测试 + `resolve_clusters`（见下）
+   + 从 scan.rs **迁入** `pick_bitmap` / `load_bitmap_from_specials` / `load_bitmap`（含其测试）；scan.rs 加
+   `pub use crate::read::read_file;`（**`xd_fs_exfat::scan::read_file` 路径不变，T7 计划零改动**）。
+   迁后 scan.rs ≈470 行、read.rs ≈330 行（两文件均 <500，M1a 注 11 同款 recipe）。
+2. **I2 修正（必改）**：删除项链可用性只查**前缀** `chain[..need]`——查整链会在"链尾被占"时回退连续、丢一半
+   可恢复数据（qual-t5 探针：T5 判 Complete 而 T6-as-planned 只交付 4096/8192）。
+3. **I1 对齐（必改）**：簇定位抽 `resolve_clusters`（三处共用；放 read.rs）：
+```rust
+/// 簇定位（read_subdir_bytes / grade_deleted / read_file 三处共用）。
+/// contiguous ⇒ 连续（NoFatChain 规范保证）；否则链覆盖 need 才用链，短/坏链退连续。
+/// None ⇔ 起点非法或 need 超出可达簇数 → 调用方各自降级。只定位、不物化连续段（qual-t5 I1）。
+pub(crate) enum Resolved {
+    Chain(Vec<u32>),
+    Contiguous { first: u32, n: u64 },
+}
+
+pub(crate) fn resolve_clusters(
+    boot: &ExfatBoot,
+    fat: &Fat32,
+    first_cluster: u32,
+    need: u64,
+    contiguous: bool,
+) -> Option<Resolved> {
+    let max_cluster = boot.cluster_count as u64 + 1;
+    if !(2..=max_cluster).contains(&(first_cluster as u64)) {
+        return None;
+    }
+    let reachable = max_cluster - first_cluster as u64 + 1;
+    if need == 0 || need > reachable {
+        return None;
+    }
+    if !contiguous
+        && let Ok(chain) = fat.chain(first_cluster)
+        && chain.len() as u64 >= need
+    {
+        return Some(Resolved::Chain(chain));
+    }
+    Some(Resolved::Contiguous { first: first_cluster, n: need })
+}
+```
+   `read_file` 消费：`None → Ok(空)`；`Chain → 逐簇读 chain[..need]`；`Contiguous → 逐簇 first+i`（**不物化**）；
+   删除项位图截断改**流式 break**（替代先物化再 truncate）。scan.rs 的 `read_subdir_bytes`/`grade_deleted` 可同批
+   改用该 helper——行为必须与现 9a7c3b1 逐例一致（差分探针 15 例即回归网）。
+4. **T6 测试适配**：`FAT_B` 在 read.rs 测试模块**重新定义**（= 24*512）；`wild_first_cluster_bounded_not_panic`
+   的 10 字段手构不变；其余测试若遇 T4/T5 新增门槛（如 vdl≤dl）按同义修正并报告。
+5. **移除** `load_bitmap` 上的 `#[allow(dead_code)]`（迁入后即有调用者）。
+6. 计数：crate 65 → **74**（+9）、workspace 178 → **187**。
+
+- [ ] **Step 1: 测试（`read.rs` 测试模块）**
 
 ```rust
     #[test]
@@ -2757,7 +2829,7 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
 }
 ```
 
-- [ ] **Step 4: 运行** → **9 passed**（累计 crate **64**；workspace 相应 +9）
+- [ ] **Step 4: 运行** → **9 passed**（累计 crate **74**；workspace 相应 +9 → 187）
 - [ ] **Step 5: Commit** `feat(fs-exfat): 文件读取（连续/链/stale 链 + 位图截断前缀、VDL 交付）`
 
 ---
@@ -2833,7 +2905,7 @@ fn deleted_chained_photo_recovered_byte_exact() {
 }
 ```
 
-- [ ] **Step 2: 运行** → crate **66 passed**（64 + 2）
+- [ ] **Step 2: 运行** → crate **76 passed**（74 + 2）
 
 - [ ] **Step 3: 生成示例**
 
