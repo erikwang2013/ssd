@@ -131,10 +131,11 @@ Expected: 编译失败（`FatImageBuilder` 未定义）。
 ```rust
 //! 合成 FAT 镜像构建器：测试与 e2e 的全部输入来源（脱开真实硬件）。
 //! 参数固定（T1 只支持 FAT16；T2 扩展 FAT12/32）：bps=512、spc=1、reserved=1、
-//! fats=1、root_entries=512、fat_size=4 扇区、total=4096 扇区（2 MiB）。
+//! fats=1、root_entries=512、fat_size=17 扇区、total=4224 扇区（≈2.1 MiB）。
+//! 4174 数据簇 ≥ 4085 → 按微软簇数规则也是真 FAT16（避免真实驱动判为 FAT12）。
 
 pub const BPS: u32 = 512; // bytes per sector
-pub const TOTAL_SECTORS: u32 = 4096;
+pub const TOTAL_SECTORS: u32 = 4224;
 
 #[derive(Clone)]
 struct BuildFile {
@@ -181,9 +182,9 @@ impl FatImageBuilder {
         //  0        reserved / 引导扇区
         //  1..5     FAT#1（4 扇区）
         //  5..37    根目录（512 项 × 32B = 32 扇区）
-        //  37..    数据区（簇 N → 扇区 37 + (N-2)）
+        //  50..    数据区（簇 N → 扇区 50 + (N-2)，共 4174 簇）
         const FAT_START: u32 = 1;
-        const FAT_SIZE: u32 = 4;
+        const FAT_SIZE: u32 = 17;
         const ROOT_START: u32 = FAT_START + FAT_SIZE; // 5
         const ROOT_SECTORS: u32 = 32;
         const DATA_START: u32 = ROOT_START + ROOT_SECTORS; // 37
@@ -363,7 +364,7 @@ impl FatType {
     fn layout(self) -> (u16, u32, u32, u32, u32) {
         match self {
             FatType::Fat12 => (224, 2, 1, 0, 1024),
-            FatType::Fat16 => (512, 4, 1, 0, 4096),
+            FatType::Fat16 => (512, 17, 1, 0, 4224),
             FatType::Fat32 => (0, 64, 32, 2, 2048),
         }
     }
@@ -659,8 +660,8 @@ mod tests {
         assert_eq!(bpb.root_entry_count, 512);
         assert_eq!(bpb.root_cluster, 0);
         // data_start = 1 + 1*4 + 32 = 37 扇区
-        assert_eq!(bpb.data_start_sector, 37);
-        assert_eq!(bpb.total_sectors, 4096);
+        assert_eq!(bpb.data_start_sector, 50);
+        assert_eq!(bpb.total_sectors, 4224);
     }
 
     #[test]
@@ -707,10 +708,10 @@ mod tests {
         let image = xd_fixtures::FatImageBuilder::fat16().build();
         let (_f, dev) = device_with(&image);
         let bpb = parse(&dev).unwrap();
-        assert_eq!(bpb.cluster_to_sector(2), 37);
-        assert_eq!(bpb.cluster_to_sector(3), 38);
+        assert_eq!(bpb.cluster_to_sector(2), 50);
+        assert_eq!(bpb.cluster_to_sector(3), 51);
         assert_eq!(bpb.cluster_bytes(), 512);
-        assert_eq!(bpb.data_cluster_count(), 4059);
+        assert_eq!(bpb.data_cluster_count(), 4174);
     }
 }
 ```
