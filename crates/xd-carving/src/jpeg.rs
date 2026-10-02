@@ -222,7 +222,8 @@ mod tests {
 
     #[test]
     fn stuffed_bytes_and_restart_markers_do_not_end_scan() {
-        // 熵段含 FF00 转义、FFD0/FFD7 RST、FF FF 填充回退：均不得误判结束，EOI 在最后
+        // 熵段含 FF00 转义、FFD0/FFD7 RST、FF FF 填充回退：均不得误判结束；
+        // 尾部 FF FF D9：填充 + EOI（删回退则把 FF 当熵字节吞掉、错过 EOI）
         let base = xd_fixtures::mini_jpeg(0);
         let mut j = base[..base.len() - 2].to_vec(); // 去掉 EOI
         j.extend_from_slice(&[
@@ -231,7 +232,7 @@ mod tests {
             0xFF, 0xFF, 0x00, 0xAA, // 填充 FF + 转义 FF00
             0xFF, 0xD7, 0xAA, // RST7
         ]);
-        j.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        j.extend_from_slice(&[0xFF, 0xFF, 0xD9]); // 填充 FF + EOI
         let mut img = vec![0u8; 256];
         img[..j.len()].copy_from_slice(&j);
         let (_f, dev) = dev_for(&img);
@@ -247,6 +248,7 @@ mod tests {
         j.extend_from_slice(&[
             0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
         ]); // SOF0 len=11
+        j.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x02]); // COM len=2（极小段：零段体）
         j.extend_from_slice(&[0xFF, 0xD9]); // EOI（无 SOS）
         let mut img = vec![0u8; 64];
         img[..j.len()].copy_from_slice(&j);
@@ -344,5 +346,29 @@ mod tests {
         let r = carve_jpeg(&mut cur, 4096).unwrap();
         assert!(!r.complete && r.len == 4096, "填充长跑不得突破上限：{r:?}");
         assert_eq!(cur.pos, 4096, "填充循环必须上限即停");
+    }
+
+    #[test]
+    fn cap_exactly_full_length_stays_complete() {
+        // cap 恰等于完整 JPEG 长度：EOI 在 cap 内收束 → 必须仍 complete
+        // （出口归一用 `>` 而非 `>=`；`>=` 语义下此测必红）
+        let j = xd_fixtures::mini_jpeg(1000);
+        let mut img = vec![0u8; 4096];
+        img[100..100 + j.len()].copy_from_slice(&j);
+        let (_f, dev) = dev_for(&img);
+        let r = carve_all(&dev, 100, img.len() as u64, j.len() as u64).unwrap();
+        assert!(
+            r.complete && r.len == j.len() as u64,
+            "恰满上限不得误判截断：{r:?}"
+        );
+    }
+
+    #[test]
+    fn cap_clamps_segment_header_overshoot() {
+        // cap=5，段头读到第 6 字节才判段长非法（len=0）→ 未归一化时返回 len=6；出口归一钳到 5
+        let img = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x00, 0x00, 0x00];
+        let (_f, dev) = dev_for(&img);
+        let r = carve_all(&dev, 0, img.len() as u64, 5).unwrap();
+        assert!(r.len == 5 && !r.complete, "段中头越限必须钳到上限：{r:?}");
     }
 }
