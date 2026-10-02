@@ -123,6 +123,15 @@ impl BlockDevice for LinuxBlockDevice {
         }
         Ok(done)
     }
+
+    /// 覆写：fstat **已打开的 fd**（不重开路径、无写路径——只读铁律不破），取 `st_rdev`。
+    /// 导出目标同盘校验（-32006）的源侧事实。
+    fn source_rdev(&self) -> Option<(u64, u64)> {
+        self.file
+            .metadata()
+            .ok()
+            .map(|md| major_minor(std::os::unix::fs::MetadataExt::rdev(&md)))
+    }
 }
 
 #[cfg(test)]

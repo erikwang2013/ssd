@@ -35,6 +35,20 @@ impl FsKind {
     }
 }
 
+/// 反解析（导出子进程按 task 行的 `fs` 字符串重建；未知值 → `ProbeError::Unsupported`
+/// ——载体是既有「不支持的卷」错误，调用侧一律当致命处理）。
+impl std::str::FromStr for FsKind {
+    type Err = ProbeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fat" => Ok(FsKind::Fat),
+            "exfat" => Ok(FsKind::Exfat),
+            _ => Err(ProbeError::Unsupported),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ProbeError {
     Unsupported,
@@ -268,6 +282,18 @@ impl ScanManager {
 
     pub fn status(&self, id: u64) -> Result<TaskRow, ScanError> {
         self.store.task(id)?.ok_or(ScanError::TaskNotFound(id))
+    }
+
+    /// 与 manager 共享同一 `Arc<Store>`（daemon 侧把 store 交给 `ExportManager` 用；
+    /// 子进程经 `--db` 另开只读连接，见 `store::open_read_only`）。
+    pub fn store_arc(&self) -> Arc<Store> {
+        self.store.clone()
+    }
+
+    /// 单条目点查（`fs.read` 用）：缺任务/缺 idx 一律 `None`——调用侧先 `status` 以区分
+    /// -32003 与 -32008。
+    pub fn entry(&self, id: u64, idx: u64) -> Result<Option<ScanEntry>, StoreError> {
+        self.store.entry(id, idx)
     }
 
     pub fn results(

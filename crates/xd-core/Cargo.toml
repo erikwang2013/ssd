@@ -13,6 +13,7 @@ xd-carving = { path = "../xd-carving" }
 xd-fs-exfat = { path = "../xd-fs-exfat" }
 xd-fs-fat = { path = "../xd-fs-fat" }
 base64 = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

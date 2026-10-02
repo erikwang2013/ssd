@@ -439,6 +439,7 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -453,6 +454,7 @@ dependencies = [
 name = "xd-daemon"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "serde_json",
  "tempfile",
  "xd-core",

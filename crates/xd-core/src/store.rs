@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::api::{ScanEntry, ScanState};
 
@@ -99,6 +99,17 @@ impl Store {
         };
         s.init()?;
         Ok(s)
+    }
+
+    /// 只读打开（导出子进程用）：**不跑 init()/迁移**——schema 由 daemon 的常规打开负责；
+    /// 子进程在降权前调用（fd/shm 均以父权限建立，降权后连接只读亦可用）。
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            conn: Mutex::new(Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?),
+        })
     }
 
     fn init(&self) -> Result<(), StoreError> {
@@ -371,6 +382,33 @@ impl Store {
         Ok((total as u64, out))
     }
 
+    /// 单条目点查（导出按 idx 取值）：缺 → `None`（调用侧映射 -32008）。
+    pub fn entry(&self, task_id: u64, idx: u64) -> Result<Option<ScanEntry>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT idx, name, path, ext, size_bytes, deleted, is_dir, quality, first_cluster,
+                    byte_offset, contiguous
+             FROM entries WHERE task_id = ?1 AND idx = ?2",
+        )?;
+        let mut rows = st.query(params![task_id as i64, idx as i64])?;
+        let Some(r) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(ScanEntry {
+            idx: r.get::<_, i64>(0)? as u64,
+            name: r.get(1)?,
+            path: r.get(2)?,
+            ext: r.get(3)?,
+            size_bytes: r.get::<_, i64>(4)? as u64,
+            deleted: r.get(5)?,
+            is_dir: r.get(6)?,
+            quality: r.get(7)?,
+            first_cluster: r.get::<_, i64>(8)? as u32,
+            byte_offset: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+            contiguous: r.get(10)?,
+        }))
+    }
+
     /// daemon 启动时调：进程内 worker 已随上次退出消失——pending/scanning 诚实置 failed；
     /// paused 保留（resume 可重跑，隔天继续语义）。
     pub fn mark_interrupted(&self) -> Result<usize, StoreError> {
@@ -478,6 +516,43 @@ mod tests {
         assert_eq!(page, vec![all[1].clone(), all[2].clone()]);
         let (_, empty) = s.entries(id, 3, 2, false).unwrap();
         assert!(empty.is_empty(), "offset 越尾 → 空页（非错）");
+    }
+
+    #[test]
+    fn entry_point_lookup_hits_misses_and_task_scope() {
+        let s = Store::open_memory().unwrap();
+        let a = s.create_task("d", "fat", "quick", 1).unwrap();
+        let b = s.create_task("d", "fat", "quick", 1).unwrap();
+        s.insert_entries(a, &[entry(0, "A.JPG", true), entry(3, "B.TXT", false)])
+            .unwrap();
+        assert_eq!(s.entry(a, 3).unwrap().unwrap().name, "B.TXT");
+        assert!(s.entry(a, 1).unwrap().is_none(), "缺 idx → None（-32008）");
+        assert!(s.entry(b, 0).unwrap().is_none(), "跨任务不串（-32008）");
+        assert!(s.entry(99, 0).unwrap().is_none(), "未知任务 → None");
+    }
+
+    #[test]
+    fn open_read_only_sees_committed_rows_but_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.db");
+        let id = {
+            let w = Store::open(&path).unwrap();
+            let id = w.create_task("d", "exfat", "quick", 4096).unwrap();
+            w.insert_entries(id, &[entry(0, "A.JPG", false)]).unwrap();
+            id
+        }; // 写连接关闭（WAL checkpoint 回主库）
+        let ro = Store::open_read_only(&path).unwrap();
+        let row = ro.task(id).unwrap().unwrap();
+        assert_eq!((row.fs.as_str(), row.device_id.as_str()), ("exfat", "d"));
+        assert_eq!(ro.entry(id, 0).unwrap().unwrap().name, "A.JPG");
+        assert!(
+            matches!(
+                ro.create_task("d", "exfat", "quick", 1),
+                Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _)))
+                    if e.code == rusqlite::ErrorCode::ReadOnly
+            ),
+            "只读连接写 = ReadOnly 错误（子进程不写库）"
+        );
     }
 
     #[test]

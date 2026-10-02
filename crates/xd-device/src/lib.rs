@@ -64,4 +64,11 @@ pub trait BlockDevice: Send + Sync {
 
     /// 从 offset 起读取直到填满 buf、到达 EOF 或出错；返回实际读取字节数。
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DeviceError>;
+
+    /// 源为物理块设备时返回节点 `st_rdev` 的 (major, minor)；镜像/未知恒 `None`。
+    /// 默认实现 `None`——既有实现零改动（导出目标同盘校验用；镜像不做该校验，
+    /// 见 `xd_core::export::check_target`）。
+    fn source_rdev(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
