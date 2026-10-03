@@ -200,15 +200,24 @@ bash scripts/e2e-package-smoke.sh
 
 两个平台都是**手动 CI job**：Actions → CI → Run workflow 勾选 `packaging=true`
 （常规轮次不跑 flutter build windows/macos）；产物 artifact 名 `xiaodun-windows-zip` /
-`xiaodun-macos-zip`。开发机无法本地验证打包，以 dispatch 一轮 CI 实证。
+`xiaodun-macos-arm64-zip` / `xiaodun-macos-x64-zip`。macOS 为**矩阵两腿**（M2 T11）：
+`macos-15` 出 arm64、`macos-15-intel` 出 x64，两腿各自跑产物冒烟；旧名 `xiaodun-macos-zip`
+**不保留兼容映射**（手动 job 无既有消费者）。开发机无法本地验证打包，以 dispatch 一轮 CI 实证。
+
+**macOS x64 物证与时效（M2 T11）**：x64 包由 `macos-15-intel` 腿产出——GitHub 的**最后一代
+Intel 镜像，2027-08 退役**（退役后需自建 Intel runner，否则 Intel 物证断供）。冒烟会在本腿
+runner 上真起包内 daemon ⇒ 包架构与 runner 不符必然失败（x64 腿绿 = x64 引擎真可在 Intel 上跑）；
+GUI 双击首开仍属真机手测项（T12）。跨架构：**arm64 包不能在 Intel Mac 上运行**；x64 包在
+Apple Silicon 上需 Rosetta 2。两架构包均为未签名（凭据未配置时）交付物，首次打开按下文右键-打开。
 
 **macOS 签名/公证（M2 T10）**：打包末尾由 `scripts/notarize.sh` 走真链——逐嵌套 `codesign`
 （引擎 → Frameworks → 整包，`--options runtime --timestamp`）→ `codesign --verify --strict`
 断言 seal 有效 → `notarytool submit --wait` → `stapler staple` + `spctl` 断言。凭据走 CI
 secrets（`APPLE_CERT_P12_BASE64`/`APPLE_CERT_PASSWORD`/`APPLE_TEAM_ID`/`APPLE_ID`/
-`APPLE_APP_PASSWORD`）：**缺任一 ⇒ 具名 `skip:` 行 + 产物名不变（未签名包）**，绝不产半签包。
-Windows 同理：`WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD` 齐备时 `signtool` 签名，缺则具名
-skip。**未签名包首次打开需右键 → 打开**（或 `xattr -d com.apple.quarantine <app>`）绕过
+`APPLE_APP_PASSWORD`，T11 起由 ci.yml 在 job 级 `env:` 注入；secrets 未配置 = 空串）：
+**缺任一 ⇒ 具名 `skip:` 行 + 产物名不变（未签名包）**，绝不产半签包。
+Windows 同理：`WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD`（同样 job 级注入）齐备时
+`signtool` 签名，缺则具名 skip。**未签名包首次打开需右键 → 打开**（或 `xattr -d com.apple.quarantine <app>`）绕过
 Gatekeeper；Windows 未签名包 SmartScreen 提示选「仍要运行」。真签名/公证/Gatekeeper 首开归
 **未验证**（凭据未配置，见计划开放问题 O5）。
 
