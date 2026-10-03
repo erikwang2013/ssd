@@ -1371,13 +1371,18 @@ mod tests {
             panic!()
         };
         assert_eq!(e.error.code, -32003);
+        // 平台中立的「不存在目标」：由 tempdir 派生**绝对**路径——绝对性是 handlers 的边界校验
+        // （`is_absolute()`，Windows 上字面量 "/nonexistent-x" 无盘符即非绝对 ⇒ 先吃 -32602，
+        // 到不了本用例要钉的 -32008/-32007）。
+        let missing_path = t.path().join("missing-dir");
+        let missing = missing_path.to_str().unwrap();
         // -32008：无此条目（先于目标校验——错误码优先级）
         let Response::Err(e) = handle_request(
             &ctx,
             &req_with(
                 31,
                 "export.start",
-                serde_json::json!({"taskId": 1, "idxs": [99], "targetDir": "/nonexistent-export-dir"}),
+                serde_json::json!({"taskId": 1, "idxs": [99], "targetDir": missing}),
             ),
         ) else {
             panic!()
@@ -1389,16 +1394,13 @@ mod tests {
             &req_with(
                 31,
                 "export.start",
-                serde_json::json!({"taskId": 1, "idxs": [0], "targetDir": "/nonexistent-export-dir"}),
+                serde_json::json!({"taskId": 1, "idxs": [0], "targetDir": missing}),
             ),
         ) else {
             panic!()
         };
         assert_eq!(e.error.code, -32007);
-        assert_eq!(
-            e.error.message,
-            "Target not writable: /nonexistent-export-dir"
-        );
+        assert_eq!(e.error.message, format!("Target not writable: {missing}"));
         // -32603：无 --db（内存库）——校验全过后诚实拒绝（子进程无从读库）
         let Response::Err(e) = handle_request(
             &ctx,
