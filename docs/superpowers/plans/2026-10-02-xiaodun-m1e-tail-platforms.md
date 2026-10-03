@@ -236,6 +236,16 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 - **T6 移交**：未验证总表加行（真 UAC/osascript/pkexec、Windows port-file ACL/`OpenProcess` 语义、pid 复用/双 daemon 窗口、macOS -32006 整盘源盲区、Windows 提权入口不可达[M2]、授权超时弃留窗口、R11 属主交还 root 真路径、R2 空转下界）；判据 3 取证点=`ui/test/elevation_test.dart`（15 枚）。
 - **未验证**：真 UAC/osascript/pkexec 对话框与端到端链、真 FDA(TCC)、Windows ACL/`OpenProcess`、真机 pid 复用、R11 root 真路径。
 
+### T5（Windows/macOS 打包）—— impl-m1e-t5。提交沿革：`2fe0e03`（主：两打包脚本+两冒烟+CI 门控+`packagedDaemonPath`+README/§11）→ `710ed0f`（F1 活锁修复）→ `579b336`（README 用法 3 如实化 + smoke 退出码）→ `7695506`（spec 逐字补正：用法 3 三行 + ps1 一行，byte-exact）→ `fff5d29`（qual 钉 0001+0002）→ `950f186`（N-1 macOS 具名失败行）。DONE → spec **PASS 主干 + 1 轻微 ISSUE（已修）** → qual **ISSUES**（1 项：F1 回归钉缺失）→ 落钉有牙 → 增复 **APPROVED**（T5 关闭；cargo 470/0；flutter 139+2；CI 两轮 7/7 与 5/5+2skip）
+
+- **交付**：`package-windows.ps1`（v0.3.0 注入 / `--locked` / 组装 / zip）/`package-macos.sh`（arch 分派 / ditto / 按架构两 zip）/`e2e-package-smoke.{ps1,sh}`（`--image`+ping、双平台具名 FAIL 奇偶）/`notarize.sh` 空壳（M2 顺序）；ci.yml 两手动 job（`packaging` input 门控、artifact `xiaodun-{windows,macos}-zip`）；`packagedDaemonPath()`（显式→ENV→**同目录回退**，双击承重件）+2 单测；README 三平台矩阵/已知限制；security §11。
+- **spec 独立核验**：两 artifact **下载拆包**（win 15 项 / mac 57 项含 6 symlink 保真、universal 主程序）；CI 锚点逐行（`PACKAGE SMOKE OK` 双平台）；门控双跑零扰动（7/7 与 skip）；偏离 A-D 全 ACCEPT。
+- **qual**：F1 修复正确但**回归保护缺失**（`pending` 提交套件 0 次填充——两序容忍机制是套件内死代码；变异双向 12/0 绿）；钉 `0001`（反序确定性钉）+`0002`（大写宿主上界钉）+N-1 落地后**双向有牙复现**（复活→挂死 rc=124、摘消费→0.304s panic、去 `toLowerCase`→红）。
+- **★ F1（T1 遗留活锁，拆弹）**：`Lines::next()` pending 回放+失配 push 回 ⇒ 通知抢跑时纯用户态自旋（98% CPU、socket 读超时全程不生效）；修复=去掉回放分支；修复前复现 rc=124 vs 修复后 0.15s；回归钉 `0001` 已落地（13 枚）。
+- **记录（T6 表）**：`Runner.rc` 版本资源仍 `xiaodun_ui.exe`（装饰性）；**F2** macOS 沙箱 entitlement + ad-hoc 签名后 seal 失效（首开或报「已损坏」）；`-macos-x64.zip` 物证缺（runner=arm64）；artifact 内 README CRLF（runner autocrlf，仓库 LF）。
+- **T6 移交**：**终轮 `packaging=true` 必办**（唯一途径修已发布 artifact 内旧 README + ps1 新行真机首解析）；未验证总表增行全集（运行时回退/真机首启/SmartScreen/无 VC++ 库/macOS 挂载+沙箱/F2/签名公证 M2/TCC-FDA M2/x64 zip/Runner.rc）；判据 4 取证点=两 artifact。
+- **未验证**：pwsh 脚本本机零执行（CI 已实证）；`packagedDaemonPath` 运行时回退（仅纯函数单测）；真机 GUI 首启/签名链全系。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
