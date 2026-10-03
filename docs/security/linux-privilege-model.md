@@ -217,11 +217,16 @@ JSON-RPC 处理（响应与通知同走一条连接）。令牌比较常数时�
 - **Windows port-file ACL 未收紧**：NTFS 无 0600 语义，现为直写（可读性由继承 ACL 决定，
   通常已限当前用户但不保证）；显式收紧仅当前用户可读 = TODO M2。
   非 unix/windows 平台**显式拒绝**（`Unsupported` / panic，不静默退化）。
+  写路径本身已由 CI **实跑**（见文末「已验」），未验的只是 ACL 收紧。
+
+**已验（CI 实跑，非仅编译）**：`rust (windows-latest)` 与 `rust (macos-latest)` 跑全 workspace
+测试（含 `tcp_session.rs` 全链路：令牌生成 = Windows `BCryptGenRandom` / unix `/dev/urandom`、
+port-file 写 = Windows 直写 / unix 0600+`.tmp`+rename、回环 TCP 握手与通知广播）——
+CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
 
 **未验证（需真机）**：
 
-- [ ] Windows/macOS 运行时：`BCryptGenRandom` 返回判定与端口文件可读性实测（CI 只证编译；
-      本代理以独立探针 crate 对 `windows-sys 0.61` 的 `x86_64-pc-windows-msvc` 目标
-      `cargo check` 通过，运行语义归 M1 出口真机）。
+- [ ] Windows port-file **可读性 ACL**（写路径本身已 CI 实跑）：NTFS 继承 ACL 是否恰好仅当前
+      用户可读——M1 出口真机 `icacls` 核对。
 - [ ] 真 UAC/osascript 提权引导拉起 TCP daemon 的端到端（Task 4 交付；CI 无桌面）。
 - [ ] macOS 全盘访问（TCC）路径下的提权会话（同上）。

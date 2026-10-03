@@ -129,6 +129,9 @@ pub(crate) fn write_line<W: Write>(out: &Mutex<W>, v: &serde_json::Value) {
 pub(crate) struct SharedSink<W>(pub(crate) Arc<Mutex<W>>);
 
 impl<W: Write> Write for SharedSink<W> {
+    /// 逐块写（`Write` 必选方法，不可省）：当前无直接调用者——广播走 `write_all`、响应走
+    /// `write_line` 直接持锁。保留是为让本适配器的契约完整：凡经此端写出的都整段持锁
+    /// （`write_vectored` 等默认方法仍会落到这里）。
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().write(buf)
     }
@@ -144,7 +147,9 @@ impl<W: Write> Write for SharedSink<W> {
         self.0.lock().unwrap().flush()
     }
 
-    /// 格式化写（响应侧 `write_line`）同样整段持锁：其多个 write 片段不会被广播行插断。
+    /// 格式化写：当前同样无调用路径（响应侧 `write_line` 直接持锁写），**保留为纵深**——
+    /// 若将来有写者改为经本端格式化写，其多个 write 片段仍整段持锁；删掉则默认实现按块
+    /// 取放锁，会静默复活本轮修掉的行插断形态（qual-m1e-t1 观察④ 裁定：留）。
     fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
         self.0.lock().unwrap().write_fmt(args)
     }
@@ -208,7 +213,7 @@ impl Drop for SinkHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// 每次 `write` 只吃 1 字节的写端：强制分块，把「部分写」窗口放到最大。
     struct Chunky {
@@ -302,6 +307,87 @@ mod tests {
             (broadcasts, responses),
             (LINES, LINES),
             "行数与写入次数不符（丢行或合并行）：{text:?}"
+        );
+    }
+
+    // qual-m1e-t1 补测（最小集）：封住 transport.rs 内两条未钉住的生命周期行为。
+    // 两个钉子与对应变异：
+    // 1) `sink_handle_drop_unregisters` —— 杀「SinkHandle::drop 注销摘除（no-op）」。
+    // 2) `failed_sink_is_evicted_without_handle_drop` —— 杀「broadcast 写失败不剔除（吞错继续写）」。
+
+    /// 恒失败的写端：模拟 TCP 写端断开（EPIPE）而读线程尚未退出的窗口。
+    struct DeadSink;
+
+    impl Write for DeadSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "dead sink",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 计数写端：每次 `write` 计数 +1，全部收下（一次 broadcast 恰好一次调用）。
+    #[derive(Clone)]
+    struct CountSink(std::sync::Arc<AtomicUsize>);
+
+    impl Write for CountSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `SinkHandle` drop ⇒ 立刻从广播集摘除（TCP 连接断开的主注销路径）。
+    #[test]
+    fn sink_handle_drop_unregisters() {
+        let notifier = Arc::new(Notifier::new());
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let handle = notifier.register(Box::new(CountSink(count.clone())));
+
+        notifier.broadcast(&serde_json::json!({"n": 1}));
+        let after_first = count.load(Ordering::SeqCst);
+        assert!(after_first > 0, "注册后广播必须到达写端");
+        let registered = notifier.sinks.lock().unwrap().len();
+        assert_eq!(registered, 1, "register 后应在册");
+
+        drop(handle);
+        // 注意：先把持锁读数落成局部量，再断言——断言失败若与持锁临时量同语句，
+        // mutex 中毒会让 SinkHandle::drop 的 unwrap 二次 panic（abort 而非干净失败）。
+        let registered = notifier.sinks.lock().unwrap().len();
+        assert_eq!(registered, 0, "SinkHandle drop 必须注销");
+        notifier.broadcast(&serde_json::json!({"n": 2}));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            after_first,
+            "drop 后不得再收到广播（注销失败 = 死写端常驻）"
+        );
+    }
+
+    /// 写失败 ⇒ 移除该写端且不影响其余写端（读线程未察觉断开时的兜底剔除路径）。
+    #[test]
+    fn failed_sink_is_evicted_without_handle_drop() {
+        let notifier = Arc::new(Notifier::new());
+        let _dead = notifier.register(Box::new(DeadSink)); // 句柄存活：只允许经写失败剔除
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let _live = notifier.register(Box::new(CountSink(count.clone())));
+
+        notifier.broadcast(&serde_json::json!({"n": 1}));
+        let registered = notifier.sinks.lock().unwrap().len();
+        assert_eq!(registered, 1, "写失败端必须被剔除（不依赖句柄 drop）");
+        notifier.broadcast(&serde_json::json!({"n": 2}));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "存活写端两次广播都必须收到（剔除不得误伤）"
         );
     }
 }

@@ -2,7 +2,8 @@
 //! port-file（提权会话的端口与令牌交接件）与令牌生成。
 //! 安全属性：unix 0600 + 同目录临时文件 rename 原子落盘（读者永远读不到半行）；
 //! 令牌 16 字节 CSPRNG → 32 位十六进制，比较见 transport.rs（常数时间）。
-//! Windows 分支**未验证（需真机）**：直写（ACL 归 M2，TODO）与 BCryptGenRandom 仅证编译。
+//! Windows 分支的写路径与令牌生成已由 CI windows runner **实跑**（tcp_session 全链路，见
+//! docs/security §7「已验」）；未收紧的是 port-file ACL（NTFS 无 0600 语义，归 M2）。
 
 use std::path::Path;
 
@@ -45,8 +46,8 @@ fn write_port_file_impl(path: &Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// windows：直写。**未验证（需真机）**——NTFS 无 unix 权限位，文件可读性由继承 ACL 决定
-/// （通常已限当前用户，但不保证）；显式收紧（仅当前用户可读）TODO M2。
+/// windows：直写。路径已由 CI windows runner 实跑（见模块头注）；**ACL 未收紧**——NTFS 无
+/// unix 权限位，文件可读性由继承 ACL 决定（通常已限当前用户，但不保证）；显式收紧 TODO M2。
 #[cfg(windows)]
 fn write_port_file_impl(path: &Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, content)
@@ -82,8 +83,8 @@ fn fill_random(buf: &mut [u8]) {
         .unwrap_or_else(|e| panic!("/dev/urandom 读取失败: {e}"));
 }
 
-/// windows：BCryptGenRandom（系统首选 RNG）。**未验证（需真机）**——CI 只证编译，
-/// 运行语义（返回值判定/常量）归 M1 出口真机核对。
+/// windows：BCryptGenRandom（系统首选 RNG）。CI windows runner 已实跑本路径（tcp_session
+/// 全链路用真令牌）；真机 UAC 提权链归 M1 出口（Task 4）。
 #[cfg(windows)]
 fn fill_random(buf: &mut [u8]) {
     use windows_sys::Win32::Security::Cryptography::{

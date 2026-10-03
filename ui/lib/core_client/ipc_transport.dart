@@ -12,7 +12,11 @@ abstract class LineCoreClient implements CoreClient {
   // 写出函数用位置初始化形参：命名形参不能是私有的（`{required this._write}` 不合法），
   // 而命名形参 + initializer list 会触发 prefer_initializing_formals（analyze 红）。
   LineCoreClient(this._write, {required Stream<String> lines}) {
-    _sub = lines.listen(_onLine);
+    _sub = lines.listen(
+      _onLine,
+      onDone: () => _failSession(StateError('session ended')),
+      onError: (Object e) => _failSession(StateError('session error: $e')),
+    );
   }
 
   final void Function(String) _write;
@@ -26,7 +30,16 @@ abstract class LineCoreClient implements CoreClient {
   @override
   Stream<Map<String, dynamic>> get notifications => _notifications.stream;
 
+  Object? _sessionError;
+
+  void _failSession(Object error) {
+    _sessionError ??= error;
+    _failPending(error);
+  }
+
   Future<Map<String, dynamic>> _call(String method, [Object? params]) {
+    final session = _sessionError;
+    if (session != null) return Future.error(session);
     final id = ++_nextId;
     final completer = Completer<Map<String, dynamic>>();
     _pending[id] = completer;
