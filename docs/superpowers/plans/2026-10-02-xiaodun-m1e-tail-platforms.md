@@ -213,6 +213,16 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 - **T3 移交**：同款缺口（macOS 亦 `Noopener`+空 list_only）；`main.rs:136`「仅 Linux 支持」消息随 T3 更新；macos.rs 从第一笔守 500 行线宽。
 - **未验证**：真机枚举/读、UAC 全链路与 `--device` 运行时、4Kn 512B 读、USB-SATA 桥接盘 BusType/removable、换盘热插拔、Windows port-file ACL（T1 项）、同盘校验缺口 UX（§8 M2 卷号比较）、IO 面 I1-I9 审查式裁定。CI 脆弱面：冒烟隐含 admin + 恒有 PhysicalDrive0（设计前提非 bug）。
 
+### T3（macOS 平台层）—— impl-m1e-t3。提交沿革：`6304f92`（主）→ `fc4a8b2`（§9 引 CI run id + F1/F2）→ `a32d3b0`（收口补钉 P1-P7）。DONE → spec **PASS**（含 1 必办 docfix）→ qual **APPROVED**（36 变异 24 KILL / 11 SURVIVE / 1 HANG）→ 收口增复 APPROVED（T3 关闭；458/0；CI 三轮 5/5）
+
+- **交付**：`macos.rs` 393 行（`/dev/diskN` 枚举[纯数字整盘、数值升序]/DKIOC 容量[Darwin `_IOC` 公式求值+单测钉头文件值]/`O_RDONLY` 打开/pread 补齐/FDA→`PermissionDenied`+hint/信任边界 `parse_disk_node`）；`source_rdev_of`+`dev_major_minor` 提为 `#[cfg(unix)]` 共用（linux 行为逐位不变）；main.rs macOS 臂；macos_smoke（枚举硬/打开弱断言）；§9+README；CI 新增 macOS `--nocapture` 取证步（P7）。
+- **spec 独立核验**：14+ 条对照；ioctl 常量对源核（curl XNU `disk.h`/`ioccom.h` 逐字复算 0x40046418/0x40086419）；CI 面亲验（**xd-daemon 真 macOS 首次真编译**——T2 遗留缺口②就此闭合）。
+- **qual**：36 枚（24 KILL / 11 SURVIVE[5 等效 + 6 缺口] / 1 HANG）；解码单射 30 万样本 0 碰撞；**P7 取证得真机实证**（runner 走 Err/EPERM 分支、`warn: …该盘仍列入，size=0`——容量容错设计口径 + 硬断言同获真机验证）；收口 P1-P7 落码后 **6/7 缺钉转 KILL**（T2/E2/E3/R3/R5/R6）。
+- **偏离 5 项全 ACCEPT**：① 枚举容量容错（**未知 ≠ 确认零**——计划自身硬断言逼出）；② 跨 crate dev_t 解码同式（单射论证 + **P5 KAT 契约钉**封单侧改 Darwin 解码类风险）；③ 依赖（libc 0.2.189+rustix，lock +2 行零新版本）；④ §9 编号（§8 已占）；⑤ 接线缺口入档。
+- **记录/移交**：**P8 容量乘法纯函数钉**（S2 残余，4 行，并入 T4 轮）；R2/R7 短读循环仅真机可验（M2）；F3 `fstat is_block_device`（M2）；`read_at` 三份逐字拷贝（P2 已给 macOS 执行覆盖；抽 `crate::read_at_fill` 留 T4）；`entries.flatten()` 吞 per-entry Err（记录）；**F4 erratum**（Task 3 Files 清单漏 lib.rs/linux.rs/Cargo.toml，impl 依正文执行正确）；`open` 侧 id canonicalize（P6）而枚举侧未规范——与 linux 同构（记录）。
+- **T4 移交（与 T2 合并全集）**：双平台 opener 接线（`list_only` 恒空 + `NoopOpener`，含 `unix:` id opener 按平台分派；macOS 的 EPERM→PermissionDenied 目标**只在该臂可达**）；**osascript 提权 ≠ FDA**（root 后仍可能 EPERM——授权失败 UX 须能提示「已提权但仍缺完全磁盘访问」）；`--device` 是否入 UAC/osascript 命令须显式规划；-32006 macOS 盲区（整盘源 vs 分区目标）入 T6 总表。
+- **未验证**：真机 root+FDA 全链、4Kn/Apple Fabric 命名、`rdisk` 性能与权限、Gatekeeper（T5/M2）、macOS port-file ACL（T1 项）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
