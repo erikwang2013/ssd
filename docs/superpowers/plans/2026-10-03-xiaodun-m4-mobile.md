@@ -176,3 +176,11 @@ iOS app 沙箱**读不到**宿主机的 iTunes/Finder 备份目录；AFC 只能�
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
+
+---
+
+## 用户裁定（2026-10-03）
+
+- **O1 = 候选 1「桌面为主」**：备份解析引擎（`xd-mobile`）落桌面 app（Mac/Windows 读本地备份 + AFC）；iOS app 仅「导入备份文件夹解析」入口 + 能力说明。
+- **O2 = 上架包仅含非越狱能力**：Android root 如实申报（Data safety）；iOS 越狱增强**不进商店包、M4 出口不含**（必要时细化轮再议 TestFlight/自签档）。
+- **预研首波已回填**：P1 f2fs **条件可行**（470 行 stdlib 原型对 2 镜像 × 4 文件 md5 全 OK；DFRWS 2025「i_addr 清零」与内核源码矛盾 → T5 loop-mount 夹具定案；估 ~3500-5000 行 Rust）；P3 **FBE 口径分层降级确认**——内容级=FDE(≤9)/便携 SD；元数据级=FBE+root+AFU(7-10)；无=离线 raw(11+)/重置后；**Android 10+ 不承诺内容级与文件名恢复**；T4 加真机最小验证 slot（建加密文件→删→raw 确认密文）；能力边界表（报告 §4 草稿）并入 M4 出口文档。

@@ -479,3 +479,12 @@ pub fn media_hints(dev: &str) -> (Option<&'static str>, Option<bool>)
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
+
+---
+
+## 用户裁定（2026-10-03）
+
+1. **Windows 代码签名证书**：确认采购（EV/OV；用户侧外部动作，长交付期——M2 期立即启动为妥）。代码侧按 R6 实现 `signtool` 钩子；证书未到位期间保持具名 skip。
+2. **Apple 证书与 CI secrets**：**暂不配置** ⇒ macOS 签名/公证走条件路径（缺凭据 ⇒ `skip:` 具名行 + artifact 名不变，绝不产半签包）；T10 的签名链代码照常实现，「缺凭据」分支即为当前验收面。
+3. **ext4 journal（R1 Cut 线）**：**撤销**——全量保留（T5 不移 M3、出口不降级）。
+4. **版本号**：M2 = **0.5.0** 确认。
