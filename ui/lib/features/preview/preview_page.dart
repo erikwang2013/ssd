@@ -47,8 +47,11 @@ class _PreviewPageState extends State<PreviewPage> {
   void _openRecover() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) =>
-            RecoverPage(taskId: widget.taskId, idxs: [widget.entry.idx]),
+        builder: (_) => RecoverPage(
+          client: widget.client,
+          taskId: widget.taskId,
+          idxs: [widget.entry.idx],
+        ),
       ),
     );
   }

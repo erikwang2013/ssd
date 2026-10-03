@@ -82,8 +82,11 @@ class _ResultsPageState extends State<ResultsPage> {
   void _openRecover() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) =>
-            RecoverPage(taskId: widget.taskId, idxs: _controller.selectedIdxs),
+        builder: (_) => RecoverPage(
+          client: widget.client,
+          taskId: widget.taskId,
+          idxs: _controller.selectedIdxs,
+        ),
       ),
     );
   }
