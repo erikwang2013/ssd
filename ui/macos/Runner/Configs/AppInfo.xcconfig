@@ -5,10 +5,16 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
+// NOTE (M2 T10): kept ASCII on purpose -- the built bundle is $PRODUCT_NAME.app and both
+// package-macos.sh and the CI artifact layout rely on the path "xiaodun_ui.app". The
+// user-visible name lives in Info.plist (CFBundleName/CFBundleDisplayName = 小盾 (Xiaodun)).
 PRODUCT_NAME = xiaodun_ui
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = com.example.xiaodunUi
+PRODUCT_BUNDLE_IDENTIFIER = com.erik.xiaodun
 
-// The copyright displayed in application information
-PRODUCT_COPYRIGHT = Copyright © 2026 com.example. All rights reserved.
+// The copyright displayed in application information.
+// NOTE (M2 T10): Info.plist hardcodes NSHumanReadableCopyright ("© 2026 erik · https://erik.xyz")
+// because an xcconfig value cannot contain "//" (it starts a comment). This legacy variable
+// is unused by the plist now; kept to avoid touching unrelated template defaults.
+PRODUCT_COPYRIGHT = Copyright © 2026 erik. All rights reserved.

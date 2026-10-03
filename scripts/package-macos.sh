@@ -3,8 +3,9 @@
 # 组装 macOS staged zip（单架构 = 构建机架构）：xiaodun_ui.app + Contents/MacOS/xd-daemon。
 # 引擎必须与主程序同目录（Contents/MacOS）：UI 按「宿主可执行文件同目录」发现 daemon
 # （ui/lib/core_client/ipc_transport.dart::packagedDaemonPath）——否则提权引导退化旧支路。
-# 版本号从 workspace Cargo.toml 注入（同 build-deb.sh）。签名/公证归 M2（scripts/notarize.sh 占位）。
-# 未签名包首次打开需右键-打开（Gatekeeper）。开发机（Linux）无法执行本脚本：以 CI dispatch 实证。
+# 版本号从 workspace Cargo.toml 注入（同 build-deb.sh）。签名/公证：调用 scripts/notarize.sh
+# 真链（T10）；凭据缺失 ⇒ 具名 skip、产物 = 未签名包（首次打开需右键-打开，Gatekeeper）。
+# 开发机（Linux）无法执行本脚本：以 CI dispatch 实证。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -33,8 +34,14 @@ install -m 755 target/release/xd-daemon "$stage/xiaodun_ui.app/Contents/MacOS/xd
 
 out=dist/$name.zip
 rm -f "$out"
+
+# 签名/公证真链（T10）：缺凭据 ⇒ notarize.sh 打具名 skip 行且不触碰 .app/.zip，
+# 本产物即未签名交付物（命名/形状与 M1e 完全一致）。
+bash scripts/notarize.sh "$stage/xiaodun_ui.app" "$out"
+
+# staple 改写 .app ⇒ 交付 zip 在签名流程之后重出，保证包内 .app 与已装订票据一致；
+# 未签名路径重出内容同形（名字不变），仅多一次 ditto。
+rm -f "$out"
 ditto -c -k --keepParent "$stage" "$out"   # zip 顶层 = $name/（与 Windows 包形一致）
 
-bash scripts/notarize.sh "$out"
-echo "note: 未签名（首次打开需右键-打开）；签名/公证归 M2"
 echo "built: $out"

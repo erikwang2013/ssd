@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>com.apple.security.app-sandbox</key>
+	<!-- F2（M2 T10）：不启用 App Sandbox（键已删除）——数据恢复与沙箱不兼容
+	     （/dev/diskN 裸读、spawn 提权 helper）。JIT entitlement 保留（Flutter 运行时）。 -->
+	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 </dict>
 </plist>

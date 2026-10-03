@@ -46,6 +46,32 @@ Rename-Item (Join-Path $stage 'xiaodun_ui.exe') 'xiaodun.exe'
 Copy-Item (Join-Path $root 'target/release/xd-daemon.exe') $stage
 Copy-Item (Join-Path $root 'packaging/windows/README-*.txt') $stage
 
+# Code-signing hook (T10): sign the two shipped executables BEFORE zipping, so the PE
+# signatures survive into the archive. Credentials (CI secrets, never committed):
+#   WINDOWS_CERT_PFX_BASE64 = base64 of the .pfx;  WINDOWS_CERT_PASSWORD = its password.
+# Missing either one => named skip; the artifact stays unsigned and SmartScreen warns
+# on first run (business-side EV/OV certificate purchase is a separate open item, plan R6/O4).
+$pfxB64 = $env:WINDOWS_CERT_PFX_BASE64
+$pfxPwd = $env:WINDOWS_CERT_PASSWORD
+if (-not $pfxB64 -or -not $pfxPwd) {
+  Write-Host ('skip: code signing skipped (WINDOWS_CERT_PFX_BASE64/WINDOWS_CERT_PASSWORD not set)' +
+    ' - this artifact is unsigned; Windows SmartScreen will warn on first run (More info -> Run anyway)')
+} else {
+  $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+  if (-not $signtool) { throw 'FAIL: signtool.exe not found on PATH (Windows SDK required for signing)' }
+  $pfx = Join-Path ([IO.Path]::GetTempPath()) ('xd-sign-' + [Guid]::NewGuid().ToString('N') + '.pfx')
+  try {
+    [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($pfxB64))
+    foreach ($exe in @('xiaodun.exe', 'xd-daemon.exe')) {
+      & $signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfx /p $pfxPwd (Join-Path $stage $exe)
+      if ($LASTEXITCODE -ne 0) { throw "FAIL: signtool sign $exe exited $LASTEXITCODE" }
+      Write-Host "signed: $exe"
+    }
+  } finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $pfx
+  }
+}
+
 $zip = Join-Path $root (Join-Path $OutDir "$name.zip")
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path $stage -DestinationPath $zip

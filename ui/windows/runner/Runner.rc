@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "xiaodun_ui" "\0"
+            VALUE "CompanyName", "Xiaodun" "\0"
+            VALUE "FileDescription", "小盾 (Xiaodun)" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "xiaodun_ui" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
-            VALUE "OriginalFilename", "xiaodun_ui.exe" "\0"
-            VALUE "ProductName", "xiaodun_ui" "\0"
+            VALUE "InternalName", "xiaodun" "\0"
+            VALUE "LegalCopyright", "© 2026 erik · https://erik.xyz" "\0"
+            VALUE "OriginalFilename", "xiaodun.exe" "\0"
+            VALUE "ProductName", "小盾 (Xiaodun)" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

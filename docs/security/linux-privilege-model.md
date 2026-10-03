@@ -459,18 +459,31 @@ UI 用户。非提权写入
 门控（flutter build windows/macos 重成本，常规轮次不摊）；artifact `xiaodun-windows-zip`/
 `xiaodun-macos-zip`（`dist/*.zip`）。
 
-**签名/公证（归 M2）**：`scripts/notarize.sh` 为占位（M2 实现顺序：逐嵌套可执行 codesign
-`--options runtime` → `notarytool submit --wait` → `stapler staple`；Apple 凭据走 CI secrets，
-不入仓）。**当前包未签名**：macOS Gatekeeper 首次打开需右键-打开（或清 quarantine 属性）、
-Windows SmartScreen 需「仍要运行」（包内 `README-安装.txt` 亦有说明）。`osascript` 提权 ≠ FDA
-（§9/§10）：提权后仍可能 EPERM。
+**签名/公证（M2 T10 实现）**：`scripts/notarize.sh` 真链——逐嵌套 codesign（先
+`Contents/MacOS/xd-daemon`，再 Frameworks 内层→framework 目录，最后整包；`--force --options
+runtime --timestamp`，**不用 `--deep`**）→ `codesign --verify --strict` 断言 seal 有效 →
+`notarytool submit --wait` → `stapler staple` + `spctl -a -vv` 断言。Apple 凭据走 CI secrets
+（`APPLE_CERT_P12_BASE64`/`APPLE_CERT_PASSWORD`/`APPLE_TEAM_ID`/`APPLE_ID`/`APPLE_APP_PASSWORD`，
+不入仓）；**缺任一 ⇒ 具名 `skip:` 行 + exit 0，产物名不变（未签名包）——绝不产半签包**；
+`package-macos.sh` 在 staple 之后重出交付 zip（包内 .app 与票据一致）。**F2 修复**：App Sandbox
+entitlement 移除（数据恢复与沙箱不兼容：/dev/diskN 裸读、提权 helper spawn），保留 Flutter JIT；
+「签名有效」以 `codesign --verify` 为准（未公证时 `spctl` 必然拒，故 spctl 仅在真公证路径断言）。
+Windows：`package-windows.ps1` 在 zip 前对 `xiaodun.exe`/`xd-daemon.exe` 跑 `signtool sign /fd
+SHA256 /tr <RFC3161> /td SHA256`（`WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD`；缺 ⇒ 具名
+skip + SmartScreen 提示句）。元数据收口（⑨）：`Runner.rc` 版本资源与 macOS
+`Info.plist`（`com.erik.xiaodun`）均为「小盾 (Xiaodun)」。**当前 CI 无凭据 ⇒ 走 skip 分支**：
+macOS Gatekeeper 首次打开需右键-打开（或清 quarantine 属性）、Windows SmartScreen 需「仍要运行」
+（包内 `README-安装.txt` 亦有说明）。`osascript` 提权 ≠ FDA（§9/§10）：提权后仍可能 EPERM。
 
 **未验证（需真机）**：
 
 - [ ] 真机解压双击/挂载 `.app`：引擎自动发现（`packagedDaemonPath` 只单测了纯函数，运行时
       回退未在真机跑过）、未签名包的 Gatekeeper 实际交互、SmartScreen 提示。
-- [ ] macOS 签名/公证链（M2）；`xd-daemon` 作为嵌套可执行在硬签名下的 TCC/FDA 授权归属
+- [ ] macOS 签名/公证链（T10 代码就位；**真 notarytool 提交/公证通过、staple 后 `spctl`
+      accepted、Gatekeeper 首开**需真 Apple 证书 + secrets，当前未配置——缺凭据 skip 路径为
+      当前 CI 验证面）；`xd-daemon` 作为嵌套可执行在硬签名下的 TCC/FDA 授权归属
       （授权属主是 app 还是 daemon）M2 定。
+- [ ] Windows `signtool` 真签名与 SmartScreen 收敛（证书采购中，plan O4）。
 - [ ] 无 VC++ 运行库的 Windows 机器上便携包的行为（依赖已写入 `README-安装.txt`）。
 
 ## 12. M1e 未验证边界总表（M1 出口汇总）
