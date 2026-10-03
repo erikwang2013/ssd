@@ -152,7 +152,7 @@ class ScanController extends ChangeNotifier {
         if (_elevatedSession && defaultTargetPlatform == TargetPlatform.macOS) {
           // osascript 提权 ≠ FDA（T3 移交）：root 之后仍 EPERM ⇒ 指路系统设置，
           // 再弹一轮提权框没有意义（提权已完成）。
-          _error = '已提权但仍缺完全磁盘访问（系统设置 > 隐私与安全性）';
+          _error = kMacosFdaHint;
           _state = ScanUiState.failed;
         } else {
           _needsElevation = true;
@@ -214,10 +214,10 @@ class ScanController extends ChangeNotifier {
 
   /// 对话框 [授权后重试]，两条路径：
   ///
-  /// ① **三平台提权引导**（客户端报得出 daemonPath）：平台命令（Windows UAC / macOS osascript /
-  ///    Linux pkexec，见 [elevationPlanFor]）→ 起提权进程 → 轮询 port-file（≤[elevationTimeout]，
-  ///    两种半行形态都重试）→ TCP 握手 → 替换为提权会话 client → 重试 scanStart。
-  ///    用户取消/超时 ⇒ 文案「未获得授权」（不静默、不悬挂）。
+  /// ① **三平台提权引导**（客户端报得出 daemonPath）：[elevateSession] 共享流（平台命令 →
+  ///    起提权进程 → 轮询 port-file，两种半行形态都重试 → TCP 握手；T6 起与首页入口同源）
+  ///    → 替换为提权会话 client → 重试 scanStart。用户取消/超时 ⇒ 文案「未获得授权」
+  ///    （不静默、不悬挂）。
   /// ② **旧路径**（拿不到 daemonPath：测试 fake/内嵌）：[CoreClient.restartPrivileged]
   ///    以同参数 in-place 重启（pkexec stdio；stdio 句柄不经文件，无 port-file 属主问题）。
   Future<void> retryWithPrivileges() async {
@@ -232,45 +232,20 @@ class ScanController extends ChangeNotifier {
     _elevationPending = true;
     _error = null;
     _notify();
+    final CoreClient fresh;
     Directory? dir;
     try {
-      // UI 自建 0700 会话目录（建后显式 chmod，防 umask 放宽）：root daemon 写 port-file 时把
-      // 属主交还目录属主（本用户），否则 0600 属主=root，UI 读不到令牌（见 portfile.rs）。
-      dir = Directory.systemTemp.createTempSync('xiaodun-elev-');
-      // `createTempSync` 无 mode 参数且**跟随 umask**（实测 0002 ⇒ 0775）：同组用户可 unlink/
-      // 替换 session.port（UI 读前 race）⇒ 显式收紧到 0700。Windows 无 POSIX 位（ACL 见 §10.5）。
-      if (!Platform.isWindows) {
-        Process.runSync('chmod', ['700', dir.path]);
-      }
-      final portFile = '${dir.path}/session.port';
-      final plan = elevationPlanFor(
-        defaultTargetPlatform,
+      fresh = await elevateSession(
         daemonPath: daemonPath,
-        portFile: portFile,
         ownerPid: pid,
-      );
-      final fresh = await _elevationConnect(
-        portFile: portFile,
-        launcherExit: _launchElevation(plan), // 不 await：与轮询并行，取消即刻唤醒
+        launcher: _launchElevation,
+        connect: _elevationConnect,
         timeout: elevationTimeout,
         interval: elevationPollInterval,
+        onSessionDir: (sessionDir) => dir = sessionDir,
       );
-      final old = _client;
-      final oldDir = _elevationDir;
-      // 不 await：广播流订阅的 cancel future 在 fake async 下不收敛（Dart null-future），
-      // 且取消订阅本就无需等待。
-      unawaited(_sub?.cancel());
-      _client = fresh;
-      _subscribe();
-      _elevatedSession = true;
-      _elevationDir = dir;
-      if (oldDir != null) _cleanupElevationDir(oldDir);
-      onClientReplaced?.call(fresh);
-      // 旧（非提权）daemon 已无用途：按契约关闭；失败不影响新会话
-      unawaited(old.close().catchError((Object _) {}));
-      _elevationPending = false;
     } catch (e) {
-      if (dir != null) _cleanupElevationDir(dir);
+      // 失败（含用户取消/超时）时会话目录已由 elevateSession 清理
       if (_disposed) return;
       _elevationPending = false;
       _error = switch (e) {
@@ -282,6 +257,20 @@ class ScanController extends ChangeNotifier {
       _notify();
       return;
     }
+    final old = _client;
+    final oldDir = _elevationDir;
+    // 不 await：广播流订阅的 cancel future 在 fake async 下不收敛（Dart null-future），
+    // 且取消订阅本就无需等待。
+    unawaited(_sub?.cancel());
+    _client = fresh;
+    _subscribe();
+    _elevatedSession = true;
+    _elevationDir = dir;
+    if (oldDir != null) cleanupElevationDir(oldDir);
+    onClientReplaced?.call(fresh);
+    // 旧（非提权）daemon 已无用途：按契约关闭；失败不影响新会话
+    unawaited(old.close().catchError((Object _) {}));
+    _elevationPending = false;
     await _startScan();
   }
 
@@ -313,17 +302,6 @@ class ScanController extends ChangeNotifier {
 
   void _subscribe() {
     _sub = _client.notifications.listen(_onNotification);
-  }
-
-  /// 会话目录收尾（尽力而为；port-file 清理归属见 docs/security §10：daemon 自退时删自己的
-  /// port-file，UI 在会话结束后删整个目录）。失败只留一个空目录（系统临时目录有清理策略），
-  /// 不打断流程。
-  void _cleanupElevationDir(Directory dir) {
-    try {
-      dir.deleteSync(recursive: true);
-    } on FileSystemException {
-      // 忽略：目录/文件可能已被并发清理
-    }
   }
 
   /// 通知分发。T4 实测：契约片段里 `"id":null` 的应答行会入流 → `method` 可能为
@@ -434,7 +412,7 @@ class ScanController extends ChangeNotifier {
     _stopPolling();
     _sub?.cancel();
     final dir = _elevationDir;
-    if (dir != null) _cleanupElevationDir(dir);
+    if (dir != null) cleanupElevationDir(dir);
     super.dispose();
   }
 }

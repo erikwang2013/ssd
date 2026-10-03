@@ -125,6 +125,10 @@ ElevationPlan elevationPlanFor(
 const Duration kElevationTimeout = Duration(seconds: 30);
 const Duration kElevationPollInterval = Duration(milliseconds: 500);
 
+/// macOS：osascript 提权 **≠ 完全磁盘访问（FDA）**——root 后仍可能 EPERM（见文件头与 §9/§10）。
+/// 扫描页（-32001 且已提权）与首页（已提权仍列不到设备）共用同一文案。
+const String kMacosFdaHint = '已提权但仍缺完全磁盘访问（系统设置 > 隐私与安全性）';
+
 /// 提权被拒：提权器启动失败或非零退出（UAC/polkit 被取消/拒绝）。
 class ElevationDeniedException implements Exception {
   ElevationDeniedException(this.message);
@@ -214,6 +218,64 @@ Future<CoreClient> connectElevatedSession({
   throw ElevationTimeoutException(
     '未在 ${timeout.inSeconds} 秒内建立提权会话${lastError == null ? '' : '（$lastError）'}',
   );
+}
+
+/// 提权会话全流程（扫描页 -32001 引导与首页空列表入口的**唯一**实现）：
+/// 0700 会话目录 → [elevationPlanFor] → 起提权进程（与轮询并行）→ 轮询 port-file
+/// ≤[timeout]（半行双形态重试）→ TCP 握手（ping 探针）→ 返回提权会话 client。
+///
+/// 失败（用户取消/超时/传输异常）按原样抛出且**会话目录已清理**；成功时把会话目录交给
+/// [onSessionDir]（调用方在会话结束时删整个目录；daemon 自退时删自己的 port-file——清理
+/// 归属见 docs/security §10）。旧 client 处置与换用归调用方（各页面的 client 归属不同）。
+Future<CoreClient> elevateSession({
+  required String daemonPath,
+  required int ownerPid,
+  ElevationLauncher? launcher,
+  ElevationSessionConnector? connect,
+  Duration timeout = kElevationTimeout,
+  Duration interval = kElevationPollInterval,
+  void Function(Directory sessionDir)? onSessionDir,
+}) async {
+  Directory? dir;
+  try {
+    // UI 自建 0700 会话目录（建后显式 chmod，防 umask 放宽）：root daemon 写 port-file 时把
+    // 属主交还目录属主（本用户），否则 0600 属主=root，UI 读不到令牌（见 portfile.rs）。
+    dir = Directory.systemTemp.createTempSync('xiaodun-elev-');
+    // `createTempSync` 无 mode 参数且**跟随 umask**（实测 0002 ⇒ 0775）：同组用户可 unlink/
+    // 替换 session.port（UI 读前 race）⇒ 显式收紧到 0700。Windows 无 POSIX 位（ACL 见 §10.5）。
+    if (!Platform.isWindows) {
+      Process.runSync('chmod', ['700', dir.path]);
+    }
+    final portFile = '${dir.path}/session.port';
+    final plan = elevationPlanFor(
+      defaultTargetPlatform,
+      daemonPath: daemonPath,
+      portFile: portFile,
+      ownerPid: ownerPid,
+    );
+    final fresh = await (connect ?? connectElevatedSession)(
+      portFile: portFile,
+      launcherExit: (launcher ?? spawnElevation)(plan), // 不 await：与轮询并行，取消即刻唤醒
+      timeout: timeout,
+      interval: interval,
+    );
+    onSessionDir?.call(dir);
+    return fresh;
+  } catch (_) {
+    if (dir != null) cleanupElevationDir(dir);
+    rethrow;
+  }
+}
+
+/// 会话目录收尾（尽力而为；port-file 清理归属见 docs/security §10：daemon 自退时删自己的
+/// port-file，UI 在会话结束后删整个目录）。失败只留一个空目录（系统临时目录有清理策略），
+/// 不打断流程。
+void cleanupElevationDir(Directory dir) {
+  try {
+    dir.deleteSync(recursive: true);
+  } on FileSystemException {
+    // 忽略：目录/文件可能已被并发清理
+  }
 }
 
 /// Win32 命令行参数引用（CreateProcess 语法）：含空格/制表/引号才加引号；反斜杠仅在引号前
