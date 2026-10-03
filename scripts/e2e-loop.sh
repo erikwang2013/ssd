@@ -129,7 +129,7 @@ grep -qF "\"exportId\":$exp_id," <<<"$fin_line" || { echo "FAIL: finished export
 grep -qF '"succeeded":1' <<<"$fin_line" || { echo "FAIL: 导出未 succeeded=1"; echo "$fin_line"; exit 1; }
 exported=$(ls -A "$outdir")
 n=$(printf '%s\n' "$exported" | wc -l)
-[ "$n" = 1 ] && [ -f "$outdir/$exported" ] || { echo "FAIL: 目标目录落盘件数非 1（got: $exported）"; exit 1; }
+[ "$n" = 1 ] && [ -f "$outdir/$exported" ] || { echo "FAIL: 目标目录落盘件数非 1（got: ${exported}）"; exit 1; }
 cmp "$outdir/$exported" "$expdir/expected.bin" || { echo "FAIL: 导出字节与埋点原字节不符"; exit 1; }
 echo "export: task $deep_task idx=$carved_idx → $exported 逐字节 == 埋点（26112,2045）"
 sudo rm -rf "$outdir" "$expdir"; outdir=""; expdir=""

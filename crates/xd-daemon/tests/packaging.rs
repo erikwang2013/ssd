@@ -4,7 +4,9 @@
 //! 文件钉（三平台腿都跑）：
 //! - `Release_entitlements_sandbox_is_false`：F2——App Sandbox 键删除、JIT entitlement 保留；
 //! - `runner_rc_metadata_is_xiaodun`：Runner.rc 版本资源收口为「小盾 (Xiaodun)」；
-//! - `smoke_reports_signature_state`：macOS 冒烟脚本如实打印签名状态（签/未签都过但留证据）。
+//! - `smoke_reports_signature_state`：macOS 冒烟脚本如实打印签名状态（签/未签都过但留证据）；
+//! - `shell_scripts_avoid_unbraced_var_adjacent_to_non_ascii`：全仓 tracked `*.sh` 里 `$var`
+//!   后紧邻非 ASCII 字节 ⇒ macOS bash 3.2 并名 + `set -u` unbound（CI 二红真根因）的静态钉。
 //!
 //! 脚本钉（`#[cfg(unix)]`，mock codesign/xcrun/security/ditto/spctl 取证，Linux/macOS 腿真跑）：
 //! - `notarize_script_skips_named_without_credentials`：缺凭据 ⇒ 具名 `skip:` 行 + exit 0（绝不产半签包）；
@@ -149,8 +151,7 @@ fn smoke_reports_signature_state() {
 
 #[test]
 fn notarize_script_avoids_bash4_only_constructs() {
-    // macOS runner 的 `bash` = /bin/bash 3.2（CI 实证红：`${!v:-}` 间接展开+默认值
-    // 被解析成乱码变量名 ⇒ unbound variable）。本测试把「只用 bash 3.2 语法」钉住：
+    // macOS runner 的 `bash` = /bin/bash 3.2。本测试把「只用 bash 3.2 语法」钉住：
     // 全行注释先剔除（注释里正当解释被禁形态），其余代码不允许出现 4.x-only 构造。
     let s = read("scripts/notarize.sh");
     let code: String = s
@@ -172,6 +173,73 @@ fn notarize_script_avoids_bash4_only_constructs() {
             "bash 3.2（macOS /bin/bash）不支持 {bad}——notarize.sh 须在 CI runner 默认 shell 下可跑"
         );
     }
+}
+
+/// `$var` 后紧邻非 ASCII 字节（全角标点等，UTF-8 首字节 ≥0x80）的静态钉。
+///
+/// 真根因（CI macOS 腿二红实证，2026-10-03）：macOS bash 3.2 会把紧邻的 0xEF 并入变量名
+/// （`$missing；` ⇒ 名字 `missing\xEF`）⇒ `set -u` 下 unbound，报错行 = 打印 skip 的那行。
+/// 本机 bash 5（任意 locale）复现不出，只有静态扫描能确定性拦——花括号定界 `${var}` 的 `}`
+/// 在任何 bash/locale 下都终止名字解析。手写字节扫描（含 heredoc；整行注释不展开故剔除）；
+/// `${...}`/`$(...)`/`$'...'`/`$?` 等天然不误报，`\$` 跳过。
+#[test]
+fn shell_scripts_avoid_unbraced_var_adjacent_to_non_ascii() {
+    let root = repo_root();
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "*.sh"])
+        .current_dir(&root)
+        .output()
+        .expect("跑 git ls-files 失败（本测试需要 git 与仓库检出）");
+    assert!(out.status.success(), "git ls-files '*.sh' 失败");
+    let listing = String::from_utf8(out.stdout).unwrap();
+    assert!(!listing.trim().is_empty(), "git ls-files '*.sh' 无输出");
+
+    let mut offenders = Vec::new();
+    for rel in listing.lines() {
+        let bytes = std::fs::read(root.join(rel)).unwrap();
+        for (ln, raw) in bytes.split(|b| *b == b'\n').enumerate() {
+            if raw.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'#') {
+                continue; // 整行注释：bash 不展开
+            }
+            let mut i = 0;
+            while i < raw.len() {
+                if raw[i] != b'$' {
+                    i += 1;
+                    continue;
+                }
+                let mut backslashes = 0;
+                while i > backslashes && raw[i - 1 - backslashes] == b'\\' {
+                    backslashes += 1;
+                }
+                if backslashes % 2 == 1 {
+                    i += 1; // 反斜杠转义的 `\$` 不展开
+                    continue;
+                }
+                let start = i + 1;
+                let mut m = start;
+                if m < raw.len() && (raw[m].is_ascii_alphabetic() || raw[m] == b'_') {
+                    m += 1;
+                    while m < raw.len() && (raw[m].is_ascii_alphanumeric() || raw[m] == b'_') {
+                        m += 1;
+                    }
+                    if m < raw.len() && raw[m] >= 0x80 {
+                        let name = String::from_utf8_lossy(&raw[start..m]).into_owned();
+                        offenders.push(format!(
+                            "{rel}:{}: ${name} 后紧邻非 ASCII 字节 0x{:02X} ⇒ 写 ${{{name}}}",
+                            ln + 1,
+                            raw[m]
+                        ));
+                    }
+                }
+                i = if m > start { m } else { i + 1 };
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "macOS bash 3.2 会把 `$var` 后紧邻的非 ASCII 字节并入变量名 ⇒ `set -u` 下 unbound（CI 二红真根因）；改用花括号定界：\n{}",
+        offenders.join("\n")
+    );
 }
 
 #[cfg(unix)]
