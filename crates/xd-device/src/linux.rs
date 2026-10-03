@@ -14,7 +14,7 @@
 
 use crate::{BlockDevice, DeviceError, DeviceInfo, DeviceKind};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileExt, FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 
 mod enumerate;
@@ -33,9 +33,9 @@ pub fn makedev(major: u64, minor: u64) -> u64 {
 }
 
 pub fn major_minor(dev: u64) -> (u64, u64) {
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-    (major, minor)
+    // 实现已提升为 `crate::dev_major_minor`（unix 共用：macOS 复用同一解码——同盘校验
+    // 两侧同式的承重件，见 lib.rs）；本函数保留公开路径与原行为（T3 纯重构）。
+    crate::dev_major_minor(dev)
 }
 
 /// 任意节点大小：rdev → /sys/dev/block/<maj>:<min>/size × 512。
@@ -112,25 +112,14 @@ impl BlockDevice for LinuxBlockDevice {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        // lib.rs 契约：读取直到填满 buf 或到达 EOF；块设备短读常见，需循环补齐。
-        let mut done = 0usize;
-        while done < buf.len() {
-            match self.file.read_at(&mut buf[done..], offset + done as u64) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) => return Err(DeviceError::Io(e)),
-            }
-        }
-        Ok(done)
+        crate::read_at_fill(&self.file, offset, buf)
     }
 
     /// 覆写：fstat **已打开的 fd**（不重开路径、无写路径——只读铁律不破），取 `st_rdev`。
-    /// 导出目标同盘校验（-32006）的源侧事实。
+    /// 导出目标同盘校验（-32006）的源侧事实。实现在 `crate::source_rdev_of`（unix 共用，
+    /// macOS 同函数；T3 提升，Linux 行为逐位不变）。
     fn source_rdev(&self) -> Option<(u64, u64)> {
-        self.file
-            .metadata()
-            .ok()
-            .map(|md| major_minor(std::os::unix::fs::MetadataExt::rdev(&md)))
+        crate::source_rdev_of(&self.file)
     }
 }
 

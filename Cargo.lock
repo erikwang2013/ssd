@@ -457,6 +457,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "tempfile",
+ "windows-sys",
  "xd-core",
  "xd-device",
  "xd-fixtures",
@@ -466,8 +467,11 @@ dependencies = [
 name = "xd-device"
 version = "0.3.0"
 dependencies = [
+ "libc",
+ "rustix",
  "serde",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

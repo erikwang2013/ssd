@@ -12,6 +12,7 @@ class FakeCoreClient implements CoreClient {
     List<DeviceInfo> devices = const [],
     List<ScanEntry> entries = const [],
     this.failWith,
+    this.daemonPathOverride,
   }) : devices = List.of(devices),
        entries = List.of(entries);
 
@@ -76,6 +77,13 @@ class FakeCoreClient implements CoreClient {
 
   /// 注入「实现不支持提权重启」（restartPrivileged → null）。
   bool restartReturnsNull = false;
+
+  /// 提权引导开关：非 null 时控制器走三平台提权流（构造 ElevationPlan + 起提权进程 +
+  /// 轮询 port-file）；null（缺省）走旧路径 restartPrivileged——既有测试语义不变。
+  String? daemonPathOverride;
+
+  @override
+  String? get daemonPath => daemonPathOverride;
 
   @override
   Future<CoreClient?> restartPrivileged() async {

@@ -191,4 +191,61 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 
 ---
 
+## 执行记录
+
+### T1（TCP 回环传输）—— impl-m1e-t1。提交沿革：`3d505cc`（主）→ `e309254`（spec 观察①：`SharedSink::write_all` 整行原子 + 并发布/响应交错钉测）→ `07710a2`（qual 修复轮：F-Dart-1 会话死亡语义 + 护栏钉 + security §7 事实化；原 `16720d3`，lead push 前 amend 消息）→ `1661088`（qual 第 5 件：`wait_port_file` 32-hex 收下加固）。DONE → spec **PASS** → qual **ISSUES**（1 行为缺陷 + 安全护栏缺钉）→ 修复有牙 + 复核 → **APPROVED**（T1 关闭；workspace 457/0；flutter 120+2 / 带 daemon 122；CI 四轮 5/5）
+
+- **交付**：daemon `--listen/--port-file` TCP 回环会话（令牌握手[首行 auth/常数时间/-32001 即断不读后续]、`serve_lines` stdio/TCP 共用、`Notifier` 广播[写失败剔除/drop 注销/`SharedSink` 整行原子]、`portfile.rs`[unix 0600+`.tmp-<pid>`+rename 原子；windows 直写+BCryptGenRandom 标注]）；Dart `LineCoreClient` 抽取 + `SocketCoreClient`（port-file 单次读；-32001 粘性会话失败快速失败）；security §7（威胁模型/令牌生命周期/已知限制）。
+- **spec 独立核验**：12 条对照 + 手工实证（错令牌+合法请求同包只回 -32001 即 EOF；CLI 成对/非回环/坏地址 exit 2；port-file 0600+32hex 无残留；stdout 全程 0 字节）；6 偏离 + 1 计划缺陷（骨架先写 port-file 用 `opts.addr.port()`，`:0` 时会写 0——按正文修正，**erratum 记录**）全接受。
+- **qual 变异 23 枚（R1-R16/D1-D7）**：KILL 归因干净（R15 write_all 摘除 3/3 稳定红）；SURVIVE = 2 时序等价/1 死代码 + **7 枚真缺钉补测**（前缀/空串令牌绕过、非回环放行、成对约束、空行、符号链接写穿、写失败剔除、SinkHandle 注销）+ **1 行为缺陷 F-Dart-1**（FIN 不触发 `Socket.done` → 在飞 + 后续每次 10s 悬挂；T4 重试流受影响）→ 粘性 `_sessionError` 修复（缺口钉 <1s 绿）。
+- **落地文件 sha 差异说明**：landed 两新文件含仓库既有零宽版权串（全树约定，非缺陷）；qual INDEX 已补 landed/CI 对照。
+- **记录项（归 M2）**：无行长上限（TCP 把可达面扩到任何本机进程）；accept 循环 EMFILE 紧旋（建议退避）；握手无超时；`lock().unwrap()` 中毒模式；`.tmp` 残留重试与 bind 失败 exit(2) 两分支无测试（近不可达）；`SharedSink::write_fmt/write` 保留为纵深（注释标注无调用路径）；一条注释归属措辞微瑕（记录不改）。
+- **T4 移交（头号设计输入）**：① 提权 daemon 生命周期缺口——协议无 shutdown RPC、client 无进程句柄 → root daemon 无主滞留 + 多轮提权累积 + port-file/令牌清理归属须定方案（shutdown RPC / owner-pid 监督 / 全断自退）；② port-file 半行**两形态**（FormatException / 截断 token→-32001）轮询须双形态重试；③ 白名单用字面 IP（勿 localhost）；④ TCP 形态新建 client 不走 restartPrivileged；⑤ taskId 过滤保留。
+- **T2/T3 移交**：port-file ACL 收紧（真机 `icacls` 核对）；Windows 直写可升级 tmp+rename（`MOVEFILE_REPLACE_EXISTING` 可原子）；中危四项随平台层加固；§7 未验证清单随演进同步。
+- **未验证**：Windows/macOS port-file ACL 可读性、真 UAC/osascript/TCC 提权链、提权 daemon 停机行为、中危四项行为面。
+
+### T2（Windows 平台层）—— impl-m1e-t2。提交沿革：`810405d`（主）→ `c2a6779`（§8 引 CI run id + `:253` 括注；qual docfix patch 原文落码）→ `aa4998f`（机械拆分 `windows/enumerate.rs` + 零盘跳过 + P2/P18/P19 钉补）。DONE → spec **PASS**（CI 面独立核验闭）→ qual **APPROVED**（20 枚移植变异 18 KILL / 2 记录）→ 收口增复 APPROVED（T2 关闭；457/0；Windows 腿 430/0；CI 两轮 5/5）
+
+- **交付**：`windows.rs`（287 行）+ `windows/enumerate.rs`（354 行）——SetupAPI 枚举（`GUID_DEVINTERFACE_DISK` → 盘号经 `IOCTL_STORAGE_GET_DEVICE_NUMBER`）/ 只读句柄（`GENERIC_READ` only、无 `NO_BUFFERING`）/ `read_at` 钳位短读（≈Linux pread）；`io_lock: Mutex<()>` 串行化（**计划缺陷①修正**：原 Send/Sync 注释不成立——内核文件游标即共享可变状态）；`win:\\.\PhysicalDriveN` + `--device` 信任边界校验（Linux/macOS 零改动）；冒烟 2 枚 **CI runner 真跑**；纯函数单测 6→8；README/§8 已知限制。
+- **spec 独立核验**：CI 面亲验（headSha 绑定、逐测试名、`runneradmin` 提权上下文旁证——预判风险消解）；计划缺陷②（daemon 臂本地不可交叉 check）由 CI 首次真编译关闭。
+- **qual**：移植变异 19+1=20 枚（**18 KILL**；存活 P3 等效 / P4 两平台同表同缺记 M2）；`SP_DEVICE_INTERFACE_DETAIL_DATA_W` cbSize 与 windows-sys 0.61.2 源码逐位核对属实；只读铁律零写 API；windows-sys 单版本 + feature 最小性微 crate 实证；**拆分机械性独立复现**（25→27 函数，仅 4 处申报差异）。Nit 记录（P18 冗余断言等）。
+- **★ T4 头号移交（opener/枚举接线缺口）**：`main.rs:199-200` Windows `list_only` 恒空 + `:254-255` opener 恒 `Noopener`；UAC 命令若只传 `--listen/--port-file` ⇒ 提权 daemon 列零设备、扫描走不通。必修：(a) Windows 枚举接线（提权上下文正是所需环境）；(b) `win:` id 的 `DaemonOpener` 臂（懒打开）或枚举即注册；(c) `image:` 拒绝语义保持；(d) `--device` 入 UAC 命令须显式规划（单盘注册 ≠ 替代枚举）。
+- **T3 移交**：同款缺口（macOS 亦 `Noopener`+空 list_only）；`main.rs:136`「仅 Linux 支持」消息随 T3 更新；macos.rs 从第一笔守 500 行线宽。
+- **未验证**：真机枚举/读、UAC 全链路与 `--device` 运行时、4Kn 512B 读、USB-SATA 桥接盘 BusType/removable、换盘热插拔、Windows port-file ACL（T1 项）、同盘校验缺口 UX（§8 M2 卷号比较）、IO 面 I1-I9 审查式裁定。CI 脆弱面：冒烟隐含 admin + 恒有 PhysicalDrive0（设计前提非 bug）。
+
+### T3（macOS 平台层）—— impl-m1e-t3。提交沿革：`6304f92`（主）→ `fc4a8b2`（§9 引 CI run id + F1/F2）→ `a32d3b0`（收口补钉 P1-P7）。DONE → spec **PASS**（含 1 必办 docfix）→ qual **APPROVED**（36 变异 24 KILL / 11 SURVIVE / 1 HANG）→ 收口增复 APPROVED（T3 关闭；458/0；CI 三轮 5/5）
+
+- **交付**：`macos.rs` 393 行（`/dev/diskN` 枚举[纯数字整盘、数值升序]/DKIOC 容量[Darwin `_IOC` 公式求值+单测钉头文件值]/`O_RDONLY` 打开/pread 补齐/FDA→`PermissionDenied`+hint/信任边界 `parse_disk_node`）；`source_rdev_of`+`dev_major_minor` 提为 `#[cfg(unix)]` 共用（linux 行为逐位不变）；main.rs macOS 臂；macos_smoke（枚举硬/打开弱断言）；§9+README；CI 新增 macOS `--nocapture` 取证步（P7）。
+- **spec 独立核验**：14+ 条对照；ioctl 常量对源核（curl XNU `disk.h`/`ioccom.h` 逐字复算 0x40046418/0x40086419）；CI 面亲验（**xd-daemon 真 macOS 首次真编译**——T2 遗留缺口②就此闭合）。
+- **qual**：36 枚（24 KILL / 11 SURVIVE[5 等效 + 6 缺口] / 1 HANG）；解码单射 30 万样本 0 碰撞；**P7 取证得真机实证**（runner 走 Err/EPERM 分支、`warn: …该盘仍列入，size=0`——容量容错设计口径 + 硬断言同获真机验证）；收口 P1-P7 落码后 **6/7 缺钉转 KILL**（T2/E2/E3/R3/R5/R6）。
+- **偏离 5 项全 ACCEPT**：① 枚举容量容错（**未知 ≠ 确认零**——计划自身硬断言逼出）；② 跨 crate dev_t 解码同式（单射论证 + **P5 KAT 契约钉**封单侧改 Darwin 解码类风险）；③ 依赖（libc 0.2.189+rustix，lock +2 行零新版本）；④ §9 编号（§8 已占）；⑤ 接线缺口入档。
+- **记录/移交**：**P8 容量乘法纯函数钉**（S2 残余，4 行，并入 T4 轮）；R2/R7 短读循环仅真机可验（M2）；F3 `fstat is_block_device`（M2）；`read_at` 三份逐字拷贝（P2 已给 macOS 执行覆盖；抽 `crate::read_at_fill` 留 T4）；`entries.flatten()` 吞 per-entry Err（记录）；**F4 erratum**（Task 3 Files 清单漏 lib.rs/linux.rs/Cargo.toml，impl 依正文执行正确）；`open` 侧 id canonicalize（P6）而枚举侧未规范——与 linux 同构（记录）。
+- **T4 移交（与 T2 合并全集）**：双平台 opener 接线（`list_only` 恒空 + `NoopOpener`，含 `unix:` id opener 按平台分派；macOS 的 EPERM→PermissionDenied 目标**只在该臂可达**）；**osascript 提权 ≠ FDA**（root 后仍可能 EPERM——授权失败 UX 须能提示「已提权但仍缺完全磁盘访问」）；`--device` 是否入 UAC/osascript 命令须显式规划；-32006 macOS 盲区（整盘源 vs 分区目标）入 T6 总表。
+- **未验证**：真机 root+FDA 全链、4Kn/Apple Fabric 命名、`rdisk` 性能与权限、Gatekeeper（T5/M2）、macOS port-file ACL（T1 项）。
+
+### T4（三平台提权流）—— impl-m1e-t4。提交沿革：`cebe692`（daemon 接线：双平台枚举/opener + `--owner-pid` 监督/空转自退 + P8 + `read_at_fill`）→ `0ad6182`（port-file 属主交还）→ `aa9562f`（UI 三平台引导）→ `84392ae`（security §10）→ `1c59b1b`（ISSUE-1：会话目录显式 chmod 700）→ `bacf0dc`（root 测试取证：ran:/skip: 二值 + CI 步）→ `c9cfdf5`/`9abe104`（qual 补钉 P1/P2345/P7 + Windows 守卫）→ `bfbfff6`（P1 随件 production hunk 还原，byte 级对照=P1b）。DONE → spec **PASS**（含 ISSUE-1 闭合）→ qual **APPROVED**（39 变异 19 KILL / 20 SURVIVE → 12 补钉 + 8 等效）→ 增复 APPROVED（T4 关闭；cargo 469/0；flutter 137+2；CI 六轮 5/5）
+
+- **交付**：`elevation.dart`（三平台 `ElevationPlan` 纯函数：Win32 `-EncodedCommand`[UTF-16LE] / osascript 双层引号 / pkexec 字面 IP + `spawnElevation` / `connectElevatedSession`）；scan_controller 提权流（-32001 → 0700 会话目录[**显式 chmod**] → 轮询 ≤30s/500ms → client 交换 → 重试；**半行双形态重试**；osascript≠FDA 提示格）；daemon 接线（`enumerate_startup_list` 三平台 + `win:`/`unix:` 平台分派 opener + `image:` 语义不变）；`--owner-pid` 监督 + 空转 3s 自退 + 清 port-file + exit 0 + stdout 零写；security §10。
+- **spec 独立核验**：命令构造 12 组注入 0 逃逸（自写 UTF-16LE 解码器 + `CommandLineToArgvW` 语义复算）；生命周期独立真进程探针（含仓库未覆盖的「启动窗口不误退」）；ISSUE-1（`createTempSync` 跟随 umask，0002⇒0775）以**显式 chmod 700 + mode 真值断言**闭合（双 umask 复跑 + 448/509 变异互证）；8 偏离全 ACCEPT。
+- **qual**：39 枚（19 KILL；**12 补钉**杀 R1/R6/R7/R9/R14/R17/R18 + D6/D13/D19/D20；8 等效）；补钉后 469/0 + 137+2；增复轮语义零差 + 全杀复跑 + 无夹带。
+- **★ 计划缺陷①（关键承重，落地时发现）**：root daemon 写 port-file 属主=root ⇒ UI 读不到令牌、整链断（T1 同用户测试暴露不出）→ `adopt_owner_of_dir`（仅 root、取自目录属主、rename 前 chown，无任意 chown 原语）+ UI 0700；**CI ubuntu+macOS 两腿 `ran:` 直证真执行**（取证步首跑命中）。
+- **计划缺陷②（Windows 提权入口不可达）**：**记 M2**（产品决策面：首页无设备时无触发点；判据 3 未失守）；强制移交互 T5（`README-安装.txt` 改写）与 T6（总表/矩阵行；表述「Windows 提权链已备、入口未接（M2）」）。
+- **计划缺陷③**：`-ArgumentList` 数组拆断含空格路径 → 单串 + Win32 引用（KAT 钉）。
+- **记录不修**：chmod 非零退出未检查（M2 一行建议）；Windows 第二轮 -32010 落 `_retryViaClientRestart` 文案误导（角落）；授权超时弃留 root daemon（窗口有界，T6 表）；30s 为软界；§10.4 未直言后果链（M2 文档补）；adopt 路径式 TOCTOU（M2 fd passing）；README「已知限制」段 stale（T5/T6）。
+- **T5 移交**：README 平台矩阵/已知限制改写（Windows 提权流「未接入（M2）」；Linux/macOS「可用（真机未验证）」；删过期「枚举接线归 T4/M2」半句）；`README-安装.txt` 提权句改写；**打包布局验证 `_client.daemonPath` 非空**（否则重试静默退化旧支路）；macOS 未签名/Gatekeeper + osascript≠FDA 真机复验说明；打包冒烟不得依赖 `--listen/--port-file/--owner-pid`。
+- **T6 移交**：未验证总表加行（真 UAC/osascript/pkexec、Windows port-file ACL/`OpenProcess` 语义、pid 复用/双 daemon 窗口、macOS -32006 整盘源盲区、Windows 提权入口不可达[M2]、授权超时弃留窗口、R11 属主交还 root 真路径、R2 空转下界）；判据 3 取证点=`ui/test/elevation_test.dart`（15 枚）。
+- **未验证**：真 UAC/osascript/pkexec 对话框与端到端链、真 FDA(TCC)、Windows ACL/`OpenProcess`、真机 pid 复用、R11 root 真路径。
+
+### T5（Windows/macOS 打包）—— impl-m1e-t5。提交沿革：`2fe0e03`（主：两打包脚本+两冒烟+CI 门控+`packagedDaemonPath`+README/§11）→ `710ed0f`（F1 活锁修复）→ `579b336`（README 用法 3 如实化 + smoke 退出码）→ `7695506`（spec 逐字补正：用法 3 三行 + ps1 一行，byte-exact）→ `fff5d29`（qual 钉 0001+0002）→ `950f186`（N-1 macOS 具名失败行）。DONE → spec **PASS 主干 + 1 轻微 ISSUE（已修）** → qual **ISSUES**（1 项：F1 回归钉缺失）→ 落钉有牙 → 增复 **APPROVED**（T5 关闭；cargo 470/0；flutter 139+2；CI 两轮 7/7 与 5/5+2skip）
+
+- **交付**：`package-windows.ps1`（v0.3.0 注入 / `--locked` / 组装 / zip）/`package-macos.sh`（arch 分派 / ditto / 按架构两 zip）/`e2e-package-smoke.{ps1,sh}`（`--image`+ping、双平台具名 FAIL 奇偶）/`notarize.sh` 空壳（M2 顺序）；ci.yml 两手动 job（`packaging` input 门控、artifact `xiaodun-{windows,macos}-zip`）；`packagedDaemonPath()`（显式→ENV→**同目录回退**，双击承重件）+2 单测；README 三平台矩阵/已知限制；security §11。
+- **spec 独立核验**：两 artifact **下载拆包**（win 15 项 / mac 57 项含 6 symlink 保真、universal 主程序）；CI 锚点逐行（`PACKAGE SMOKE OK` 双平台）；门控双跑零扰动（7/7 与 skip）；偏离 A-D 全 ACCEPT。
+- **qual**：F1 修复正确但**回归保护缺失**（`pending` 提交套件 0 次填充——两序容忍机制是套件内死代码；变异双向 12/0 绿）；钉 `0001`（反序确定性钉）+`0002`（大写宿主上界钉）+N-1 落地后**双向有牙复现**（复活→挂死 rc=124、摘消费→0.304s panic、去 `toLowerCase`→红）。
+- **★ F1（T1 遗留活锁，拆弹）**：`Lines::next()` pending 回放+失配 push 回 ⇒ 通知抢跑时纯用户态自旋（98% CPU、socket 读超时全程不生效）；修复=去掉回放分支；修复前复现 rc=124 vs 修复后 0.15s；回归钉 `0001` 已落地（13 枚）。
+- **记录（T6 表）**：`Runner.rc` 版本资源仍 `xiaodun_ui.exe`（装饰性）；**F2** macOS 沙箱 entitlement + ad-hoc 签名后 seal 失效（首开或报「已损坏」）；`-macos-x64.zip` 物证缺（runner=arm64）；artifact 内 README CRLF（runner autocrlf，仓库 LF）。
+- **T6 移交**：**终轮 `packaging=true` 必办**（唯一途径修已发布 artifact 内旧 README + ps1 新行真机首解析）；未验证总表增行全集（运行时回退/真机首启/SmartScreen/无 VC++ 库/macOS 挂载+沙箱/F2/签名公证 M2/TCC-FDA M2/x64 zip/Runner.rc）；判据 4 取证点=两 artifact。
+- **未验证**：pwsh 脚本本机零执行（CI 已实证）；`packagedDaemonPath` 运行时回退（仅纯函数单测）；真机 GUI 首启/签名链全系。
+
+---
+
 © 2026 erik · https://erik.xyz · erik@erik.xyz

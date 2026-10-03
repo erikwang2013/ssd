@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 
 import '../../core_client/core_client.dart';
+import '../../core_client/elevation.dart';
 import '../../core_client/protocol.dart';
 import '../../util/format.dart';
 import '../results/results_page.dart';
@@ -14,6 +15,8 @@ class ScanPage extends StatefulWidget {
     required this.client,
     required this.device,
     this.onClientReplaced,
+    this.elevationLauncher,
+    this.elevationConnect,
   });
 
   final CoreClient client;
@@ -21,6 +24,10 @@ class ScanPage extends StatefulWidget {
 
   /// 特权重启后应用层换用新 client（EACCES 引导路径）。
   final void Function(CoreClient client)? onClientReplaced;
+
+  /// 测试注入缝（提权器启动/会话连接）：null = 用真实现（UAC/osascript/pkexec + TCP）。
+  final ElevationLauncher? elevationLauncher;
+  final ElevationSessionConnector? elevationConnect;
 
   @override
   State<ScanPage> createState() => _ScanPageState();
@@ -31,6 +38,8 @@ class _ScanPageState extends State<ScanPage> {
     widget.client,
     deviceId: widget.device.id,
     onClientReplaced: widget.onClientReplaced,
+    elevationLauncher: widget.elevationLauncher,
+    elevationConnect: widget.elevationConnect,
   );
 
   @override
@@ -39,7 +48,8 @@ class _ScanPageState extends State<ScanPage> {
     super.dispose();
   }
 
-  /// 开始扫描；-32001 → EACCES 对话框，[授权后重试] = 特权重启 → 重试 scanStart。
+  /// 开始扫描；-32001 → EACCES 对话框，[授权后重试] = 平台提权引导（UAC/osascript/pkexec
+  /// → TCP 提权会话）→ 重试 scanStart。**真对话框路径未验证（需真机）。**
   Future<void> _start() async {
     await _controller.start();
     if (!mounted) return;
@@ -48,7 +58,7 @@ class _ScanPageState extends State<ScanPage> {
         context: context,
         builder: (ctx) => AlertDialog(
           title: const Text('需要管理员权限访问该设备'),
-          content: const Text('核心服务将以管理员身份重启，然后继续扫描。'),
+          content: const Text('将弹出系统授权对话框；授权后以管理员身份建立提权会话，然后继续扫描。'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -97,7 +107,8 @@ class _ScanPageState extends State<ScanPage> {
     if (taskId == null) return;
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => ResultsPage(client: widget.client, taskId: taskId),
+        // 提权会话替换过客户端：必须用控制器**当前**的 client（widget.client 是旧引用）
+        builder: (_) => ResultsPage(client: _controller.client, taskId: taskId),
       ),
     );
   }
@@ -205,6 +216,10 @@ class _ScanPageState extends State<ScanPage> {
   List<Widget> _statusArea() {
     final state = _controller.state;
     final error = _controller.error;
+    // 提权会话建立中（认证框可能久置 30s）：如实告知，不显示「扫描中」
+    if (_controller.elevationPending) {
+      return const [Text('等待授权…')];
+    }
     return switch (state) {
       ScanUiState.canceled => const [Text('扫描已取消')],
       ScanUiState.failed => [Text(error == null ? '扫描失败' : '扫描失败：$error')],

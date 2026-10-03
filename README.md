@@ -31,6 +31,17 @@
 
 只要设备在系统中表现为块设备即可，与内置磁盘走同一条通路。
 
+### 平台
+
+| 平台 | 引擎（枚举 / 只读 / 提权） | 打包 | 状态 |
+|---|---|---|---|
+| Linux | sysfs 枚举 + 只读 + `pkexec` 提权（uaccess 免密路径） | deb（daemon + polkit + udev） | 可用（真机未验证） |
+| Windows | SetupAPI 枚举 + 只读；UAC 提权链已备、**应用内入口未接入（M2）** | 便携 zip | 可用（真机未验证） |
+| macOS | `/dev/diskN` 枚举 + 只读 + `osascript` 提权（≠ 完全磁盘访问授权） | staged zip（未签名；公证归 M2） | 可用（真机未验证） |
+
+「可用（真机未验证）」= 代码与 CI 冒烟（两 runner 真跑枚举/读）已通过，真机路径
+（真 U 盘/真相机卡、真 UAC/polkit/授权对话框、真 FDA 授权）仍需手测，见「已知限制」。
+
 ### 恢复能力
 
 - **删除文件恢复**（快速扫描）：文件名、目录结构、时间戳完整找回，附恢复质量分级（完整 / 可能损坏 / 仅雕刻）
@@ -110,9 +121,10 @@ ssd/
 │   ├── lib/home_page.dart      #   设备列表页（三态）
 │   └── test/                   #   golden 契约测试 + widget / 集成测试
 ├── fixtures/                   # 确定性测试镜像生成脚本
-├── scripts/                    # 端到端冒烟（scripts/e2e.sh）
+├── scripts/                    # 端到端冒烟（e2e.sh）· 打包（package-windows.ps1 / package-macos.sh）
+├── packaging/                  # 打包素材（Windows 包内 README-安装.txt · deb · polkit · udev）
 ├── docs/                       # 设计文档 · 实施计划 · 图示素材
-└── .github/workflows/          # CI：Rust 三平台矩阵 + Flutter job
+└── .github/workflows/          # CI：Rust 三平台矩阵 + Flutter job + 手动打包 job
 ```
 
 详细设计见 [设计文档](docs/superpowers/specs/2026-10-02-xiaodun-design.md)。
@@ -168,6 +180,31 @@ cd ui && flutter test         # UI：协议 golden + widget 测试
 cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真 daemon 全链路（扫描→预览→导出逐字节）
 ```
 
+### 打包（Windows / macOS）
+
+```powershell
+# Windows（Windows + Flutter + Rust）：产物 dist/xiaodun-vX.Y.Z-windows-x64.zip
+pwsh scripts/package-windows.ps1
+pwsh scripts/e2e-package-smoke.ps1     # 解压 → 布局断言 → --image 起 daemon → ping
+```
+
+```bash
+# macOS（产物 dist/xiaodun-vX.Y.Z-macos-<arm64|x64>.zip，架构 = 构建机架构）
+bash scripts/package-macos.sh
+bash scripts/e2e-package-smoke.sh
+```
+
+包内布局：主程序与 `xd-daemon[.exe]` **同目录**（`xiaodun.exe` + `xd-daemon.exe` / `.app` 的
+`Contents/MacOS/xd-daemon`）——界面按此自动发现引擎（`XD_DAEMON_BIN` 可覆盖），冒烟脚本断言该布局。
+包内 `README-安装.txt` 说明当前 Windows 权限现状（提权入口未接入，M2）。
+
+两个平台都是**手动 CI job**：Actions → CI → Run workflow 勾选 `packaging=true`
+（常规轮次不跑 flutter build windows/macos）；产物 artifact 名 `xiaodun-windows-zip` /
+`xiaodun-macos-zip`。开发机无法本地验证打包，以 dispatch 一轮 CI 实证。
+
+**macOS 未签名**：当前包未签名/未公证（归 M2，`scripts/notarize.sh` 为占位），首次打开需
+**右键 → 打开**（或 `xattr -d com.apple.quarantine <app>`）绕过 Gatekeeper。
+
 ## 路线图
 
 | 阶段 | 内容 | 出口标准 |
@@ -197,8 +234,25 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真 daem
   （三重目标校验、逐字节精确、分片流式、逐件降级/失败报告、实取消）；全链路集成测试
   （Rust 夹具镜像 → 真 daemon → 扫描 → 预览回读 → 导出 → 报告逐字节）进 CI，e2e-loop 增
   「环回挂载点导出断言 `-32006` + 普通目录导出逐字节比对」真集成段
+- **M1e 尾段 · 平台收口**（本次合入）：TCP 回环提权会话（`--listen/--port-file` 令牌 0600 文件 +
+  `--owner-pid` 监督 + 空转自退；Windows UAC / macOS osascript / Linux pkexec 三平台引导）；Windows
+  （SetupAPI）与 macOS（`/dev/diskN`）平台层（枚举 + 只读句柄 + 属主交还）；Windows 便携 zip 与
+  macOS staged zip 打包（CI 手动 job `packaging=true` + 产物冒烟）；F1 测试活锁拆弹 + 全链路回归钉
 
-M1 剩余切片：Windows/macOS 平台层与打包。
+**已知限制（M1e 平台层）**：Windows 目标盘同源校验（-32006）M1 不做——Windows 无 `st_rdev`，
+`source_rdev` 恒 `None`（M2 补，卷句柄盘号比较）；Windows 物理盘枚举/只读打开**未验证（需真机）**
+（CI 只证枚举/读冒烟，且枚举需管理员权限）。Windows 的 UAC 提权链（命令构造/回环会话/生命周期，
+T4）已就位，但**应用内入口未接入**：非提权时枚举为空 ⇒ 首页无设备 ⇒ 走不到提权引导，M2 补首页入口。
+macOS `/dev/diskN` 枚举/只读打开同样**未验证（需真机）**（非 root/无完全磁盘访问时枚举仅列盘、容量记 0）；
+macOS 的 -32006 亦实质未封——挂载卷 `st_dev` 是分区 `dev_t`、源侧 `st_rdev` 是整盘 `dev_t`，
+且无 `/sys` 祖先链兜底（M2 以 IOKit 补，与 Windows 缺口同级）；macOS 的 `osascript` 提权
+**不等于**完全磁盘访问（FDA）授权——root 后仍可能 EPERM（UI 已备提示文案）。
+transport/removable 提示字段：Windows 已映射（BusType → usb/sata/nvme/other + removable），
+macOS 恒 `None`/`false`（M2 以 IOKit 补）。打包产物**未签名**：macOS 首次打开需右键-打开，
+Windows SmartScreen 需「仍要运行」。细节见 `docs/security/linux-privilege-model.md` §8/§9/§10/§11。
+
+**M1e 尾段已完成开发**；出口验收（全矩阵 CI + 未验证边界总表）收官后 M1 完整合入。
+真机手测清单索引见 `docs/security/linux-privilege-model.md` §12（M1e 边界总表）与 §5（Linux 平台项）。
 目标：全端 1.0 约 9-12 个月（5-6 人团队，4 条工作流并行）。
 
 ---
