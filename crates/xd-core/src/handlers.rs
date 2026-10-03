@@ -1023,6 +1023,7 @@ mod tests {
                 first_cluster: 0,
                 byte_offset: None,
                 contiguous: None,
+                record_id: None,
             });
         }
         store.insert_entries(id, &entries).unwrap();
@@ -1274,6 +1275,7 @@ mod tests {
                     first_cluster: 6,
                     byte_offset: None,
                     contiguous: None,
+                    record_id: None,
                 }],
             )
             .unwrap();

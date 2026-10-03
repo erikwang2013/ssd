@@ -511,6 +511,7 @@ fn forged(idx: u64, name: &str, ext: &str, size: u64, quality: &str) -> ScanEntr
         first_cluster: 0,
         byte_offset: None,
         contiguous: None,
+        record_id: None,
     }
 }
 

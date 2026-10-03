@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":16,"result":{"total":2,"entries":[{"idx":0,"name":"REPORT.PDF","path":"/docs","ext":"pdf","sizeBytes":52313,"deleted":false,"isDir":false,"quality":"complete","firstCluster":8194,"recordId":18},{"idx":1,"name":"DELETED.JPG","path":"/DCIM","ext":"jpg","sizeBytes":24576,"deleted":true,"isDir":false,"quality":"complete","firstCluster":13314,"recordId":37}]}}

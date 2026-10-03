@@ -7,6 +7,8 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xiaodun_ui/core_client/protocol.dart';
+// v1.3 值级断言用产品模型（本文件另有 v1 最简局部 ScanEntry 同名遮蔽，故加前缀）
+import 'package:xiaodun_ui/core_client/protocol.dart' as proto;
 
 Map<String, dynamic> golden(String name) =>
     jsonDecode(File('../proto/v1/examples/$name').readAsStringSync())
@@ -123,13 +125,15 @@ void expectRpcError(String file, int code, String message) {
 }
 
 void main() {
-  test('golden set is exactly the 36 contract files', () {
-    // 与 Rust 侧 golden_set_is_exactly_the_36_contract_files 对称：
+  test('golden set is exactly the 40 contract files', () {
+    // 与 Rust 侧 golden_set_is_exactly_the_40_contract_files 对称：
     // 新增/删除契约文件必须同步两侧测试（flutter test 的 cwd 为 ui/）。
     final names = Directory(
       '../proto/v1/examples',
     ).listSync().map((e) => e.uri.pathSegments.last).toList()..sort();
     final expected = [
+      'daemon_shutdown.request.json',
+      'daemon_shutdown.response.json',
       'device_list.request.json',
       'device_list.response.json',
       'error_device_permission.response.json',
@@ -160,6 +164,8 @@ void main() {
       'scan_results.request.json',
       'scan_results.response.json',
       'scan_results_carved.response.json',
+      'scan_results_ext4.response.json',
+      'scan_results_ntfs.response.json',
       'scan_resume.request.json',
       'scan_resume.response.json',
       'scan_start.request.json',
@@ -307,6 +313,84 @@ void main() {
       final result = decodeResult(golden(file));
       expect(result['taskId'], 1, reason: file);
       expect(result['state'], state, reason: file);
+    });
+  });
+
+  test('v1.3 goldens: recordId 值级/三态 + daemon.shutdown 逐字', () {
+    // NTFS：recordId = MFT 记录号（deleted + maybeDamaged 构型）。
+    final ntfs = proto.ScanResultsPage.fromJson(
+      decodeResult(golden('scan_results_ntfs.response.json')),
+    );
+    expect(ntfs.total, 1);
+    final img = ntfs.entries.single;
+    expect(img.name, 'IMG_2043.JPG');
+    expect(img.deleted, isTrue);
+    expect(img.quality, 'maybeDamaged');
+    expect(img.firstCluster, 120);
+    expect(img.recordId, 42);
+    expect(
+      ntfs.entries.map((e) => e.toJson()).toList(),
+      golden('scan_results_ntfs.response.json')['result']['entries'],
+      reason: 'encode 方向同形（recordId 键在）',
+    );
+
+    // ext4：recordId = inode 号（1 live + 1 journal 恢复）。
+    final ext4 = proto.ScanResultsPage.fromJson(
+      decodeResult(golden('scan_results_ext4.response.json')),
+    );
+    expect(ext4.total, 2);
+    expect(ext4.entries[0].deleted, isFalse);
+    expect(ext4.entries[0].recordId, 18);
+    expect(ext4.entries[1].deleted, isTrue);
+    expect(ext4.entries[1].recordId, 37);
+    expect(
+      ext4.entries.map((e) => e.toJson()).toList(),
+      golden('scan_results_ext4.response.json')['result']['entries'],
+    );
+
+    // 三态（口径同 byteOffset）：缺省 = null 且序列化省略键；**0 是合法记录号**。
+    Map<String, dynamic> entryJson(Object? recordId) => {
+      'idx': 0,
+      'name': 'A.TXT',
+      'path': '/',
+      'ext': 'txt',
+      'sizeBytes': 4,
+      'deleted': true,
+      'isDir': false,
+      'quality': 'complete',
+      'firstCluster': 6,
+      'recordId': ?recordId,
+    };
+    expect(proto.ScanEntry.fromJson(entryJson(null)).recordId, isNull);
+    expect(
+      proto.ScanEntry.fromJson(entryJson(null))
+          .toJson()
+          .containsKey('recordId'),
+      isFalse,
+      reason: '序列化省略 null（与 Rust skip_serializing_if 同形）',
+    );
+    expect(proto.ScanEntry.fromJson(entryJson(0)).recordId, 0);
+    expect(
+      proto.ScanEntry.fromJson(entryJson(0)).toJson()['recordId'],
+      0,
+      reason: '0 不得被当作未知省略（不得用 0 表未知）',
+    );
+    // 旧格式（无 recordId 键）仍解码 = null：纯增量，v1.2 客户端载荷不被拒。
+    final legacy =
+        (golden('scan_results.response.json')['result']['entries'] as List)
+            .map((e) => proto.ScanEntry.fromJson(e as Map<String, dynamic>))
+            .toList();
+    expect(legacy.every((e) => e.recordId == null), isTrue);
+
+    // daemon.shutdown：请求 params 为 null（与 ping 同形）、响应逐字。
+    expect(
+      jsonDecode(
+        encodeRequest(id: 24, method: 'daemon.shutdown', params: null),
+      ),
+      golden('daemon_shutdown.request.json'),
+    );
+    expect(decodeResult(golden('daemon_shutdown.response.json')), {
+      'accepted': true,
     });
   });
 

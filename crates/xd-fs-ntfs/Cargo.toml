@@ -1,0 +1,8 @@
+# © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
+[package]
+name = "xd-fs-ntfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xd-device = { path = "../xd-device" }

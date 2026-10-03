@@ -25,6 +25,12 @@ pub struct ScanEntry {
     /// 不猜连续）；旧客户端缺省解析为 None，语义与 M1d 前一致。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contiguous: Option<bool>,
+    /// FS 元数据记录号（v1.3）：NTFS = MFT 记录号；ext4 = inode 号；fat/exfat/雕刻件恒 None。
+    /// 读取路径以它重定位（与 byte_offset 分工：后者恒为雕刻件）。
+    /// 三态：缺省 = null（序列化省略）；**0 是合法记录号/inode 号**——不得用 0 表未知
+    ///（同 byte_offset 口径）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -104,6 +104,7 @@ fn fat_to_entry(e: &xd_fs_fat::scan::FatEntry) -> ScanEntry {
         first_cluster: e.first_cluster,
         byte_offset: None,
         contiguous: None, // fat 无 NoFatChain 概念：拓扑由 deleted 决定（删除件走连续回退）
+        record_id: None,  // fat 无 FS 记录号（v1.3 恒缺省；读取走 first_cluster）
     }
 }
 
@@ -123,6 +124,47 @@ fn exfat_to_entry(e: &xd_fs_exfat::scan::ExfatEntry) -> ScanEntry {
         first_cluster: e.first_cluster,
         byte_offset: None,
         contiguous: Some(e.contiguous), // exfat 拓扑提示：反构造读取时承重（NoFatChain/链）
+        record_id: None,                // exfat 无 FS 记录号（v1.3 恒缺省）
+    }
+}
+
+fn ntfs_to_entry(e: &xd_fs_ntfs::NtfsEntry) -> ScanEntry {
+    ScanEntry {
+        idx: 0,
+        name: e.name.clone(),
+        path: e.path.clone(),
+        ext: e.ext.clone(),
+        size_bytes: e.size_bytes,
+        deleted: e.deleted,
+        is_dir: e.is_dir,
+        quality: match e.quality {
+            xd_fs_ntfs::RecoverQuality::Complete => "complete".into(),
+            xd_fs_ntfs::RecoverQuality::MaybeDamaged => "maybeDamaged".into(),
+        },
+        first_cluster: e.first_cluster,
+        byte_offset: None,
+        contiguous: None, // ntfs 无 exfat NoFatChain 概念：读取以 record_id 重定位
+        record_id: Some(e.record_id), // MFT 记录号（含 0：$MFT 自身记录号合法）
+    }
+}
+
+fn ext4_to_entry(e: &xd_fs_ext4::Ext4Entry) -> ScanEntry {
+    ScanEntry {
+        idx: 0,
+        name: e.name.clone(),
+        path: e.path.clone(),
+        ext: e.ext.clone(),
+        size_bytes: e.size_bytes,
+        deleted: e.deleted,
+        is_dir: e.is_dir,
+        quality: match e.quality {
+            xd_fs_ext4::RecoverQuality::Complete => "complete".into(),
+            xd_fs_ext4::RecoverQuality::MaybeDamaged => "maybeDamaged".into(),
+        },
+        first_cluster: e.first_cluster,
+        byte_offset: None,
+        contiguous: None, // ext4 无 exfat NoFatChain 概念：读取以 record_id 重定位
+        record_id: Some(e.record_id), // inode 号（含 0 保留位：契约层不解释值域）
     }
 }
 
@@ -278,6 +320,7 @@ impl CarveProgress<'_> {
                     first_cluster: 0,
                     byte_offset: Some(e.byte_offset),
                     contiguous: None, // 雕刻件无拓扑：读取走 read_back（byte_offset 分支）
+                    record_id: None,  // 雕刻件恒无 FS 记录号（v1.3）
                 };
                 self.found += 1; // idx 先占位后自增：条目编号与 found 计数恒一致
                 let _ = self.store.insert_entries(
@@ -335,6 +378,17 @@ pub(crate) fn run_worker(
                 .map_err(|e| e.to_string()),
                 FsKind::Exfat => xd_fs_exfat::scan::scan_with_observer(&counting, &mut |e| {
                     progress.on_entry(exfat_to_entry(e));
+                })
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+                // T1 骨架臂：恒 Err(Unsupported) → 任务 failed（-32603 语义，非 panic）；T2/T4 填实
+                FsKind::Ntfs => xd_fs_ntfs::scan_with_observer(&counting, &mut |e| {
+                    progress.on_entry(ntfs_to_entry(e));
+                })
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+                FsKind::Ext4 => xd_fs_ext4::scan_with_observer(&counting, &mut |e| {
+                    progress.on_entry(ext4_to_entry(e));
                 })
                 .map(|_| ())
                 .map_err(|e| e.to_string()),

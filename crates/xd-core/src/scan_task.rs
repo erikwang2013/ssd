@@ -24,6 +24,8 @@ pub struct ScanCanceled;
 pub enum FsKind {
     Fat,
     Exfat,
+    Ntfs,
+    Ext4,
 }
 
 impl FsKind {
@@ -31,6 +33,8 @@ impl FsKind {
         match self {
             FsKind::Fat => "fat",
             FsKind::Exfat => "exfat",
+            FsKind::Ntfs => "ntfs",
+            FsKind::Ext4 => "ext4",
         }
     }
 }
@@ -44,6 +48,8 @@ impl std::str::FromStr for FsKind {
         match s {
             "fat" => Ok(FsKind::Fat),
             "exfat" => Ok(FsKind::Exfat),
+            "ntfs" => Ok(FsKind::Ntfs),
+            "ext4" => Ok(FsKind::Ext4),
             _ => Err(ProbeError::Unsupported),
         }
     }
@@ -54,15 +60,25 @@ pub enum ProbeError {
     Unsupported,
 }
 
-/// 引导扇区签名粗筛（唯一 1 个扇区读）。exFAT 签名定死；FAT 做 0x55AA + BPB 字段合理性
-/// 粗筛，完整校验留给引擎（worker 内 parse 失败 → 任务 failed）。
+/// 引导区签名粗筛（唯一 1 次读放大到 2048B——ext4 超级块在 1080，须越过首扇区）。
+/// 判定顺序写死：exFAT → NTFS → ext4 → FAT（FAT 为最粗筛，兜底）。exFAT/NTFS 签名定死；
+/// ext4 认 superblock magic 0xEF53（卷内 1024+56）；FAT 做 0x55AA + BPB 字段合理性粗筛，
+/// 完整校验留给引擎（worker 内 parse 失败 → 任务 failed）。**n 之外的字节不是输入**：
+/// 一切签名判定都以实际读到的 n 为界（设备短读不得误判）。
 pub fn probe(dev: &dyn BlockDevice) -> Result<FsKind, ProbeError> {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 2048];
     let n = dev
         .read_at(0, &mut buf)
         .map_err(|_| ProbeError::Unsupported)?;
     if n >= 11 && &buf[3..11] == b"EXFAT   " {
         return Ok(FsKind::Exfat);
+    }
+    if n >= 11 && &buf[3..11] == b"NTFS    " {
+        return Ok(FsKind::Ntfs); // OEM ID（VBR 偏移 3）
+    }
+    // ext4：超级块 magic 0xEF53（LE：字节序 0x53,0xEF）位于卷内 1024+56 = 1080（0x438）
+    if n >= 1082 && buf[1080] == 0x53 && buf[1081] == 0xEF {
+        return Ok(FsKind::Ext4);
     }
     if n >= 512 {
         let bps = u16::from_le_bytes([buf[11], buf[12]]);
@@ -121,16 +137,24 @@ impl DeviceOpener for NoopOpener {
 /// worker 线程体：入参恒为 (id, device, ctrl, store, notify)；deep 的额外状态（runs）由闭包携带。
 type WorkerFn = Box<dyn FnOnce(u64, Arc<dyn BlockDevice>, Arc<Ctrl>, Arc<Store>, NotifyFn) + Send>;
 
-/// 空闲区间枚举分派（两引擎错误一律收敛为 UnallocatedUnavailable——上层只回 -32005，
+/// 空闲区间枚举分派（各引擎错误一律收敛为 UnallocatedUnavailable——上层只回 -32005，
 /// 错误细节只进日志）。空 Vec 是合法结果（无空闲 = 空扫），不得与 Err 混同。
 fn unallocated_runs_of(dev: &dyn BlockDevice, fs: FsKind) -> Result<Vec<Range<u64>>, ScanError> {
-    // 两引擎错误类型不同（FatError/ExfatError）：此处抹成 () 收敛（细节进日志，不回客户端）
+    // 各引擎错误类型不同（FatError/ExfatError/NtfsError/Ext4Error）：此处抹成 () 收敛
+    //（细节进日志，不回客户端）
     let r = match fs {
         FsKind::Fat => xd_fs_fat::freespace::unallocated_runs(dev).map_err(|e| {
             eprintln!("warn: fat freespace unavailable: {e:?}");
         }),
         FsKind::Exfat => xd_fs_exfat::freespace::unallocated_runs(dev).map_err(|e| {
             eprintln!("warn: exfat freespace unavailable: {e:?}");
+        }),
+        // T1 骨架恒 Err(Unsupported) → -32005（深扫拒绝在未知分配上扫）；T3/T4 填实
+        FsKind::Ntfs => xd_fs_ntfs::unallocated_runs(dev).map_err(|e| {
+            eprintln!("warn: ntfs freespace unavailable: {e:?}");
+        }),
+        FsKind::Ext4 => xd_fs_ext4::unallocated_runs(dev).map_err(|e| {
+            eprintln!("warn: ext4 freespace unavailable: {e:?}");
         }),
     };
     r.map_err(|()| ScanError::UnallocatedUnavailable)
@@ -732,6 +756,7 @@ mod tests {
             first_cluster: 0,
             byte_offset: Some(byte_offset),
             contiguous: None,
+            record_id: None,
         }
     }
 
@@ -1046,5 +1071,107 @@ mod tests {
         assert_eq!(probe(&*dev).unwrap(), FsKind::Exfat);
         let (_f2, zeros) = crate::testutil::dev_from_bytes(&[0u8; 4096]);
         assert!(matches!(probe(&*zeros), Err(ProbeError::Unsupported)));
+    }
+
+    /// NTFS 粗筛夹具：OEM ID（VBR 偏移 3..11）置 "NTFS    "，其余为零。
+    fn ntfs_skeleton_image() -> Vec<u8> {
+        let mut image = vec![0u8; 4096];
+        image[3..11].copy_from_slice(b"NTFS    ");
+        image
+    }
+
+    /// ext4 粗筛夹具：superblock magic 0xEF53（LE 字节序）置卷内 1080..1082，其余为零。
+    fn ext4_skeleton_image() -> Vec<u8> {
+        let mut image = vec![0u8; 4096];
+        image[1080] = 0x53;
+        image[1081] = 0xEF;
+        image
+    }
+
+    #[test]
+    fn probe_detects_ntfs_by_oem_id() {
+        let (_f, dev) = crate::testutil::dev_from_bytes(&ntfs_skeleton_image());
+        assert_eq!(probe(&*dev).unwrap(), FsKind::Ntfs);
+        assert_eq!(FsKind::Ntfs.as_str(), "ntfs");
+        assert_eq!("ntfs".parse::<FsKind>().unwrap(), FsKind::Ntfs);
+    }
+
+    #[test]
+    fn probe_detects_ext4_by_superblock_magic() {
+        let (_f, dev) = crate::testutil::dev_from_bytes(&ext4_skeleton_image());
+        assert_eq!(probe(&*dev).unwrap(), FsKind::Ext4);
+        assert_eq!(FsKind::Ext4.as_str(), "ext4");
+        assert_eq!("ext4".parse::<FsKind>().unwrap(), FsKind::Ext4);
+    }
+
+    /// 对抗性短读设备：整块 buf 全覆盖合法内容，但**只声称读了 `n` 字节**——
+    /// `n` 之外的残字节不是输入。probe 若有任一判定越过 n（丢掉 `n >=` 闸门），此处必红。
+    struct ResidueDev {
+        image: Vec<u8>,
+        n: usize,
+    }
+
+    impl BlockDevice for ResidueDev {
+        fn info(&self) -> &xd_device::DeviceInfo {
+            unreachable!("probe 不读 info")
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, xd_device::DeviceError> {
+            assert_eq!(offset, 0, "probe 只读卷首");
+            let m = self.image.len().min(buf.len());
+            buf[..m].copy_from_slice(&self.image[..m]);
+            Ok(self.n.min(m))
+        }
+    }
+
+    #[test]
+    fn probe_short_read_does_not_false_positive() {
+        // <1082 字节输入不得误判 ext4（同理 NTFS 的 n>=11）：设备短读后，n 之外的字节
+        // 恰是合法签名残影。
+        let short = |n: usize, image: Vec<u8>| probe(&ResidueDev { image, n });
+        assert!(
+            matches!(
+                short(1081, ext4_skeleton_image()),
+                Err(ProbeError::Unsupported)
+            ),
+            "n=1081：ext4 magic 的后半字节在 n 之外，不得误判"
+        );
+        assert!(
+            matches!(
+                short(8, ntfs_skeleton_image()),
+                Err(ProbeError::Unsupported)
+            ),
+            "n=8：NTFS OEM ID 不完整，不得误判"
+        );
+        // 对照：同内容读满 → 正判（防「一律 Unsupported」的假修复）
+        assert_eq!(short(1082, ext4_skeleton_image()).unwrap(), FsKind::Ext4);
+        assert_eq!(short(11, ntfs_skeleton_image()).unwrap(), FsKind::Ntfs);
+    }
+
+    #[test]
+    fn unsupported_fs_skeleton_fails_cleanly() {
+        // T1 骨架臂：NTFS/ext4 已被 probe 认出，但引擎恒 Err(Unsupported) → 快扫任务
+        // failed（**非 panic**：崩溃隔离边界内「未实现」不得伪装成崩溃），深扫启动如实拒绝。
+        for (image, fs) in [
+            (ntfs_skeleton_image(), FsKind::Ntfs),
+            (ext4_skeleton_image(), FsKind::Ext4),
+        ] {
+            let m = mgr();
+            let (_f, dev) = crate::testutil::dev_from_bytes(&image);
+            assert_eq!(probe(&*dev).unwrap(), fs);
+            let s = m.start(dev.clone()).unwrap();
+            assert_eq!(s.fs, fs, "入册 fs 串与 probe 一致（handlers 自动透传）");
+            let row = wait_for_state(&m, s.task_id, ScanState::Failed, Duration::from_secs(10));
+            assert_eq!(row.found_count, 0);
+            // unallocated_runs_of 两臂：骨架恒 Err → 深扫启动拒绝（-32005 语义），不产任务
+            assert!(matches!(
+                m.start_deep(dev),
+                Err(ScanError::UnallocatedUnavailable)
+            ));
+        }
+        // 管理器在骨架拒绝后仍可用（隔离：两新臂不污染既有引擎）
+        let m = mgr();
+        let (_f, dev) = exfat_fixture();
+        let s = m.start(dev).unwrap();
+        wait_for_state(&m, s.task_id, ScanState::Completed, Duration::from_secs(10));
     }
 }

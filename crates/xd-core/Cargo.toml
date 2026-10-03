@@ -11,7 +11,9 @@ serde_json = { workspace = true }
 xd-device = { path = "../xd-device" }
 xd-carving = { path = "../xd-carving" }
 xd-fs-exfat = { path = "../xd-fs-exfat" }
+xd-fs-ext4 = { path = "../xd-fs-ext4" }
 xd-fs-fat = { path = "../xd-fs-fat" }
+xd-fs-ntfs = { path = "../xd-fs-ntfs" }
 base64 = { workspace = true }
 rustix = { workspace = true }
 

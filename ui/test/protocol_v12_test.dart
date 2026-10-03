@@ -42,6 +42,8 @@ void decodeResponse(String name, Map<String, dynamic> message) {
       expect(ScanStatusResult.fromJson(result).readBytes, 123456, reason: name);
     case 'scan_results.response.json':
     case 'scan_results_carved.response.json':
+    case 'scan_results_ntfs.response.json':
+    case 'scan_results_ext4.response.json':
       expect(
         ScanResultsPage.fromJson(result).entries,
         hasLength((result['entries'] as List).length),
@@ -59,17 +61,19 @@ void decodeResponse(String name, Map<String, dynamic> message) {
       expect(ExportStartResult.fromJson(result).exportId, 1, reason: name);
     case 'export_cancel.response.json':
       expect(result, {'exportId': 1, 'state': 'canceled'}, reason: name);
+    case 'daemon_shutdown.response.json': // v1.3：无产品模型（T7 才落地消费），逐字
+      expect(result, {'accepted': true}, reason: name);
     default:
       fail('响应 golden 未分发：$name');
   }
 }
 
 void main() {
-  test('36 golden 全解码（产品模型；请求/响应/通知三态分流）', () {
+  test('40 golden 全解码（产品模型；请求/响应/通知三态分流）', () {
     final names = Directory(
       '../proto/v1/examples',
     ).listSync().map((e) => e.uri.pathSegments.last).toList()..sort();
-    expect(names, hasLength(36), reason: '集合断言归 protocol_v1_test.dart；此处消费');
+    expect(names, hasLength(40), reason: '集合断言归 protocol_v1_test.dart；此处消费');
     for (final name in names) {
       final message = golden(name);
       expect(message['jsonrpc'], '2.0', reason: name);

@@ -5,8 +5,8 @@ v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`s
 错误码，以及 `DeviceInfo.transport` 可选字段。**v0 封存**：`proto/v0/**` 不再改动，
 仅作历史快照（v0 golden 里 `protocol` 仍为 0）；唯一例外：
 `error_method_not_found.response.json` 的示例方法名随 `scan.start` 转正修正（M1b T5），其余不动。
-**破坏性变更才递增协议号；本版为新增**——v1.1（M1c 雕刻）与 v1.2（M1d 预览/导出）
-同样为纯增量，不递增 `protocol`。
+**破坏性变更才递增协议号；本版为新增**——v1.1（M1c 雕刻）、v1.2（M1d 预览/导出）与
+v1.3（M2 三平台桌面）同样为纯增量，不递增 `protocol`。
 
 - 传输（stdio、每行一条 JSON）、信封（JSON-RPC 2.0）、`id` 原样回显、空行处理、
   `<VERSION>` 占位约定、golden 规则（`examples/*.json` 为唯一事实源，Rust/Dart 双侧
@@ -22,7 +22,7 @@ v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`s
 |---|---|---|
 | `ping` | null | `{"pong": true, "version": "<VERSION>", "protocol": 1}` |
 | `device.list` | null | `{"devices": [DeviceInfo]}` |
-| `scan.start` | `{"device": "<id>", "mode"?: "quick"\|"deep"}` | `{"taskId": <u64>, "fs": "fat"\|"exfat", "totalBytes": <u64>}` |
+| `scan.start` | `{"device": "<id>", "mode"?: "quick"\|"deep"}` | `{"taskId": <u64>, "fs": "fat"\|"exfat"\|"ntfs"\|"ext4", "totalBytes": <u64>}` |
 | `scan.status` | `{"taskId": <u64>}` | `{"taskId", "state", "readBytes", "foundCount", "elapsedMs"}` |
 | `scan.results` | `{"taskId", "offset", "limit", "deletedOnly"?}` | `{"total": <u64>, "entries": [ScanEntry]}` |
 | `scan.pause` | `{"taskId"}` | `{"taskId", "state": "paused"}` |
@@ -31,6 +31,7 @@ v1 是 v0 的**超集**：新增 `scan.*` 方法（扫描任务事件流）、`s
 | `fs.read` (v1.2) | `{"taskId", "idx", "offset", "length"}` | `{"bytesBase64": "<base64>", "eof": <bool>}` |
 | `export.start` (v1.2) | `{"taskId", "idxs": [<u64>], "targetDir": "<绝对路径>"}` | `{"exportId": <u64>, "fileCount": <u64>, "estimatedBytes": <u64>}` |
 | `export.cancel` (v1.2) | `{"exportId": <u64>}` | `{"exportId", "state": "canceled"\|"completed"}` |
+| `daemon.shutdown` (v1.3) | null | `{"accepted": true}` |
 
 - `scan.start`：`mode` 缺省 `"quick"`；`"deep"` 自 M1c 起有效（未分配空间雕刻）。
   设备无权限（EACCES）→ `-32001`；未知或不支持的文件系统 → `-32002`；其它 `mode` 值
@@ -77,6 +78,8 @@ JSON-RPC 2.0 通知：**无 `id` 字段**，不期待响应；UI 按 `method` �
   表示链已失效或无法判定，见 M1b 安全裁定 (a)「链只走不猜」）。
 - `firstCluster`：起始簇号（0 = 无簇/未知）。
 - `byteOffset`（v1.1 增量）：雕刻条目的未分配空间内起始字节坐标，缺省省略——见「v1.1 增量」小节。
+- `recordId`（v1.3 增量）：FS 元数据记录号（NTFS = MFT 记录号；ext4 = inode 号），缺省省略——
+  见「v1.3 增量」小节。
 
 ## DeviceInfo
 
@@ -102,7 +105,7 @@ v0 字段不变，**新增 `transport`**：
 | -32002 | 不支持的文件系统（`Unsupported file system`） |
 | -32003 | 任务不存在（`Task not found: <taskId>`） |
 | -32004 | 任务状态不允许该操作（`Task not active: <taskId>`） |
-| -32005 | 空闲空间不可判定（`Cannot determine free space`；`mode:"deep"` 前置：exfat 位图 / FAT 表不可读——「无空闲」是合法空扫，不得与此混同） |
+| -32005 | 空闲空间不可判定（`Cannot determine free space`；`mode:"deep"` 前置：exfat 位图 / FAT 表 / NTFS `$Bitmap` / ext4 块位图不可读——「无空闲」是合法空扫，不得与此混同） |
 | -32006 | 恢复目标落在源设备上（`Target is on the source device: <dir>`；`st_dev(目标) == st_rdev(源块设备)`，或目标所在文件系统设备位于源设备节点之下（盘级祖先，sysfs 走链；解析不到时退回前者 fail-open），root 降权前判定；镜像源不适用） |
 | -32007 | 目标不可写（`Target not writable: <dir>`；不存在/非目录/无权限） |
 | -32008 | 条目不存在（`Entry not found: <idx>`） |
@@ -159,7 +162,23 @@ v0 字段不变，**新增 `transport`**：
 （`#[serde(default)]` 或 `Option<T>`，语义为「缺失 = 旧行为」）；**不得**删除或重命名既有字段；
 **不得**加 `deny_unknown_fields`——golden 只增不改（沿用本版先例）。
 
-## golden 文件（36）
+## v1.3 增量（M2 三平台桌面）
+
+**纯增量，读旧客户端不受影响**（不递增 `protocol`）：既有 36 个 golden 一字不动；
+本版新增 golden 4 个（NTFS/ext4 结果页、`daemon.shutdown` 请求/响应）；`quality` 值域不变，
+无新错误码。
+
+- `scan.start` 结果 `fs` 值域增 `"ntfs"` | `"ext4"`（`"fat"`/`"exfat"` 不变）——daemon 侧按
+  卷首结构识别（exFAT OEM ID → NTFS OEM ID → ext4 超级块 magic `0xEF53`@1080 → FAT BPB 粗筛），
+  读到字节数不足以判定时**不猜**（判错 FS 比拒绝更坏）→ `-32002`。
+- `ScanEntry.recordId`（可选 u64，序列化省略缺省）：**FS 元数据记录号**——NTFS = MFT 记录号；
+  ext4 = inode 号；fat/exfat/雕刻件缺失。读取路径以它重定位（与 `byteOffset` 分工：后者恒为
+  雕刻件）。**三态**：缺省 = null；**0 是合法记录号/inode 号**——不得用 0 表未知（同 `byteOffset`
+  口径）。缺 `recordId` 的旧行读 NTFS/ext4 条目 ⇒ 内部错误（-32603），**绝不按 `firstCluster` 猜读**。
+- 新方法 `daemon.shutdown`：`params` 为 null；回 `{"accepted": true}` 后清理 port-file 并 exit 0
+  （stdio 下亦接受，等价 stdin EOF）——M2 T7 落地，本版先钉契约面。
+
+## golden 文件（40）
 
 examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.request.json`、
 `device_list.response.json`、`scan_start.request.json`、`scan_start.response.json`、
@@ -174,7 +193,9 @@ examples/ 下：`ping.request.json`、`ping.response.json`、`device_list.reques
 `export_finished.notification.json`、`export_cancel.request.json`、`export_cancel.response.json`、
 `error_target_on_source.response.json`、`error_target_not_writable.response.json`、
 `error_entry_not_found.response.json`、`error_entry_too_large.response.json`、
-`error_insufficient_space.response.json`。
+`error_insufficient_space.response.json`（v1.2 止 36 枚）、`scan_results_ntfs.response.json`、
+`scan_results_ext4.response.json`、`daemon_shutdown.request.json`、`daemon_shutdown.response.json`
+（v1.3 新增 4 枚）。
 
 Rust 侧断言：`crates/xd-core/tests/contract_v1.rs`；Dart 侧：`ui/test/protocol_v1_test.dart`。
 

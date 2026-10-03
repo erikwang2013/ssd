@@ -73,6 +73,22 @@ pub fn read_entry_range(
                 xd_fs_exfat::read::read_file_range(dev, &e, offset, length)
                     .map_err(|e| ReadError::Internal(e.to_string()))?
             }
+            // v1.3 读取路由：以 `record_id`（NTFS MFT 记录号 / ext4 inode 号）重定位。
+            // 缺 record_id 的旧行是**坏行**（该 FS 的扫描恒落 Some，含 0）→ Internal，不空交付。
+            FsKind::Ntfs => {
+                let rid = entry
+                    .record_id
+                    .ok_or_else(|| ReadError::Internal("ntfs entry without recordId".into()))?;
+                xd_fs_ntfs::read_file_range(dev, rid, offset, length)
+                    .map_err(|e| ReadError::Internal(e.to_string()))?
+            }
+            FsKind::Ext4 => {
+                let rid = entry
+                    .record_id
+                    .ok_or_else(|| ReadError::Internal("ext4 entry without recordId".into()))?;
+                xd_fs_ext4::read_file_range(dev, rid, offset, length)
+                    .map_err(|e| ReadError::Internal(e.to_string()))?
+            }
         }
         .into_iter()
         .take(length as usize) // 引擎内已 clamp 到条目尾；此为 length 侧防线
@@ -90,6 +106,13 @@ fn unallocated_runs(dev: &dyn BlockDevice, fs: FsKind) -> Result<Vec<Range<u64>>
             .map_err(|e| ReadError::Internal(e.to_string())),
         FsKind::Exfat => xd_fs_exfat::freespace::unallocated_runs(dev)
             .map_err(|e| ReadError::Internal(e.to_string())),
+        // T1 骨架臂：恒 Err(Unsupported) → Internal（-32603，非 panic）；T3/T4 填实
+        FsKind::Ntfs => {
+            xd_fs_ntfs::unallocated_runs(dev).map_err(|e| ReadError::Internal(e.to_string()))
+        }
+        FsKind::Ext4 => {
+            xd_fs_ext4::unallocated_runs(dev).map_err(|e| ReadError::Internal(e.to_string()))
+        }
     }
 }
 
@@ -398,6 +421,7 @@ mod tests {
             first_cluster: 0,
             byte_offset: Some(bo),
             contiguous: None,
+            record_id: None,
         };
         let (bytes, eof) = read_entry_range(&*dev, FsKind::Exfat, &e, 0, 1 << 20).unwrap();
         assert_eq!(

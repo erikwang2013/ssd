@@ -10,6 +10,8 @@ members = [
     "crates/xd-fixtures",
     "crates/xd-fs-fat",
     "crates/xd-fs-exfat",
+    "crates/xd-fs-ntfs",
+    "crates/xd-fs-ext4",
 ]
 
 [workspace.package]

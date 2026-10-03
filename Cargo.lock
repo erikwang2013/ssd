@@ -447,7 +447,9 @@ dependencies = [
  "xd-device",
  "xd-fixtures",
  "xd-fs-exfat",
+ "xd-fs-ext4",
  "xd-fs-fat",
+ "xd-fs-ntfs",
 ]
 
 [[package]]
@@ -492,12 +494,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "xd-fs-ext4"
+version = "0.4.0"
+dependencies = [
+ "xd-device",
+]
+
+[[package]]
 name = "xd-fs-fat"
 version = "0.4.0"
 dependencies = [
  "tempfile",
  "xd-device",
  "xd-fixtures",
+]
+
+[[package]]
+name = "xd-fs-ntfs"
+version = "0.4.0"
+dependencies = [
+ "xd-device",
 ]
 
 [[package]]

@@ -733,6 +733,7 @@ mod tests {
             first_cluster: 6,
             byte_offset: None,
             contiguous: None,
+            record_id: None,
         }
     }
 

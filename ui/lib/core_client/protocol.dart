@@ -56,7 +56,7 @@ class PingResult {
   );
 }
 
-/// v1.2 扫描条目。`byteOffset`/`contiguous` 为可空增量字段：
+/// v1.2 扫描条目。`byteOffset`/`contiguous`/`recordId` 为可空增量字段：
 /// 线上缺省省略（Rust 侧 `skip_serializing_if = "Option::is_none"`），解码为 null。
 class ScanEntry {
   const ScanEntry({
@@ -71,6 +71,7 @@ class ScanEntry {
     required this.firstCluster,
     this.byteOffset,
     this.contiguous,
+    this.recordId,
   });
 
   final int idx;
@@ -90,6 +91,10 @@ class ScanEntry {
   /// null = 未知（fat/雕刻/迁移前旧行）——不得据此宣称「连续」。
   final bool? contiguous;
 
+  /// v1.3：FS 元数据记录号（NTFS = MFT 记录号；ext4 = inode 号）；fat/exfat/雕刻件为 null。
+  /// 三态：缺省 = null；**0 是合法值**（不得用 0 表未知，口径同 byteOffset）。
+  final int? recordId;
+
   factory ScanEntry.fromJson(Map<String, dynamic> json) => ScanEntry(
     idx: json['idx'] as int,
     name: json['name'] as String,
@@ -102,6 +107,7 @@ class ScanEntry {
     firstCluster: json['firstCluster'] as int,
     byteOffset: json['byteOffset'] as int?,
     contiguous: json['contiguous'] as bool?,
+    recordId: json['recordId'] as int?,
   );
 
   Map<String, dynamic> toJson() => {
@@ -116,6 +122,7 @@ class ScanEntry {
     'firstCluster': firstCluster,
     'byteOffset': ?byteOffset,
     'contiguous': ?contiguous,
+    'recordId': ?recordId,
   };
 
   /// 展示名：雕刻件无名 → 与导出落盘命名一致（`carved_{idx:06}.{ext}`，ext 空回退 `bin`）。

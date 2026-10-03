@@ -582,6 +582,7 @@ mod tests {
             first_cluster: 0,
             byte_offset: None,
             contiguous: None,
+            record_id: None,
         };
         assert_eq!(file_name_for(&mk("", "jpg", 42)), "carved_000042.jpg");
         assert_eq!(
@@ -701,6 +702,7 @@ mod tests {
             first_cluster: 0,
             byte_offset: Some(94208), // 簇 6 起点
             contiguous: None,
+            record_id: None,
         };
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out.jpg");
