@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "xd-carving"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
  "xd-device",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "xd-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "rusqlite",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "xd-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rustix",
  "serde_json",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "xd-device"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -472,15 +472,15 @@ dependencies = [
 
 [[package]]
 name = "xd-ffi"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "xd-fixtures"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "xd-fs-exfat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
  "xd-device",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "xd-fs-fat"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
  "xd-device",

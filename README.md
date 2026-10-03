@@ -184,15 +184,15 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真 daem
 **M1 进行中**。已完成并发布：
 - **M0 地基**（v0.1.0）：契约 v0、只读镜像后端、stdio daemon、Flutter 骨架、CI 三平台矩阵
 - **M1a / M1a2 / M1e**（v0.2.0）：FAT12/16/32 与 exFAT 只读引擎、Linux 平台层（枚举/提权/打包）
-- **M1b**：契约 v1（`scan.*` 事件流）+ 扫描编排端到端——状态机（暂停/恢复/取消）、
+- **M1b**（v0.3.0）：契约 v1（`scan.*` 事件流）+ 扫描编排端到端——状态机（暂停/恢复/取消）、
   崩溃隔离（worker panic 不落 daemon）、SQLite 流式落盘（重启可查/中断恢复）、daemon 并发接线
   （stdout 串行化、`--db`、懒打开防提权面）
-- **M1c**（本次合入）：文件雕刻——`xd-carving`（JPEG marker 走链 + PNG chunk+CRC 重组，结构验证
+- **M1c**（v0.3.0）：文件雕刻——`xd-carving`（JPEG marker 走链 + PNG chunk+CRC 重组，结构验证
   压误报、诚实截断、返回硬上限）+ 未分配区间枚举（exFAT 位图/FAT 表驱动，拒绝未知分配）+
   `mode:"deep"` 深扫端到端（契约 v1.1：`quality:"carved"`/`byteOffset`）+ **断点续跑**（检查点配对写、
   杀进程重启无损续扫）+ 恢复率门禁（合成镜像 100%/0 假阳性进 CI）+ 两项量化（JPEG 预读 20046→2 次读、
   落库 139→>8000 条/秒）
-- **M1d**（本次合入）：UI 三页 + 导出——扫描/结果/预览/恢复四页接真 daemon（协议 v1.2：`fs.read`
+- **M1d**（v0.3.0）：UI 三页 + 导出——扫描/结果/预览/恢复四页接真 daemon（协议 v1.2：`fs.read`
   分片预览、`export.start/cancel/progress/finished` 事件流与五枚错误码）；导出为**降权子进程**
   （三重目标校验、逐字节精确、分片流式、逐件降级/失败报告、实取消）；全链路集成测试
   （Rust 夹具镜像 → 真 daemon → 扫描 → 预览回读 → 导出 → 报告逐字节）进 CI，e2e-loop 增
