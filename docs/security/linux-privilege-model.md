@@ -255,8 +255,8 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
 - **枚举需管理员**：`IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 带 `FILE_READ_ACCESS`，且 Vista+
   上物理盘 `GENERIC_READ` 打开即需提权 ⇒ 非提权进程拿不到盘列表。daemon 侧枚举已由 T4 接线
   （`enumerate_startup_list` + `win:` 分派 opener，`device.list` = 启动枚举 + `--image`/`--device`
-  注册项）；但**应用内 UAC 入口未接入**（非提权 ⇒ 枚举空 ⇒ 首页无设备 ⇒ 走不到提权引导，§10.6 末条，
-  M2 补）。非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）归 M2 评估。
+  注册项）；**应用内 UAC 入口已接入（M2 T6）**：首页空列表给「以管理员身份重启引擎」入口（§13.1）；
+  非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）已评估、不实现（§13.2，方案 A 定稿）。
 - **transport/removable 仅提示**：BusType 归类不参与任何过滤（同 Linux 口径）；两平台归类可
   不一致（如 USB-SATA 桥接盘），以各自真机行为为准（见下）。
 
@@ -511,12 +511,11 @@ TCP 握手 → 返回提权会话 client；失败清理会话目录并抛异常�
 client）→ 重列设备；**旧非提权 client 显式关闭**（其为 UI 子进程，关闭等价令其退出——§10.2
 的旧路径；`daemon.shutdown` RPC 属 T7）。失败 ⇒ 既有文案「未获得授权（原因）」+ 可重试
 （不换 client、不关旧 client）；macOS 提权成功仍空列表 ⇒「已提权但仍缺完全磁盘访问（系统设置 >
-隐私与安全性）」（`kMacosFdaHint`，与扫描页同一常量，§9/§10.2）；会话目录失败即清、会话结束由
-页面 dispose 清（daemon 侧自清 port-file，§10）。
+隐私与安全性）」（`kMacosFdaHint`，与扫描页同一常量，§9/§10.2）；会话目录失败即清、换用时清旧目录、页面销毁即清（含提权在途卸载分支）；daemon 侧自清 port-file（§10）。
 
 **已验（widget 层，假启动器 + 假 port-file + 假连接器）**：三平台按钮可见性；走通 = 换 client
 并重列设备、旧 client 被关闭；取消 = 「未获得授权」+ 不换/不关旧 client + 失败会话目录已清；
-macOS FDA 提示。扫描页原 15 枚提权钉零回归（同一 `elevateSession` 共享流）。
+macOS FDA 提示。扫描页 17 枚提权钉（实测）零回归（同一 `elevateSession` 共享流）。
 
 **未验证（需真机）**：真 UAC/osascript/pkexec 对话框与提权端到端（CI runner 无桌面/无交互
 会话）；真 FDA 交互（与 §10.6 同口径）。
@@ -530,8 +529,7 @@ macOS FDA 提示。扫描页原 15 枚提权钉零回归（同一 `elevateSessio
 
 - `dwDesiredAccess = 0` 是 CreateFile 的文档化用法——「允许应用在不访问设备的情况下查询设备
   属性」，物理盘名 `\\.\PhysicalDriveN` 为文档列举形态（Microsoft CreateFileW 文档）。
-- `IOCTL_STORAGE_QUERY_PROPERTY` 的 CTL_CODE 访问位 = **FILE_ANY_ACCESS**（`IOCTL_STORAGE_BASE
-  0x0500`）⇒ 任意句柄（含 0 access）可查 `STORAGE_DEVICE_DESCRIPTOR`（BusType/vendor/product
+- `IOCTL_STORAGE_QUERY_PROPERTY` 的 CTL_CODE 访问位 = **FILE_ANY_ACCESS**（`CTL_CODE(FILE_DEVICE_MASS_STORAGE 0x2D, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)`；`IOCTL_STORAGE_BASE` = 0x2D，0x0500 为 Function 号）⇒ 任意句柄（含 0 access）可查 `STORAGE_DEVICE_DESCRIPTOR`（BusType/vendor/product
   ——即现有 `query_descriptor` 的全部字段）；`IOCTL_STORAGE_GET_DEVICE_NUMBER` 同为
   FILE_ANY_ACCESS（§8 已依赖）。
 - `IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 访问位 = **FILE_READ_ACCESS**（`0x7405C`）⇒ 需读
@@ -539,6 +537,8 @@ macOS FDA 提示。扫描页原 15 枚提权钉零回归（同一 `elevateSessio
   预判一致；现有枚举「size 必得」（§8）即由此而来）。
 - 残余不确定性：有个别存储栈（报告为 stornvme）对句柄访问位更严的记载——「非提权一定可查」
   不是硬保证，需真机逐机型复验。
+  （Microsoft CreateFileW 文档对物理盘/卷打开本身另注「caller must have administrative
+  privileges」——若该条对 0-access 亦成立，只会加强「不追加实现」结论。）
 - 备选（唯一能拿容量的路径）：Storage WMI（`MSFT_PhysicalDisk` / `Get-PhysicalDisk`）——该
   命名空间对标准用户常见 Access Denied（需管理员预授权限才可读），且引入 COM/WMI 机制，
   代价远大于收益。
