@@ -26,7 +26,7 @@ img=$tmp/test.img
 dd if=/dev/zero of="$img" bs=1024 count=64 2>/dev/null
 
 out=$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' \
-  | "$app/Contents/MacOS/xd-daemon" --image "$img")
+  | "$app/Contents/MacOS/xd-daemon" --image "$img") || { echo "FAIL: xd-daemon exit code $?"; exit 1; }
 echo "$out"
 echo "$out" | grep -q '"pong":true' || { echo "FAIL: ping 未收到 pong"; exit 1; }
 echo "PACKAGE SMOKE OK (macOS)"
