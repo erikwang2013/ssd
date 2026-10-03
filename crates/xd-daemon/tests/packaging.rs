@@ -73,11 +73,77 @@ fn runner_rc_metadata_is_xiaodun() {
 }
 
 #[test]
+fn macos_bundle_metadata_is_xiaodun() {
+    let plist = read("ui/macos/Runner/Info.plist");
+    for needle in [
+        "<string>小盾 (Xiaodun)</string>", // CFBundleDisplayName
+        "<string>小盾</string>",           // CFBundleName
+        "<string>© 2026 erik · https://erik.xyz</string>", // NSHumanReadableCopyright
+        "<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>", // 标识符仍由 xcconfig 注入
+    ] {
+        assert!(plist.contains(needle), "Info.plist 缺条目: {needle}");
+    }
+    let xcc = read("ui/macos/Runner/Configs/AppInfo.xcconfig");
+    assert!(
+        xcc.contains("PRODUCT_BUNDLE_IDENTIFIER = com.erik.xiaodun"),
+        "AppInfo.xcconfig 的 bundle id 必须是 com.erik.xiaodun（TCC/FDA 授权按 bundle id 归属，改了就丢授权）"
+    );
+    assert!(
+        !plist.contains("com.example") && !xcc.contains("com.example"),
+        "⑨ 收口: macOS 元数据不得残留 com.example"
+    );
+}
+
+#[test]
+fn package_macos_wires_sign_then_rezip() {
+    let s = read("scripts/package-macos.sh");
+    let lines: Vec<&str> = s.lines().collect();
+    let find = |pred: &dyn Fn(&str) -> bool, what: &str| {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("package-macos.sh 缺「{what}」"))
+    };
+    let i_install = find(
+        &|l| {
+            l.trim_start()
+                .starts_with("install -m 755 target/release/xd-daemon")
+        },
+        "引擎安装行",
+    );
+    let i_notarize = find(
+        &|l| l.trim_start().starts_with("bash scripts/notarize.sh"),
+        "notarize 调用",
+    );
+    assert!(
+        lines[i_notarize].contains("xiaodun_ui.app") && lines[i_notarize].contains("$out"),
+        "notarize 调用须带 .app 与 zip 两个参数: {}",
+        lines[i_notarize]
+    );
+    let i_reditto = lines
+        .iter()
+        .rposition(|l| {
+            l.trim_start()
+                .starts_with("ditto -c -k --keepParent \"$stage\" \"$out\"")
+        })
+        .unwrap_or_else(|| panic!("package-macos.sh 缺 staple 后重出的交付 zip ditto"));
+    assert!(
+        i_install < i_notarize,
+        "引擎必须先在 Contents/MacOS 就位再签名（先签后装会破坏封条）"
+    );
+    assert!(
+        i_notarize < i_reditto,
+        "交付 zip 必须在 notarize/staple 之后重出（否则包内 .app 与已装订票据不一致）"
+    );
+}
+
+#[test]
 fn smoke_reports_signature_state() {
     let s = read("scripts/e2e-package-smoke.sh");
     assert!(
-        s.contains("codesign -dv"),
-        "macOS 冒烟须如实打印签名状态（签/未签都通过但留证据）"
+        s.lines()
+            .any(|l| l.trim_start().starts_with("codesign -dv")),
+        "macOS 冒烟须有一行可执行的 codesign -dv（注释不算）如实打印签名状态"
     );
 }
 
@@ -272,5 +338,104 @@ mod scripts {
                 assert!(l.contains(flag), "签名调用缺 {flag}: {l}");
             }
         }
+    }
+
+    #[test]
+    fn notarize_script_fails_fast_on_sign_failure_and_cleans_up() {
+        // codesign 失败必须通过 set -e 立刻传播：不得继续签 .app、不得提交公证/装订；
+        // 且 EXIT trap 在失败路径也要清掉临时 keychain（私钥）。
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("stage/xiaodun_ui.app");
+        let daemon = app.join("Contents/MacOS/xd-daemon");
+        fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+        fs::write(&daemon, b"fake mach-o").unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin = tmp.path().join("mock-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = tmp.path().join("calls.log");
+        write_mock(&bin, "codesign", "exit 1\n"); // 首个签名即失败
+        write_mock(&bin, "xcrun", "");
+        write_mock(&bin, "spctl", "");
+        write_mock(&bin, "ditto", touch_last_arg());
+        write_mock(
+            &bin,
+            "security",
+            "if [ \"$1\" = \"find-identity\" ]; then\n\
+             \x20 printf '%s\\n' '  1) 0123456789ABCDEF0123456789ABCDEF01234567 \"Developer ID Application: Mock (TEAMID)\"'\n\
+             fi\n",
+        );
+
+        let zip = tmp.path().join("dist/out.zip");
+        fs::create_dir_all(zip.parent().unwrap()).unwrap();
+        let mut cmd = Command::new("bash");
+        cmd.arg(repo_root().join("scripts/notarize.sh"))
+            .arg(&app)
+            .arg(&zip)
+            .env("MOCK_LOG", &log)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .current_dir(repo_root());
+        for v in CRED_VARS {
+            cmd.env_remove(v);
+        }
+        cmd.env("APPLE_CERT_P12_BASE64", "ZmFrZQ==")
+            .env("APPLE_CERT_PASSWORD", "pw")
+            .env("APPLE_TEAM_ID", "TEAMID1234")
+            .env("APPLE_ID", "dev@example.com")
+            .env("APPLE_APP_PASSWORD", "app-pw");
+        let out = cmd.output().unwrap();
+        assert!(
+            !out.status.success(),
+            "codesign 失败必须传播为非零退出；stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let text = fs::read_to_string(&log).unwrap();
+        let signs = text
+            .lines()
+            .filter(|l| l.starts_with("codesign ") && l.contains(" --sign "))
+            .count();
+        assert_eq!(
+            signs, 1,
+            "首个签名失败后必须立刻停止（不得继续签 .app）;日志:\n{text}"
+        );
+        assert!(
+            !text.contains("notarytool"),
+            "签名失败后不得提交公证;日志:\n{text}"
+        );
+        assert!(
+            !text.contains("stapler"),
+            "签名失败后不得 staple;日志:\n{text}"
+        );
+        assert!(
+            text.contains("security delete-keychain"),
+            "EXIT trap 在失败路径也必须清理临时 keychain;日志:\n{text}"
+        );
+    }
+
+    #[test]
+    fn notarize_script_skip_is_inert() {
+        // 「绝不产半签包」的另一半：凭据缺失时不得触碰 .app、不得产出 zip。
+        // app 传文件（非目录）即可——skip 门控先于一切校验，任何触碰都会改 mtime/内容。
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("fake.app");
+        fs::write(&app, b"untouched").unwrap();
+        let before_mtime = fs::metadata(&app).unwrap().modified().unwrap();
+        let zip = tmp.path().join("dist/out.zip");
+        let out = run_notarize(&app, Some(&zip), false, &std::env::var("PATH").unwrap());
+        assert!(out.status.success(), "skip 路径必须 exit 0");
+        assert!(!zip.exists(), "skip 不得产出 zip（绝不产半签包）");
+        assert_eq!(
+            fs::read(&app).unwrap(),
+            b"untouched",
+            "skip 不得改写 .app 内容"
+        );
+        assert_eq!(
+            fs::metadata(&app).unwrap().modified().unwrap(),
+            before_mtime,
+            "skip 不得触碰 .app（mtime 变了）"
+        );
     }
 }
