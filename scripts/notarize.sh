@@ -22,9 +22,13 @@ app="${1:-}"
 zip="${2:-}"
 
 # --- 凭据门控（先于一切签名动作：绝不产半签包）---
-# 显式逐变量检查：不用 `${!v}`（间接展开 + `:-` 默认值）——macOS 自带 bash 3.2 解析该形态
-# 会报「missing�: unbound variable」（CI macOS 腿实测红，2026-10-03）。本脚本须在
-# /bin/bash 3.2 下可跑（CI runner 默认 shell），只用 POSIX/bash-3.2 语法。
+# 显式逐变量检查（不用间接展开；bash 3.2 友好）。本脚本须在 /bin/bash 3.2 下可跑
+# （CI runner 默认 shell），只用 POSIX/bash-3.2 语法。
+# 定界铁律：`$var` 后紧跟非 ASCII 字节（全角标点等，UTF-8 首字节 ≥0x80）会被 macOS
+# bash 3.2 把该字节并入变量名（`$missing；` 当成了 `missing\xEF`）⇒ `set -u` 下
+# unbound——CI macOS 腿二红真根因，报错行就是打印 skip 的那行。凡变量后接中文标点，
+# 一律 `${var}` 定界：`}` 在任何 bash/locale 下都终止名字解析；由 packaging.rs 的
+# shell_scripts_avoid_unbraced_var_adjacent_to_non_ascii 静态钉住。
 missing=""
 add_missing() { [ -n "${2:-}" ] || missing="${missing:+$missing }$1"; }
 add_missing APPLE_CERT_P12_BASE64 "${APPLE_CERT_P12_BASE64:-}"
@@ -33,7 +37,7 @@ add_missing APPLE_TEAM_ID "${APPLE_TEAM_ID:-}"
 add_missing APPLE_ID "${APPLE_ID:-}"
 add_missing APPLE_APP_PASSWORD "${APPLE_APP_PASSWORD:-}"
 if [ -n "$missing" ]; then
-  echo "skip: 签名/公证跳过——缺凭据: $missing；本产物未签名/未公证（artifact 名不变）"
+  echo "skip: 签名/公证跳过——缺凭据: ${missing}；本产物未签名/未公证（artifact 名不变）"
   exit 0
 fi
 
@@ -87,4 +91,4 @@ xcrun notarytool submit "$zip" --wait \
 xcrun stapler staple "$app"
 spctl -a -vv "$app"
 
-echo "notarized: $app（seal 有效，公证票据已 staple；交付 zip 由调用方在 staple 后重出）"
+echo "notarized: ${app}（seal 有效，公证票据已 staple；交付 zip 由调用方在 staple 后重出）"
