@@ -3,7 +3,8 @@
 //! 覆盖：happy 逐字节相等、删除件被复占簇的短交付（degraded/short read）、目标目录 -32007、
 //! cancel 两态竞态容忍（同 scan_ipc 的 pause 先例）+ 取消须真终止（qual I1）、
 //! unknown-ext 雕刻件 failed + 无残骸（qual I3）、父死后子 EPIPE 静默退出（qual I4）、
-//! 伪造库行的落盘名净化/穿越拦截（qual 硬化 (a)）。
+//! 伪造库行的落盘名净化/穿越拦截（qual 硬化 (a)）、分片流式 >CHUNK（4MiB+1 单件）逐字节、
+//! EPIPE 宽夹具「杀在飞行中」确定断言（T9 收官 qual 补覆盖）。
 //! 铁律（T8/T6 教训）：**每个 spawn 必带 `--db <tempdir>`**——导出的子进程按 `--db` 只读打开同一
 //! 库，内存库降级时 export.start 诚实 -32603；不触真实 $HOME。
 //! -32006/-32010 的**真值**归单测（xd-core::export 的纯函数注入假 statvfs/rdev）；-32006 的真环回
@@ -207,6 +208,49 @@ fn bulk_image_bytes() -> Vec<u8> {
     let mut b = xd_fixtures::ExfatImageBuilder::new();
     for i in 0..30u32 {
         b.add_file("/", &format!("BIG_{i:03}.BIN"), &vec![i as u8; 32 * 1024]);
+    }
+    b.build()
+}
+
+/// 分片夹具：单件 4MiB+1 = `CHUNK`(4MiB) 边界 + 1B —— 第二迭代恰为 1 字节尾块（最严边界）。
+/// 落 FAT16 扩容卷（9000 扇区 = 4.6MiB；data_start=69、簇池 8931 ≥ 8193）。选 FAT16 而非 exFAT：
+/// exFAT 构建器卷长硬编码 1MiB（改它动公共夹具）；且 FAT16 走**真簇链**（8193 簇串联），
+/// 是分片读最严的路径。字节 = 位置相关（见 `pattern_byte`）。
+fn multi_chunk_image_bytes() -> (Vec<u8>, Vec<u8>) {
+    let data: Vec<u8> = (0..4 * 1024 * 1024 + 1).map(pattern_byte).collect();
+    let img = xd_fixtures::FatImageBuilder::fat16_sized(9000)
+        .add_file("/", "HUGE.BIN", &data)
+        .build();
+    (img, data)
+}
+
+/// 位置相关字节：`(i % 251) ^ (i >> 20)`——非 251/4MiB 周期，偏移错位（如次片重读 0）必现。
+fn pattern_byte(i: u64) -> u8 {
+    ((i % 251) as u8) ^ ((i >> 20) as u8)
+}
+
+/// 大件逐字节比对（不 `assert_eq!` 整个 4MiB Vec：panic 消息会打印全文）。
+fn assert_bytes_eq(got: &[u8], want: &[u8], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: 长度不等");
+    if let Some(pos) = got.iter().zip(want).position(|(a, b)| a != b) {
+        panic!(
+            "{what}: 首差字节 @ {pos}（got={:#04x} want={:#04x}，len={}）",
+            got[pos],
+            want[pos],
+            got.len()
+        );
+    }
+}
+
+/// EPIPE 宽夹具：30 × 256KiB = 7.5MiB（FAT16 扩容卷 16384 扇区 = 8MiB；15360/16286 簇）。
+/// 不用共用 bulk（960KiB）：那是给 cancel 用例的「窗口内可取消」两态语义；本用例要的是
+/// 「kill 落在飞行中」——宽夹具把子进程寿命（数百 ms）推离杀父时刻（≈2–3ms）若干个数量级，
+/// `count < 30` 才是确定断言而非竞态采样。
+#[cfg(target_os = "linux")]
+fn wide_bulk_image_bytes() -> Vec<u8> {
+    let mut b = xd_fixtures::FatImageBuilder::fat16_sized(16384);
+    for i in 0..30u32 {
+        b.add_file("/", &format!("WIDE_{i:03}.BIN"), &vec![i as u8; 256 * 1024]);
     }
     b.build()
 }
@@ -690,13 +734,15 @@ fn hostile_row_names_and_ext_cannot_escape_target_dir() {
 /// （run_inner 的 writeln 失败臂 `return Ok(())`），stderr 无 panic 留痕——子 stderr 继承 daemon
 /// 的 stderr（= 本测试管道），父死后仍可读全。
 /// 牙：EPIPE 臂改成 unwrap/panic → 子 panic 落 stderr → 红。
+/// 宽夹具（见 wide_bulk_image_bytes）下的第三重牙：`count < 30` 证「kill 落在飞行中」——
+/// 缺它则「子恰在 kill 前自然跑完」的微窗是**未检验**（终报/退出断言都照过），不是假绿。
 /// 用例本体绑定 Linux（子在场观测走 /proc 子进程表，见 find_export_worker）；非 Linux 无可信观测面 ⇒ 门控。
 #[cfg(target_os = "linux")]
 #[test]
 fn epipe_worker_exits_silently_when_parent_dies() {
     let dir = tempfile::tempdir().unwrap();
     let img_path = dir.path().join("bulk.img");
-    std::fs::write(&img_path, bulk_image_bytes()).unwrap();
+    std::fs::write(&img_path, wide_bulk_image_bytes()).unwrap();
     let db = dir.path().join("t.db");
     let out = dir.path().join("out");
     std::fs::create_dir(&out).unwrap();
@@ -749,5 +795,71 @@ fn epipe_worker_exits_silently_when_parent_dies() {
         "EPIPE 路径不得 panic（子 stderr 留痕）：{log}"
     );
 
+    // 杀在飞行中（而非子自然跑完）：子逐件写盘、每件后写 progress（EPIPE 检查点），父死后的
+    // 首个 progress 即退出 ⇒ 落盘件数必远小于 30。宽夹具下子寿命数百 ms、kill 在 ≈2–3ms，
+    // 本断言是**确定**的（旧 960KiB 夹具子寿命与 kill 同量级 ⇒ 此处会退化为竞态，故不适用）。
+    let names = dir_names(&out);
+    assert!(
+        names.len() < 30,
+        "worker 在 kill 前已自然跑完（观测窗失守）：{} 件={names:?}",
+        names.len()
+    );
+
+    let _ = child.wait();
+}
+
+/// 8）分片流式 >CHUNK：单件 4MiB+1 导出逐字节相等（T9 收官补覆盖）。
+/// 既有夹具最大件 64KiB ⇒ `CHUNK`=4MiB 的**第二迭代从未执行**（逐片读的偏移推进、
+/// `min` 尾块钳制、eof 停机全无实证）。选 4MiB+1 而非 8MiB+1：最少迭代数（2）内打到边界，
+/// 且尾块恰 1 字节 = 最严的 min/eof 形态。
+/// 牙：循环边界丢尾块（`while off + CHUNK <= size`）→ 短 1B ⇒ degraded；`read_entry_range`
+/// 恒传 0（偏移不推进）→ 尾块字节错而**终报仍 succeeded**——只有逐字节比对能抓。
+#[test]
+fn exports_multi_chunk_file_byte_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let img_path = dir.path().join("vol.img");
+    let (image, want) = multi_chunk_image_bytes();
+    std::fs::write(&img_path, &image).unwrap();
+    let db = dir.path().join("t.db");
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+
+    let (mut child, mut stdin, rx, _err) = spawn_image_daemon(&img_path, &db);
+    let dev_id = first_image_device(&mut stdin, &rx);
+    let task_id = scan_to_completed(&mut stdin, &rx, dev_id);
+    let entries = collect_named_entries(&mut stdin, &rx, task_id);
+    assert_eq!(entries.len(), 1, "夹具单件：{entries:?}");
+    assert_eq!(
+        entries[0].2,
+        4 * 1024 * 1024 + 1,
+        "声明大小 = CHUNK+1：{entries:?}"
+    );
+    let idx = entries[0].0;
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"export.start",
+               "params":{"taskId":task_id,"idxs":[idx],"targetDir":out.to_str().unwrap()}}),
+    );
+    let (st, exf) =
+        collect_response_and_notification(&rx, 3, "export.finished", Duration::from_secs(30));
+    assert_eq!(st["result"]["fileCount"], 1, "{st}");
+    assert_eq!(
+        st["result"]["estimatedBytes"].as_u64(),
+        Some(4 * 1024 * 1024 + 1),
+        "{st}"
+    );
+    let exf = exf.expect("导出已起 ⇒ 必有终报");
+    let p = &exf["params"];
+    assert_eq!(p["succeeded"], 1, "整件成功：{exf}");
+    assert_eq!(p["degraded"], 0, "丢尾块即 4194304B ⇒ degraded：{exf}");
+    assert_eq!(p["failed"], 0, "{exf}");
+
+    let names = dir_names(&out);
+    assert_eq!(names, vec!["HUGE.BIN"], "{names:?}");
+    let got = std::fs::read(out.join("HUGE.BIN")).unwrap();
+    assert_bytes_eq(&got, &want, "4MiB+1 分片导出（第二迭代恰 1B 尾块）");
+
+    drop(stdin);
     let _ = child.wait();
 }
