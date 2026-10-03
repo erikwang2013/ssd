@@ -133,11 +133,18 @@ impl<W: Write> Write for SharedSink<W> {
         self.0.lock().unwrap().write(buf)
     }
 
+    /// **整段持锁**一次写完：默认 `write_all` 会按块反复调 `write`，每块取放一次连接锁——
+    /// 慢读者部分写时，广播行会被该连接的响应行插断。广播走的正是这个入口
+    /// （`Notifier::broadcast` → `Box<dyn Write>::write_all`）。
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().write_all(buf)
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.lock().unwrap().flush()
     }
 
-    /// 整行（含格式化的多个 write 片段）持锁一次写完：广播行不会被另一线程的半行插断。
+    /// 格式化写（响应侧 `write_line`）同样整段持锁：其多个 write 片段不会被广播行插断。
     fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
         self.0.lock().unwrap().write_fmt(args)
     }
@@ -195,5 +202,106 @@ impl Drop for SinkHandle {
             .lock()
             .unwrap()
             .retain(|(i, _)| *i != self.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// 每次 `write` 只吃 1 字节的写端：强制分块，把「部分写」窗口放到最大。
+    struct Chunky {
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for Chunky {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(1);
+            self.out.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 并发「广播行 × 响应行」共用一条连接写端：任一行被插断即成坏行（JSON 不可解析）。
+    ///
+    /// 钉法（确定性判据）：第三个线程不停 `try_lock` 连接锁，**持锁时刻输出必须停在行边界**。
+    /// 修复后（`SharedSink::write_all` 整段持锁）该判据是恒真式——行未写完时锁始终在写者手里，
+    /// 观测者只能在整行落定后取到锁，故本测试不可能因调度而假红；未修复时（默认 `write_all`
+    /// 按块取放锁）观测者能在两块之间取到锁并看到半行，即被抓住（钉测有效性见提交报告：
+    /// 临时摘除 `write_all` 覆写实跑为红）。
+    #[test]
+    fn broadcast_and_response_lines_never_interleave() {
+        const LINES: usize = 40;
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let conn = Arc::new(Mutex::new(Chunky { out: out.clone() }));
+        let notifier = Arc::new(Notifier::new());
+        let _sink = notifier.register(Box::new(SharedSink(conn.clone())));
+
+        let done = AtomicBool::new(false);
+        let interleaved: Mutex<Option<String>> = Mutex::new(None);
+
+        std::thread::scope(|s| {
+            let broadcaster = s.spawn(|| {
+                for i in 0..LINES {
+                    notifier.broadcast(&serde_json::json!({"n": i}));
+                }
+            });
+            let responder = s.spawn(|| {
+                for i in 0..LINES {
+                    write_line(&conn, &serde_json::json!({"resp": i}));
+                }
+            });
+            let watcher = s.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    if let Ok(_guard) = conn.try_lock() {
+                        let seen = out.lock().unwrap();
+                        if seen.last().is_some_and(|b| *b != b'\n') {
+                            *interleaved.lock().unwrap() =
+                                Some(String::from_utf8_lossy(&seen).into_owned());
+                            return;
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            broadcaster.join().unwrap();
+            responder.join().unwrap();
+            done.store(true, Ordering::SeqCst);
+            watcher.join().unwrap();
+        });
+
+        let partial = interleaved.lock().unwrap().take();
+        assert!(
+            partial.is_none(),
+            "持锁时输出停在半行（广播/响应行被插断）：\n{}",
+            partial.unwrap_or_default()
+        );
+
+        // 终局校验：整段输出逐行可解析，两条序列各 LINES 行且以 `\n` 收尾。
+        let bytes = out.lock().unwrap().clone();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.ends_with('\n'), "输出必须以整行收尾：{text:?}");
+        let (mut broadcasts, mut responses) = (0, 0);
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("坏行（被插断）{line:?}: {e}"));
+            match v.get("n").is_some() {
+                true => broadcasts += 1,
+                false => {
+                    assert!(v.get("resp").is_some(), "未知行 {v}");
+                    responses += 1;
+                }
+            }
+        }
+        assert_eq!(
+            (broadcasts, responses),
+            (LINES, LINES),
+            "行数与写入次数不符（丢行或合并行）：{text:?}"
+        );
     }
 }

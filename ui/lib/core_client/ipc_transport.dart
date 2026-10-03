@@ -9,7 +9,8 @@ import 'protocol.dart';
 /// 行协议公共基类：`lines`（响应/通知行流）与 `write`（发一行）由子类适配
 /// （process stdio / TCP socket），`_call`、应答配对与通知流不再逐实现复制。
 abstract class LineCoreClient implements CoreClient {
-  // 写出函数走位置参数（`this._write`）：命名参数不能是私有初始化形参。
+  // 写出函数用位置初始化形参：命名形参不能是私有的（`{required this._write}` 不合法），
+  // 而命名形参 + initializer list 会触发 prefer_initializing_formals（analyze 红）。
   LineCoreClient(this._write, {required Stream<String> lines}) {
     _sub = lines.listen(_onLine);
   }
