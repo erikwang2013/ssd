@@ -223,6 +223,19 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 - **T4 移交（与 T2 合并全集）**：双平台 opener 接线（`list_only` 恒空 + `NoopOpener`，含 `unix:` id opener 按平台分派；macOS 的 EPERM→PermissionDenied 目标**只在该臂可达**）；**osascript 提权 ≠ FDA**（root 后仍可能 EPERM——授权失败 UX 须能提示「已提权但仍缺完全磁盘访问」）；`--device` 是否入 UAC/osascript 命令须显式规划；-32006 macOS 盲区（整盘源 vs 分区目标）入 T6 总表。
 - **未验证**：真机 root+FDA 全链、4Kn/Apple Fabric 命名、`rdisk` 性能与权限、Gatekeeper（T5/M2）、macOS port-file ACL（T1 项）。
 
+### T4（三平台提权流）—— impl-m1e-t4。提交沿革：`cebe692`（daemon 接线：双平台枚举/opener + `--owner-pid` 监督/空转自退 + P8 + `read_at_fill`）→ `0ad6182`（port-file 属主交还）→ `aa9562f`（UI 三平台引导）→ `84392ae`（security §10）→ `1c59b1b`（ISSUE-1：会话目录显式 chmod 700）→ `bacf0dc`（root 测试取证：ran:/skip: 二值 + CI 步）→ `c9cfdf5`/`9abe104`（qual 补钉 P1/P2345/P7 + Windows 守卫）→ `bfbfff6`（P1 随件 production hunk 还原，byte 级对照=P1b）。DONE → spec **PASS**（含 ISSUE-1 闭合）→ qual **APPROVED**（39 变异 19 KILL / 20 SURVIVE → 12 补钉 + 8 等效）→ 增复 APPROVED（T4 关闭；cargo 469/0；flutter 137+2；CI 六轮 5/5）
+
+- **交付**：`elevation.dart`（三平台 `ElevationPlan` 纯函数：Win32 `-EncodedCommand`[UTF-16LE] / osascript 双层引号 / pkexec 字面 IP + `spawnElevation` / `connectElevatedSession`）；scan_controller 提权流（-32001 → 0700 会话目录[**显式 chmod**] → 轮询 ≤30s/500ms → client 交换 → 重试；**半行双形态重试**；osascript≠FDA 提示格）；daemon 接线（`enumerate_startup_list` 三平台 + `win:`/`unix:` 平台分派 opener + `image:` 语义不变）；`--owner-pid` 监督 + 空转 3s 自退 + 清 port-file + exit 0 + stdout 零写；security §10。
+- **spec 独立核验**：命令构造 12 组注入 0 逃逸（自写 UTF-16LE 解码器 + `CommandLineToArgvW` 语义复算）；生命周期独立真进程探针（含仓库未覆盖的「启动窗口不误退」）；ISSUE-1（`createTempSync` 跟随 umask，0002⇒0775）以**显式 chmod 700 + mode 真值断言**闭合（双 umask 复跑 + 448/509 变异互证）；8 偏离全 ACCEPT。
+- **qual**：39 枚（19 KILL；**12 补钉**杀 R1/R6/R7/R9/R14/R17/R18 + D6/D13/D19/D20；8 等效）；补钉后 469/0 + 137+2；增复轮语义零差 + 全杀复跑 + 无夹带。
+- **★ 计划缺陷①（关键承重，落地时发现）**：root daemon 写 port-file 属主=root ⇒ UI 读不到令牌、整链断（T1 同用户测试暴露不出）→ `adopt_owner_of_dir`（仅 root、取自目录属主、rename 前 chown，无任意 chown 原语）+ UI 0700；**CI ubuntu+macOS 两腿 `ran:` 直证真执行**（取证步首跑命中）。
+- **计划缺陷②（Windows 提权入口不可达）**：**记 M2**（产品决策面：首页无设备时无触发点；判据 3 未失守）；强制移交互 T5（`README-安装.txt` 改写）与 T6（总表/矩阵行；表述「Windows 提权链已备、入口未接（M2）」）。
+- **计划缺陷③**：`-ArgumentList` 数组拆断含空格路径 → 单串 + Win32 引用（KAT 钉）。
+- **记录不修**：chmod 非零退出未检查（M2 一行建议）；Windows 第二轮 -32010 落 `_retryViaClientRestart` 文案误导（角落）；授权超时弃留 root daemon（窗口有界，T6 表）；30s 为软界；§10.4 未直言后果链（M2 文档补）；adopt 路径式 TOCTOU（M2 fd passing）；README「已知限制」段 stale（T5/T6）。
+- **T5 移交**：README 平台矩阵/已知限制改写（Windows 提权流「未接入（M2）」；Linux/macOS「可用（真机未验证）」；删过期「枚举接线归 T4/M2」半句）；`README-安装.txt` 提权句改写；**打包布局验证 `_client.daemonPath` 非空**（否则重试静默退化旧支路）；macOS 未签名/Gatekeeper + osascript≠FDA 真机复验说明；打包冒烟不得依赖 `--listen/--port-file/--owner-pid`。
+- **T6 移交**：未验证总表加行（真 UAC/osascript/pkexec、Windows port-file ACL/`OpenProcess` 语义、pid 复用/双 daemon 窗口、macOS -32006 整盘源盲区、Windows 提权入口不可达[M2]、授权超时弃留窗口、R11 属主交还 root 真路径、R2 空转下界）；判据 3 取证点=`ui/test/elevation_test.dart`（15 枚）。
+- **未验证**：真 UAC/osascript/pkexec 对话框与端到端链、真 FDA(TCC)、Windows ACL/`OpenProcess`、真机 pid 复用、R11 root 真路径。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
