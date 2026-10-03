@@ -757,6 +757,8 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 
 > **qual-m1d-t5 移交（测试缝，实施前必读）**：`file_selector.getDirectoryPath()` 是平台插件，**widget 测试直接调会挂**——测试缝推荐 `FileSelectorPlatform.instance` 注入 fake（不改页面签名；`TestDefaultBinaryMessenger` 平台通道 mock 为备选）。`start()` → `exportStart(taskId, idxs, dir)`；订阅 `export.progress/finished`（按 exportId 过滤）；状态机 `picking → exporting → done(report)|failed|canceled`。目标目录展示预估大小 = `estimatedBytes`；报告页：`succeeded/degraded/failed` 三计数 + 降级/失败清单（reason 文案）+「打开目标文件夹」按钮（`Process.start('xdg-open', [dir])`——桌面 Linux；其他平台 no-op + 文案）。
 
+> **T8 归档注记（lead）**：① `RecoverPage` 落码增必填 `client`（preview/results 两调用点同步传入，两枚上游钉测零改动）；② **finished 抢跑寄存回放加固**落地——T3 底盘竞序（daemon 可先发 finished 再回响应）而导出**无轮询兜底**，丢一条即永久卡「导出中」；计划外但 lead 追认，测试 7 钉死；③ O1（`start()` 重置 `_exportId/_done/_total/_writtenBytes`）+ O3（回放独立 try/catch）修复轮（qual-m1d-t8）+ 25 枚补测（`recover_page_supp*.dart`）；④ -32006/-32010 专用文案与 `itemsTruncated` 提示行已落；⑤ dev_dep `file_selector_platform_interface` + 6 件已跟踪生成物随提交（pub get 必需）；⑥ 未测三项（真 GTK 弹窗/真 xdg-open/真 daemon 全流程）归 T9。
+
 - [ ] **Step 1: 页面结构（规范级）**
 ```
 Scaffold('恢复文件')
@@ -868,6 +870,18 @@ Scaffold('恢复文件')
 - **记录级偏差（裁定归档）**：① 提交信息非逐字（T6 先例）；② 超 Files 清单改 2 文件（QualityBadge 提取 + results_page 调用点透传=编译必需，无夹带）；③ 68B 笔误修订。
 - **P3/P4 记录不修（归 M4/M5）**：P3 文本 >256KiB 无截断提示；P3 同位重建 State 复用（**T8/T9 勿在同槽位重建 PreviewPage**）；P4：eof 检查先于越限（撒谎件 ≤33MiB 界内多收 1 片）、takeBytes 2× 峰值 ≤66MiB+base64 瞬态、失败臂无重试按钮、QualityBadge 第三消费者出现时按 util/errors 先例上收。
 - **移交 T8/T9**：T8=RecoverPage 接导出链路时同步 `preview_page.dart:51` 调用点（传 client）；错误映射复用 `describeCoreError`；-32006/-32010 文案按计划 773。T9=-32009 集成须用文本件（图片被 32MiB 本地截先行）；雕刻件预览断言 `fsRead(idx)`+字节；qual 24 条变异并入 T9 抽检池。未验证：真 daemon 分片/eof 行为、-32009 真路径、大图真解码耗时/内存、eof+cap 同片多收。
+
+### T8（恢复页）—— impl-m1d-t8。提交沿革：`94c61fb`（主）→ `2928b19`（qual 两修复 + 25 枚补测）。DONE → spec **PASS** → qual ISSUES（O1/O3 必修）→ 修复有牙（T8 关闭；115+1 跳过 / GATE2 待二进制刷新，见★）
+
+- **交付**：恢复页桩→正式（controller/page/report_view 三件）；状态机 `picking → exporting → done|failed|canceled`；`file_selector` 目标选择（测试缝 `FileSelectorPlatform.instance`）；`exportStart(taskId,idxs,dir)`；`export.progress/finished` 按 exportId 过滤；-32006/-32010 专用文案、其余 describeCoreError；报告三计数+清单（落盘名一律 `ExportReportItem.name`）+ `itemsTruncated` 提示；[打开目标文件夹] 仅按目录；`RecoverPage` 增必填 client、两调用点同步；测试 10→35 枚。
+- **★ finished 抢跑寄存回放（impl 计划外加固，lead 追认）**：T3 底盘竞序——daemon 可先发 finished 再回响应；导出**无轮询兜底**，丢一条即永久卡「导出中」→ 未知 exportId 在途寄存、响应到达后双检回放；spec 穿透（删寄存/删回放→测试 7 红；异 id 双检拒、非在途丢弃、单槽三处清零=无界增长不存在、串扰自愈、重复幂等）。
+- **★ O1/O3 修复轮（qual 修正因果链）**：O1=二次导出在途窗口 `_exportId` 残留 → 新导出自己的抢跑 finished 被双拒 → 永久「导出中」（实测取消指旧 id、旧计数残留）→ `start()` 重置四字段；O3=畸形 finished 回放落外层 catch → failed+TypeError 上屏而导出在跑 → 回放独立 try/catch。回退变异 m30/m31 → 恰 3 枚红（与 impl 自证一致）。
+- **qual 变异 51→54 枚**：v1 44 KILL/7 SURVIVE → 25 枚补测落地后 **47 KILL/6 等价 SURVIVE**；repo 单跑杀不掉的 20 枚全转 KILL；**m26 修正为 KILL**（v1「等价」判定有误——新补测正好观测到）。工艺披露：m30/m31 首跑 harness 缺陷自修、m31 单独复跑补齐。
+- **spec 独立核验**：15 探针；6 项偏离逐项实证接受（dev_dep lint 必要性 / 生成物逐字节重生成 + lock enforce / 寄存回放重点穿透 / itemsTruncated 字段对齐 / 骨架必要偏差 / 未测三项）；两枚上游钉测 diff 零改动。
+- **O2 异议（qual 胜）**：formatBytes 边界实测正确（0/1023/1024/1048575/1MiB/1TiB），spec「进位毛刺」不成立 → 不改码 + 3 枚边界断言。
+- **记录不修（归 M4/M5）**：`start()` 不清 `_report`（单引用被下次 finished 替换、exporting 不渲染 → 无泄漏/无陈旧显示，清理代价大于收益）；非 Linux SnackBar 臂无测试缝；清单渲染非懒加载（≤1000 量级可接受）；cancel 后 `_error` 瞬态残留。
+- **★ 环境前置（T9 首步）**：GATE2（XD_DAEMON_BIN 集成）红——target 中 daemon 二进制过期（构建早于 T3 起全部引擎改动），报 `-32601 Method not found: fs.read`；父提交 94c61fb 同红，**非 T8 回归**。T9 首步 `cargo build`（debug+release）刷新后复跑确认。
+- **移交 T9**：集成须覆盖真 daemon exportId 过滤与至少一次真抢跑时序；-32006/-32010 可直接断言 UI 文案；不得引入真 xdg-open 进程断言；变异池 54 枚可抽检（`matrix2_result.json`）；-32009 集成须用文本件（>64MiB）；雕刻件预览断言 `fsRead(idx)`+字节。未验证：真 GTK 弹窗、真 xdg-open、真 daemon 全流程（GATE2 绿态待刷新复跑）。
 
 ---
 
