@@ -435,6 +435,48 @@ fn owner_pid_without_tcp_session_is_rejected() {
     assert!(err.contains("--owner-pid"), "错误信息须点名参数：{err}");
 }
 
+/// `--owner-pid 0` 非法（pid > 0 校验）：0 会被存活探针判死 ⇒ daemon 起来即自退——
+/// 参数错误必须 exit 2 点名参数，不得静默接受（qual-m1e-t4 补钉，杀「放行 0」变异）。
+#[test]
+fn owner_pid_zero_is_rejected() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            "/tmp/xd-qual-zero.port",
+            "--owner-pid",
+            "0",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--owner-pid"), "错误信息须点名参数：{err}");
+    // 非数字同样走 parse Err 臂（spec-m1e-t4 标记的未覆盖分支）：exit 2 且点名参数。
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            "/tmp/xd-qual-zero.port",
+            "--owner-pid",
+            "abc",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon");
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--owner-pid"), "错误信息须点名参数：{err}");
+}
+
 #[test]
 fn notifications_broadcast_to_all_authenticated_connections() {
     let dir = tempfile::tempdir().unwrap();
@@ -529,6 +571,10 @@ fn root_daemon_hands_port_file_back_to_owner_user() {
         .expect("spawn owner stand-in");
 
     let mut child = Command::new("sudo")
+        // cwd 置 `/`（root 属主）：`adopt_owner_of_dir` 若改用 cwd 而非 port-file 父目录定属主，
+        // 这里就会 chown 到 root ⇒ 用户读不到 port-file ⇒ 本测试红（qual-m1e-t4 缺口补钉；
+        // 本机无免密 sudo 不可验，CI Linux/macOS 腿真跑判别）。
+        .current_dir("/")
         .args([
             "-n",
             env!("CARGO_BIN_EXE_xd-daemon"),
@@ -595,4 +641,97 @@ fn root_daemon_hands_port_file_back_to_owner_user() {
     assert!(status.success(), "sudo/daemon 退出码应为 0：{status:?}");
     assert!(!pf.exists(), "自退必须清理 port-file");
     daemon.kill_and_assert_stdout_empty();
+}
+
+// ---- qual-m1e-t4 补钉：监督的两条「不得误杀」判据 + 两条边界 ----
+
+/// ① 启动窗口（从未连接）不得被空转自退误杀：`ever_registered` 守卫若被摘除，daemon 会在
+/// IDLE_EXIT(3s) 后自退并清 port-file —— UI 尚未连上就丢了会话（授权后端口已就绪、UI 慢一拍）。
+/// ② 有活跃连接时不得空转自退：`sink_count()` 判据若反转（连接中即计空转），连接持有超过
+/// IDLE_EXIT 后 daemon 会掐断**正在使用**的会话。
+/// 实测杀两枚变异（qual-m1e-t4）：摘 ever_registered 守卫 / 反转 sink_count 判据。
+#[test]
+fn watchdog_spares_startup_window_and_active_session() {
+    const IDLE_EXIT_MS: u64 = 3_000; // transport.rs 的 IDLE_EXIT（本测试须跨过它）
+    let dir = tempfile::tempdir().unwrap();
+    let pf = dir.path().join("session.port");
+    let mut daemon = spawn_tcp(&[], &pf);
+    let (port, token) = wait_port_file(&pf);
+
+    // ① 从未连接：跨过 IDLE_EXIT 仍须存活（宽限一个 tick 再加 100ms）
+    std::thread::sleep(Duration::from_millis(IDLE_EXIT_MS + 600));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "启动窗口（从未连接）不得被空转自退误杀"
+    );
+    assert!(pf.exists(), "启动窗口内 port-file 不得被清");
+
+    // ② 活跃连接：连续持有 > IDLE_EXIT，每拍 ping 都必须应答
+    let (mut stream, reader) = connect_authed(port, &token);
+    let mut lines = Lines::new(reader);
+    for i in 1..=3 {
+        std::thread::sleep(Duration::from_millis(1_500));
+        send(
+            &mut stream,
+            json!({"jsonrpc":"2.0","id":i,"method":"ping","params":null}),
+        );
+        assert_eq!(
+            lines.response(i)["result"]["pong"],
+            true,
+            "活跃连接期间不得自退（第 {i} 拍，累计已持有 1.5s×{i} > IDLE_EXIT）"
+        );
+    }
+
+    daemon.kill_and_assert_stdout_empty();
+}
+
+/// EPERM = 存活（跨用户属主）：非 root daemon 探 pid 1（root 属主）——`kill(1, 0)` 必 EPERM，
+/// 探针须判「存活」而非自退。杀「EPERM → 不存在」变异（qual-m1e-t4；该分支此前全无覆盖：
+/// root 测试里 daemon 是 root、属主是同用户，走的是 Ok 臂）。仅 unix：Windows 的
+/// `OpenProcess(1)` 失败于 ERROR_INVALID_PARAMETER，语义不同。
+#[cfg(unix)]
+#[test]
+fn alive_probe_treats_eperm_as_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let pf = dir.path().join("session.port");
+    let mut daemon = spawn_tcp(&["--owner-pid", "1"], &pf);
+    let _ = wait_port_file(&pf);
+    std::thread::sleep(Duration::from_millis(1_600)); // > 2 个 tick（探针每 500ms 一次）
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "pid 1 跨用户（EPERM）必须判为存活，不得自退"
+    );
+    assert!(pf.exists(), "未触发自退时 port-file 必须在");
+    daemon.kill_and_assert_stdout_empty();
+}
+
+/// 非 root 写 **他人属主目录**（/tmp 本身：root:root 1777，sticky 允许建/删自己的文件）不得
+/// 因属主交还逻辑而失败：`adopt_owner_of_dir` 的 `euid == root` 门若被摘除，这里会 chown(root)
+/// → EPERM → 写 port-file 失败 → daemon exit 2（非提权路径全断）。实测杀该变异（qual-m1e-t4）。
+#[cfg(unix)]
+#[test]
+fn non_root_port_file_in_foreign_owned_dir_succeeds() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = std::path::Path::new("/tmp");
+    let tmp_uid = std::fs::metadata(tmp).expect("/tmp").uid();
+    let euid = rustix::process::geteuid().as_raw();
+    if tmp_uid == euid {
+        eprintln!("skip: /tmp 属主为本用户（属主交还无判别力）");
+        return;
+    }
+    let pf = tmp.join(format!("xd-qual-t4-{}.port", std::process::id()));
+    let _ = std::fs::remove_file(&pf);
+    let mut daemon = spawn_tcp(&[], &pf);
+    let (port, token) = wait_port_file(&pf);
+    let (mut stream, reader) = connect_authed(port, &token);
+    let mut lines = Lines::new(reader);
+    send(
+        &mut stream,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping","params":null}),
+    );
+    assert_eq!(lines.response(1)["result"]["pong"], true);
+    drop(lines);
+    drop(stream);
+    daemon.kill_and_assert_stdout_empty();
+    let _ = std::fs::remove_file(&pf);
 }
