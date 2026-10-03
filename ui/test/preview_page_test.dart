@@ -2,6 +2,7 @@
 // 预览页 widget 测试（Fake 驱动）：按 ext 分派（图片分片组装到 eof / 文本前缀 /
 // 其它仅信息卡）、坏图 errorBuilder、>32MiB 不拉、短交付提示、雕刻件信息卡与
 // 导航参数（写路径只传 idx——displayName 仅供展示）。
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -65,6 +66,19 @@ Future<FakeCoreClient> pumpPreview(
   );
   await flush(tester);
   return fake;
+}
+
+/// fsRead 挂起直到测试显式完成（dispose 竞态测试用）。
+class _SlowReadClient extends FakeCoreClient {
+  final completer = Completer<FsReadResult>();
+
+  @override
+  Future<FsReadResult> fsRead(
+    int taskId,
+    int idx, {
+    int offset = 0,
+    int length = 1048576,
+  }) => completer.future;
 }
 
 void main() {
@@ -234,5 +248,152 @@ void main() {
     expect(recover.taskId, 9);
     expect(recover.idxs, [5]);
     await unload(tester);
+  });
+
+  testWidgets('未支持类型：不读取 + 「此类型不支持预览」（其余仅信息卡）', (tester) async {
+    final fake = FakeCoreClient();
+    await pumpPreview(
+      tester,
+      client: fake,
+      e: entry(name: 'clip.mp4', ext: 'mp4', size: 4096),
+    );
+    expect(fake.fsReadQueries, isEmpty, reason: '其它类型不读取');
+    expect(find.text('此类型不支持预览'), findsOneWidget);
+    expect(find.text('clip.mp4'), findsWidgets, reason: '信息卡恒显（AppBar + 名称行）');
+    await unload(tester);
+  });
+
+  testWidgets('ext 分派：png 与大小写不敏感（PNG 走图片臂）；json 走文本臂', (tester) async {
+    final pngFake = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) =>
+          FsReadResult(bytes: tinyPng, eof: true);
+    await pumpPreview(
+      tester,
+      client: pngFake,
+      e: entry(name: 'x.PNG', ext: 'PNG', size: tinyPng.length),
+    );
+    expect(pngFake.fsReadQueries, hasLength(1), reason: 'PNG 大写也须命中图片臂');
+    expect(find.byType(Image), findsOneWidget);
+    await unload(tester);
+
+    final jsonFake = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) => FsReadResult(
+        bytes: Uint8List.fromList(utf8.encode('{"a":1}')),
+        eof: true,
+      );
+    await pumpPreview(
+      tester,
+      client: jsonFake,
+      e: entry(name: 'data.json', ext: 'json', size: 7),
+    );
+    expect(find.byType(SelectableText), findsOneWidget, reason: 'json 须命中文本臂');
+    await unload(tester);
+  });
+
+  testWidgets('契约外防御：非 eof 零交付立即停（防死循环）、不误报短交付', (tester) async {
+    var calls = 0;
+    final fake = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) =>
+          FsReadResult(bytes: Uint8List(0), eof: calls++ > 0);
+    await pumpPreview(tester, client: fake, e: entry(size: 4096));
+    expect(fake.fsReadQueries, hasLength(1), reason: '零交付且非 eof：守卫须停（否则死循环）');
+    expect(find.text('实际数据短于声明大小'), findsNothing, reason: 'eof 未到：不得断言短交付');
+    await unload(tester);
+  });
+
+  testWidgets('声明撒谎（实收越 32MiB 上限）：32 片即停并示「文件过大」', (tester) async {
+    final chunk = Uint8List(1024 * 1024);
+    var calls = 0;
+    final fake = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) =>
+          FsReadResult(bytes: chunk, eof: ++calls > 32); // 第 33 片才 eof：变异下防挂死
+    await pumpPreview(
+      tester,
+      client: fake,
+      e: entry(size: 2 * 1024 * 1024),
+    );
+    expect(
+      fake.fsReadQueries,
+      hasLength(32),
+      reason: '1MiB×32 恰达上限即停（32MiB 本身不算超）',
+    );
+    expect(find.text('文件过大，暂不支持预览'), findsOneWidget);
+    await unload(tester);
+  });
+
+  testWidgets('上限边界：声明恰 32MiB 仍尝试读取；32MiB+1 不拉', (tester) async {
+    final atCap = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) =>
+          FsReadResult(bytes: Uint8List(0), eof: true);
+    await pumpPreview(
+      tester,
+      client: atCap,
+      e: entry(size: 32 * 1024 * 1024),
+    );
+    expect(atCap.fsReadQueries, hasLength(1), reason: '恰 32MiB 不超限：须尝试读取');
+    await unload(tester);
+
+    final overCap = FakeCoreClient();
+    await pumpPreview(
+      tester,
+      client: overCap,
+      e: entry(size: 32 * 1024 * 1024 + 1),
+    );
+    expect(overCap.fsReadQueries, isEmpty, reason: '32MiB+1 超限：不拉');
+    expect(find.text('文件过大，暂不支持预览'), findsOneWidget);
+    await unload(tester);
+  });
+
+  testWidgets('文本：非法 UTF-8 不炸（allowMalformed → U+FFFD 替换符）', (tester) async {
+    final bytes = Uint8List.fromList([0x41, 0xFF, 0x42]);
+    final fake = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) =>
+          FsReadResult(bytes: bytes, eof: true);
+    await pumpPreview(
+      tester,
+      client: fake,
+      e: entry(name: 'junk.txt', ext: 'txt', size: 3),
+    );
+    final text = tester.widget<SelectableText>(find.byType(SelectableText));
+    expect(text.data, 'A\uFFFDB', reason: '非法字节以替换符呈现，不得整页失败');
+    await unload(tester);
+  });
+
+  testWidgets('信息卡：非雕刻件无「偏移」行；状态按 deleted 逐字；恰等不报短交付', (tester) async {
+    final fake = FakeCoreClient()
+      ..onFsRead = (taskId, idx, offset, length) =>
+          FsReadResult(bytes: Uint8List.fromList(utf8.encode('ab')), eof: true);
+    await pumpPreview(
+      tester,
+      client: fake,
+      e: entry(name: 'gone.txt', ext: 'txt', size: 2, deleted: true),
+    );
+    expect(
+      find.text('偏移'),
+      findsNothing,
+      reason: 'byteOffset null（非雕刻件）不得显示偏移行',
+    );
+    expect(find.text('已删除'), findsOneWidget, reason: 'deleted 条目状态行逐字');
+    expect(find.text('存活'), findsNothing);
+    expect(
+      find.text('实际数据短于声明大小'),
+      findsNothing,
+      reason: 'eof 且实收 == 声明：恰等不是短交付',
+    );
+    await unload(tester);
+  });
+
+  testWidgets('竞态：加载在途时卸载 → 结果到达不 notify（无 dispose 后使用）', (tester) async {
+    final slow = _SlowReadClient();
+    await pumpPreview(
+      tester,
+      client: slow,
+      e: entry(size: tinyPng.length),
+    );
+    await unload(tester); // fsRead 仍在途即 dispose
+    slow.completer.complete(FsReadResult(bytes: tinyPng, eof: true));
+    await tester.pump();
+    await tester.pump();
+    // 无正向断言：_disposed 守卫缺失时 notifyListeners-after-dispose 断言炸掉本测试
   });
 }
