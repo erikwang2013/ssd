@@ -22,10 +22,16 @@ app="${1:-}"
 zip="${2:-}"
 
 # --- 凭据门控（先于一切签名动作：绝不产半签包）---
+# 显式逐变量检查：不用 `${!v}`（间接展开 + `:-` 默认值）——macOS 自带 bash 3.2 解析该形态
+# 会报「missing�: unbound variable」（CI macOS 腿实测红，2026-10-03）。本脚本须在
+# /bin/bash 3.2 下可跑（CI runner 默认 shell），只用 POSIX/bash-3.2 语法。
 missing=""
-for v in APPLE_CERT_P12_BASE64 APPLE_CERT_PASSWORD APPLE_TEAM_ID APPLE_ID APPLE_APP_PASSWORD; do
-  [ -n "${!v:-}" ] || missing="${missing:+$missing }$v"
-done
+add_missing() { [ -n "${2:-}" ] || missing="${missing:+$missing }$1"; }
+add_missing APPLE_CERT_P12_BASE64 "${APPLE_CERT_P12_BASE64:-}"
+add_missing APPLE_CERT_PASSWORD "${APPLE_CERT_PASSWORD:-}"
+add_missing APPLE_TEAM_ID "${APPLE_TEAM_ID:-}"
+add_missing APPLE_ID "${APPLE_ID:-}"
+add_missing APPLE_APP_PASSWORD "${APPLE_APP_PASSWORD:-}"
 if [ -n "$missing" ]; then
   echo "skip: 签名/公证跳过——缺凭据: $missing；本产物未签名/未公证（artifact 名不变）"
   exit 0

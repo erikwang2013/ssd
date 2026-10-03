@@ -147,6 +147,33 @@ fn smoke_reports_signature_state() {
     );
 }
 
+#[test]
+fn notarize_script_avoids_bash4_only_constructs() {
+    // macOS runner 的 `bash` = /bin/bash 3.2（CI 实证红：`${!v:-}` 间接展开+默认值
+    // 被解析成乱码变量名 ⇒ unbound variable）。本测试把「只用 bash 3.2 语法」钉住：
+    // 全行注释先剔除（注释里正当解释被禁形态），其余代码不允许出现 4.x-only 构造。
+    let s = read("scripts/notarize.sh");
+    let code: String = s
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for bad in [
+        "${!",
+        "mapfile",
+        "readarray",
+        "declare -A",
+        "&>",
+        "|&",
+        ";;&",
+    ] {
+        assert!(
+            !code.contains(bad),
+            "bash 3.2（macOS /bin/bash）不支持 {bad}——notarize.sh 须在 CI runner 默认 shell 下可跑"
+        );
+    }
+}
+
 #[cfg(unix)]
 mod scripts {
     use super::repo_root;
