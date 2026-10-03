@@ -175,3 +175,53 @@ reap 完成～state 落定之间的 µs 级窗内该 pid 已被回收，理论�
 - [ ] `/etc/passwd` 无该 uid 时只降 uid 的警告路径（组属主保留 root，stderr 有留痕）。
 - [ ] 真 GTK 目录选择弹窗、真桌面文件管理器「打开目标文件夹」（CI 无桌面，按计划不引入
       真 `xdg-open` 进程断言）——归 M1 出口手测。
+
+## 7. 提权会话传输（M1e-tail T1：TCP 回环 + 令牌）
+
+**模型**：提权（root）daemon 不再走 stdio——`--listen 127.0.0.1:0 --port-file F`：绑定回环
+随机端口 → 生成会话令牌 → **原子写 F**（一行 `<port> <token>`；unix：`.tmp-<pid>` 以 `create_new`
+独占 + 0600 创建后 `rename`，读者永远读不到半行）→ stderr 打印就绪。客户端（Dart
+`SocketCoreClient`）读 F → `Socket.connect` 回环 → **首行必须 `{"auth":"<token>"}`**，否则
+daemon 回 `-32001`（id=null）后**立即断开、不读后续**；认证通过后该连接按 stdio 同款逐行
+JSON-RPC 处理（响应与通知同走一条连接）。令牌比较常数时间（长度差直接 `false`，逐字节 XOR 折叠）。
+协议全文见 `crates/xd-daemon/src/transport.rs` 头注。
+
+**威胁模型（为什么这条面成立）**：
+
+1. **令牌文件即能力**：异用户进程读不到 0600 的 F（Linux 权限位；Windows 见未验证），读不到令牌
+   即无法通过握手——回环监听面因此**不弱于**原 stdio 句柄传递：两者都要求「已是当前用户」。
+   回环端口不对外网卡暴露（绑定 `127.0.0.1`），且 `main.rs` 对 `--listen` 只放行回环地址
+   （非回环 → exit 2，显式拒绝而非静默）。
+2. **同用户攻击者无提权增益**：同用户进程本就有 uaccess 直读设备（§1 方案 A），亦可 `ptrace`
+   普通用户进程/读其内存。令牌只把「同用户的可达性」显式化，不新增任何跨用户或跨权限动作；
+   本模型的收益方是**用户自己**的 UI 进程拿到 root 只读能力的通道。
+3. **令牌生命周期**：daemon 启动时 16 字节 CSPRNG（unix `/dev/urandom`；windows `BCryptGenRandom`）
+   → 32 位十六进制，仅存于 daemon 内存与该 0600 文件；daemon 退出即失效。M1 不做轮换——
+   每次提权引导都是「新 daemon + 新令牌」（daemon 生命周期 == 会话）；轮换/过期归 M2。
+4. **认证失败不泄露**：失败只有固定一条 `-32001` + 断开，不回显期望值、不区分「格式错」与
+   「令牌错」，不读该连接其余内容。
+
+**已知限制（M1 明示接受，M2 收紧）**：
+
+- **通知广播给所有已认证连接**（非订阅路由）：daemon 侧 `Notifier` 对注册的每个写端遍历写；
+  多客户端场景下 A 的扫描进度也会推给 B。M1 产品形态是「单 UI 进程 + 提权 daemon」，
+  实际只有一族连接；连接路由/订阅模型归 M2。测试钉子见
+  `crates/xd-daemon/tests/tcp_session.rs::notifications_broadcast_to_all_authenticated_connections`。
+- **无连接数/频率限制**：本地任意进程可对回环端口反复连接、反复猜令牌。16 字节令牌空间下
+  在线暴力不可行，且猜测成功者本就等价于当前用户（见威胁模型 2）；但**无速率限制本身**是
+  已知缺口（连接洪泛/资源耗尽面）——M2 收紧。
+- **广播持全局锁逐端写**：慢读者（TCP 缓冲写满）会拖住其余连接的广播（代码内 `ponytail:` 注释
+  标记）。M1 接受；每端独立缓冲/线程归 M2。
+- **stdout 仅协议**：TCP 模式下 stdout 不写任何东西（诊断全 stderr），集成测试全程断言其为空
+  （`kill_and_assert_stdout_empty`）——维护 stdio 与 TCP 两模式共同的契约。
+- **Windows port-file ACL 未收紧**：NTFS 无 0600 语义，现为直写（可读性由继承 ACL 决定，
+  通常已限当前用户但不保证）；显式收紧仅当前用户可读 = TODO M2。
+  非 unix/windows 平台**显式拒绝**（`Unsupported` / panic，不静默退化）。
+
+**未验证（需真机）**：
+
+- [ ] Windows/macOS 运行时：`BCryptGenRandom` 返回判定与端口文件可读性实测（CI 只证编译；
+      本代理以独立探针 crate 对 `windows-sys 0.61` 的 `x86_64-pc-windows-msvc` 目标
+      `cargo check` 通过，运行语义归 M1 出口真机）。
+- [ ] 真 UAC/osascript 提权引导拉起 TCP daemon 的端到端（Task 4 交付；CI 无桌面）。
+- [ ] macOS 全盘访问（TCC）路径下的提权会话（同上）。

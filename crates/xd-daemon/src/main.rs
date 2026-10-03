@@ -1,21 +1,24 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
-//! 小盾桌面特权进程：stdio JSON-RPC 服务（每行一条 JSON，见 proto/v0/README.md）。
+//! 小盾桌面特权进程：JSON-RPC 服务（每行一条 JSON，见 proto/v0/README.md）。
+//! 传输二选一：stdio（缺省）或 TCP 回环提权会话（`--listen`+`--port-file` 成对给出，
+//! 协议与威胁模型见 transport.rs 头注与 docs/security）。
 //! 提权归 M4；M1e 起 Linux 支持 --device 注册物理块设备 + 启动时 sysfs 枚举供 device.list，
 //! 并在 root（pkexec 兜底）路径做 --image 参数纵深防御（privcheck，见 docs/security/linux-privilege-model.md）。
-//! M1b：扫描 worker 线程与主循环经唯一 stdout 写口（`write_line`）串行化；`--db` 指定任务库
+//! M1b：扫描 worker 线程与主循环经唯一写口（`transport::write_line`）串行化；`--db` 指定任务库
 //! （缺省 XDG state 路径，打开失败降级内存库并 warn）。
 
 mod export_worker;
+mod portfile;
 #[cfg(target_os = "linux")]
 mod privcheck;
+mod transport;
 
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use xd_core::api::{PROTOCOL_VERSION, Request, Response, RpcErr, RpcError};
+use xd_core::api::PROTOCOL_VERSION;
 use xd_core::export::ExportManager;
-use xd_core::handlers::{CoreCtx, handle_request};
+use xd_core::handlers::CoreCtx;
 #[cfg(target_os = "linux")]
 use xd_core::scan_task::OpenError;
 use xd_core::scan_task::{DeviceOpener, NotifyFn, ScanCanceled, ScanManager};
@@ -53,6 +56,8 @@ fn main() {
 
     let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
     let mut db_path: Option<PathBuf> = None;
+    let mut listen: Option<std::net::SocketAddr> = None;
+    let mut port_file: Option<PathBuf> = None;
     // 提权兜底路径（pkexec 以 root 拉起）的准入判定，见 docs/security/linux-privilege-model.md。一次 /proc 读。
     #[cfg(target_os = "linux")]
     let euid = privcheck::effective_uid();
@@ -128,12 +133,47 @@ fn main() {
                 };
                 db_path = Some(PathBuf::from(path));
             }
+            "--listen" => {
+                let Some(addr) = args.next() else {
+                    eprintln!("error: --listen requires host:port");
+                    std::process::exit(2);
+                };
+                match addr.parse::<std::net::SocketAddr>() {
+                    // 监听面仅回环（提权会话传输的安全前提，见 docs/security）：非回环地址拒绝。
+                    Ok(a) if a.ip().is_loopback() => listen = Some(a),
+                    Ok(a) => {
+                        eprintln!("error: --listen 仅允许回环地址（收到 {a}）");
+                        std::process::exit(2);
+                    }
+                    Err(e) => {
+                        eprintln!("error: --listen 需为 host:port: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--port-file" => {
+                let Some(path) = args.next() else {
+                    eprintln!("error: --port-file requires a path");
+                    std::process::exit(2);
+                };
+                port_file = Some(PathBuf::from(path));
+            }
             other => {
                 eprintln!("error: unknown argument {other}");
                 std::process::exit(2);
             }
         }
     }
+
+    // `--listen`/`--port-file` 成对出现才进 TCP 模式；只给其一 = 参数错误（不静默退 stdio）。
+    let tcp = match (listen, port_file) {
+        (Some(addr), Some(port_file)) => Some(transport::TcpOptions { addr, port_file }),
+        (None, None) => None,
+        _ => {
+            eprintln!("error: --listen 与 --port-file 须成对出现");
+            std::process::exit(2);
+        }
+    };
 
     // 启动枚举（Linux，零 open()）：失败不阻塞 daemon 启动，但留痕（UI 侧收集 stderr 可诊断）。
     #[cfg(target_os = "linux")]
@@ -184,12 +224,11 @@ fn main() {
         None => (Store::open_memory().expect("sqlite in-memory"), None),
     };
 
-    // 用 `Stdout` 而非 `StdoutLock<'static>`：现 std 的锁句柄含 `ReentrantLockGuard`（!Send），
-    // 无法跨 worker 共享；`Mutex<Stdout>` 同样把整行写出串行化（+ 每行 flush）。
-    let out: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
+    // 通知广播器（stdio 会话 / 各 TCP 连接各注册一个写端；逐端锁 + flush 串行化整行）。
+    let notifier = Arc::new(transport::Notifier::new());
     let notify: NotifyFn = {
-        let out = out.clone();
-        Arc::new(move |v: serde_json::Value| write_line(&out, &v))
+        let notifier = notifier.clone();
+        Arc::new(move |v: serde_json::Value| notifier.broadcast(&v))
     };
     // `tasks` 持设备句柄至 daemon 退出（M1c 现场续跑复用）；USB 安全弹出前的关句柄策略归 M1d/M2。
     let mgr = Arc::new(ScanManager::new(store, notify.clone()));
@@ -204,41 +243,25 @@ fn main() {
     #[cfg(not(target_os = "linux"))]
     let opener: Arc<dyn DeviceOpener> = Arc::new(xd_core::scan_task::NoopOpener);
 
-    let ctx = CoreCtx::new(devices)
-        .with_list_only(list_only)
-        .with_scan(mgr, opener)
-        .with_export(exports);
-    let stdin = std::io::stdin();
+    let ctx = Arc::new(
+        CoreCtx::new(devices)
+            .with_list_only(list_only)
+            .with_scan(mgr, opener)
+            .with_export(exports),
+    );
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(e) => {
-                eprintln!("error: read failed: {e}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle_request(&ctx, &req),
-            Err(_) => Response::Err(RpcErr {
-                jsonrpc: "2.0".into(),
-                id: serde_json::Value::Null,
-                error: RpcError::parse_error(),
-            }),
-        };
-        // 写出失败（下游关闭）不退出：进程随 stdin EOF 结束。
-        write_line(&out, &serde_json::to_value(&response).unwrap());
+    // TCP 回环（提权会话）：不读 stdin、stdout 不写（诊断全 stderr）；服务循环不返回。
+    if let Some(opts) = tcp {
+        transport::serve_tcp(opts, ctx.clone(), notifier.clone());
     }
-}
 
-/// 唯一 stdout 写口（主循环与扫描 worker 的通知共用；`Mutex` 串行化整行输出）。
-fn write_line(out: &Mutex<std::io::Stdout>, v: &serde_json::Value) {
-    let mut w = out.lock().unwrap();
-    let _ = writeln!(w, "{v}");
-    let _ = w.flush();
+    // stdio 会话：注册通知写端（与响应写出共用同一把锁 ⇒ 整行不交错），进程存活期内一直在册。
+    // 用 `Stdout` 而非 `StdoutLock<'static>`：现 std 的锁句柄含 `ReentrantLockGuard`（!Send），
+    // 无法跨 worker 共享。
+    let out: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
+    let _sink = notifier.register(Box::new(transport::SharedSink(out.clone())));
+    let stdin = std::io::stdin();
+    transport::serve_lines(stdin.lock(), &ctx, &out);
 }
 
 /// 懒打开物理设备（device.list 零 open 铁律的唯一出口）。`image:` 一律拒绝——镜像只能经

@@ -10,6 +10,10 @@ serde_json = { workspace = true }
 xd-core = { path = "../xd-core" }
 xd-device = { path = "../xd-device" }
 
+# 令牌生成（BCryptGenRandom，portfile.rs）。仅 windows 目标编译；运行语义未验证（需真机）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", default-features = false, features = ["Win32_Security_Cryptography"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 xd-fixtures = { path = "../xd-fixtures" }

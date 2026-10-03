@@ -457,6 +457,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "tempfile",
+ "windows-sys",
  "xd-core",
  "xd-device",
  "xd-fixtures",
