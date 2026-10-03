@@ -275,8 +275,13 @@ fn port_file_is_0600_and_leaves_no_temp_file() {
     let mut daemon = spawn_tcp(&[], &pf);
 
     let _ = wait_port_file(&pf);
-    let mode = std::fs::metadata(&pf).unwrap().permissions().mode() & 0o777;
+    let md = std::fs::metadata(&pf).unwrap();
+    let mode = md.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "port-file 含令牌，必须 0600（仅本用户可读）");
+    // 同用户写入（本测试非提权）：属主 = 目录属主 = 写者，adopt_owner_of_dir 无事可做。
+    use std::os::unix::fs::MetadataExt;
+    let dir_uid = std::fs::metadata(dir.path()).unwrap().uid();
+    assert_eq!(md.uid(), dir_uid, "非提权写入不得改属主");
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -483,5 +488,108 @@ fn notifications_broadcast_to_all_authenticated_connections() {
         "B 断开后 A 的广播必须照常"
     );
 
+    daemon.kill_and_assert_stdout_empty();
+}
+
+/// 提权形态（root daemon ↔ 普通用户 UI）的 port-file 属主与可读性 + 全链路（T4 落地发现的
+/// T1 缺口：root 写 0600 ⇒ 属主=root ⇒ UI 读不到令牌，提权链断）：以 `sudo -n` 起 root daemon，
+/// port-file 落在当前用户自建的 0700 目录 ⇒ 属主须交还当前用户、权限仍 0600、当前用户可读并
+/// 握手 ping（与 UI 侧同路径）；属主进程亡 ⇒ root daemon 自退 + 清 port-file（属主监督在
+/// root 下同样成立）。**未验证**：polkit 授权框本身（本测试以 `sudo -n` 代替提权器；
+/// 真机 pkexec/osascript 链归出口手测）。无免密 sudo（开发机常态）⇒ 跳过并留痕；CI runner
+/// 有免密 sudo ⇒ 真跑。
+#[cfg(unix)]
+#[test]
+fn root_daemon_hands_port_file_back_to_owner_user() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let sudo_ok = Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo_ok {
+        eprintln!(
+            "skip: root_daemon_hands_port_file_back_to_owner_user 需免密 sudo（CI runner 有，开发机无）"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap(); // 0700 + 属主 = 当前用户（UI 侧 createTempSync 同款）
+    let pf = dir.path().join("session.port");
+    // 属主监督凭据：本测试持有且可杀的进程（= UI 进程的替身；kill 后必须 wait 回收，
+    // 否则僵尸进程对 kill(pid,0) 恒存活，属主监督不触发）。
+    let mut owner = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn owner stand-in");
+
+    let mut child = Command::new("sudo")
+        .args([
+            "-n",
+            env!("CARGO_BIN_EXE_xd-daemon"),
+            "--listen",
+            "127.0.0.1:0",
+            "--port-file",
+            pf.to_str().unwrap(),
+            "--owner-pid",
+            &owner.id().to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn root daemon via sudo");
+    let stdout = child.stdout.take();
+    let mut daemon = Daemon { child, stdout };
+
+    // 当前用户读到 port-file 即属主已交还（root:0600 时 read_to_string 必然 EACCES → 轮询超时红）
+    let (port, token) = wait_port_file(&pf);
+    let md = std::fs::metadata(&pf).unwrap();
+    let owner_uid = std::fs::metadata(dir.path()).unwrap().uid();
+    assert_eq!(
+        md.uid(),
+        owner_uid,
+        "root daemon 必须把 port-file 属主交还目录属主（UI 用户）"
+    );
+    assert_eq!(
+        md.permissions().mode() & 0o777,
+        0o600,
+        "属主交还不得放松权限位（令牌仍仅属主可读）"
+    );
+
+    let (mut stream, reader) = connect_authed(port, &token);
+    let mut lines = Lines::new(reader);
+    send(
+        &mut stream,
+        json!({"jsonrpc":"2.0","id":1,"method":"ping","params":null}),
+    );
+    assert_eq!(
+        lines.response(1)["result"]["pong"],
+        true,
+        "root 提权会话按 UI 侧路径（读 port-file → 握手）可用"
+    );
+    drop(lines);
+    drop(stream);
+
+    owner.kill().expect("kill owner stand-in");
+    owner.wait().expect("reap owner stand-in");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = daemon.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "属主消亡后 root daemon 必须在 10s 内自退"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "sudo/daemon 退出码应为 0：{status:?}");
+    assert!(!pf.exists(), "自退必须清理 port-file");
     daemon.kill_and_assert_stdout_empty();
 }

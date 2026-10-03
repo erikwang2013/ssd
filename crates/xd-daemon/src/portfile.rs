@@ -2,8 +2,11 @@
 //! port-file（提权会话的端口与令牌交接件）与令牌生成。
 //! 安全属性：unix 0600 + 同目录临时文件 rename 原子落盘（读者永远读不到半行）；
 //! 令牌 16 字节 CSPRNG → 32 位十六进制，比较见 transport.rs（常数时间）。
-//! Windows 分支的写路径与令牌生成已由 CI windows runner **实跑**（tcp_session 全链路，见
-//! docs/security §7「已验」）；未收紧的是 port-file ACL（NTFS 无 0600 语义，归 M2）。
+//! **属主**：提权（root）daemon 写 UI 的 port-file 时把属主交还目标目录属主（[`adopt_owner_of_dir`]）
+//! ——0600 的属主即读者，root:0600 普通用户读不到令牌、提权链断（T4 落地时发现的 T1 缺口；
+//! 目录由 UI 以 `createTempSync` 0700 自建，属主恒为 UI 用户）。Windows 分支的写路径与令牌生成
+//! 已由 CI windows runner **实跑**（tcp_session 全链路，见 docs/security §7「已验」）；
+//! 未收紧的是 port-file ACL（NTFS 无 0600 语义，归 M2）。
 
 use std::path::Path;
 
@@ -43,7 +46,39 @@ fn write_port_file_impl(path: &Path, content: &[u8]) -> std::io::Result<()> {
     f.write_all(content)?;
     f.flush()?;
     drop(f);
+    adopt_owner_of_dir(&tmp, path)?;
     std::fs::rename(&tmp, path)
+}
+
+/// 提权写入（root daemon 写 UI 指定的 port-file）时把属主交还**目标目录的属主**：
+/// 0600 的属主即读者，root:0600 的 F 普通用户读不到 ⇒ 提权会话拿不到令牌（T4 落地发现）。
+/// 目录由 UI 以 `createTempSync`（0700）自建，属主恒为 UI 用户；非 root 写入时创建者本就是
+/// 目录属主（或换属主失败不该拖垮会话）⇒ 只在 euid==root 且属主不同时才 chown。
+/// **残留风险**（docs/security §10 明示）：能控制 `--port-file` 路径指向他人目录者，可让 root
+/// daemon 把令牌交给该目录属主——根因是 pkexec 不校验参数（§3 已接受的同一缺口），M4 一并收紧。
+#[cfg(unix)]
+fn adopt_owner_of_dir(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::process::{Gid, Uid, geteuid};
+
+    if !geteuid().is_root() {
+        return Ok(());
+    }
+    let dir = match target.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let (file, dir) = (tmp.metadata()?, dir.metadata()?);
+    if file.uid() == dir.uid() {
+        return Ok(());
+    }
+    rustix::fs::chown(
+        tmp,
+        Some(Uid::from_raw(dir.uid())),
+        Some(Gid::from_raw(dir.gid())),
+    )
+    .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
 /// windows：直写。路径已由 CI windows runner 实跑（见模块头注）；**ACL 未收紧**——NTFS 无
