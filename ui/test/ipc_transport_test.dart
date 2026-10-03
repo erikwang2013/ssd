@@ -86,6 +86,9 @@ sleep 5
     );
     final daemon = File.fromUri(dir.uri.resolve('xd-daemon.exe'))..createSync();
     expect(packagedDaemonPath(executablePath: exe.path), daemon.path);
+    // 宿主名大小写不敏感（Windows）：XIAODUN.EXE 同样应找 xd-daemon.exe
+    final upper = File.fromUri(dir.uri.resolve('XIAODUN.EXE'))..createSync();
+    expect(packagedDaemonPath(executablePath: upper.path), daemon.path);
   });
 
   test('打包布局回退：macOS 形态（.app/Contents/MacOS，无 .exe 后缀）', () {

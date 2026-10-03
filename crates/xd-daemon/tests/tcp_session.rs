@@ -736,3 +736,43 @@ fn non_root_port_file_in_foreign_owned_dir_succeeds() {
     daemon.kill_and_assert_stdout_empty();
     let _ = std::fs::remove_file(&pf);
 }
+
+// 决定性钉子（qual-m1e-t5 建议，随 tcp_session.rs 其他 test 同文件）：
+// Lines 的「两序容忍」此前无任何确定性覆盖——提交套件按常识序（先 response 后
+// notification）调用，pending 只有在 daemon 侧通知抢跑（真竞态：scan_start 先
+// spawn worker 再序列化响应）时才被填充。本测试本地回环固定「通知先于响应」的
+// 线上序 + 反向调用序，确定性地走「失配寄存 → entry-check 消费」路径：
+// 杀 F1 复活（next() 回放 pending ⇒ 纯用户态活锁，读超时永不生效）与
+// entry-check 摘除（通知已在寄存，再读新行 ⇒ 对端关闭 ⇒ panic）。
+#[test]
+fn lines_helper_tolerates_notification_before_response() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // 线上序：通知先、响应后（与调用序相反）
+        writeln!(
+            s,
+            r#"{{"jsonrpc":"2.0","method":"scan.progress","params":{{"taskId":7}}}}"#
+        )
+        .unwrap();
+        writeln!(s, r#"{{"jsonrpc":"2.0","id":7,"result":{{"pong":true}}}}"#).unwrap();
+        s.flush().unwrap();
+        // 不立即关闭：挂在 drop 上让客户端先读完（读新行路径会撞 EOF，见上）
+        std::thread::sleep(Duration::from_millis(300));
+    });
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut lines = Lines::new(BufReader::new(stream));
+
+    // 调用序与线上序相反：首读即失配（通知）⇒ 寄存；响应随后到达。
+    let resp = lines.response(7);
+    assert_eq!(resp["result"]["pong"], true, "{resp}");
+    // 寄存在 pending 里的通知必须由 entry-check 谓词检索取回（不得再读线）。
+    let note = lines.notification("scan.progress");
+    assert_eq!(note["params"]["taskId"], 7, "{note}");
+    server.join().unwrap();
+}
