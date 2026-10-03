@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -201,6 +202,7 @@ fn reused_cluster_image_bytes() -> Vec<u8> {
 
 /// cancel 夹具：30 × 32KiB = 960KiB（240 簇，1MiB 卷内）——子进程启动 + 逐件 create/write
 /// 撑出可观窗口；cancel 紧随 start 发出。
+#[cfg(unix)]
 fn bulk_image_bytes() -> Vec<u8> {
     let mut b = xd_fixtures::ExfatImageBuilder::new();
     for i in 0..30u32 {
@@ -367,6 +369,9 @@ fn target_dir_missing_maps_to_minus_32007() {
 /// 4）cancel：紧随 start 发出 → 两态竞态容忍（同 scan_ipc 的 pause 先例）：运行中 → canceled +
 /// 终报 canceled==true（计数自洽）；恰已跑完 → 幂等 "completed" + 终报 canceled==false 全成功。
 /// 之后 ping 仍通 = 取消不卡死 jobs 锁/转发线程。
+/// 取消语义 = SIGTERM 子进程（unix 专属；非 unix 显式 `PlatformUnsupported`，运行时支持归
+/// M1e-tail）⇒ 本用例门控 unix。
+#[cfg(unix)]
 #[test]
 fn cancel_stops_export_two_state_tolerance() {
     let dir = tempfile::tempdir().unwrap();
@@ -497,6 +502,10 @@ fn dir_names(dir: &Path) -> Vec<String> {
 /// （子进程寿命与之同级），而全扫一次 ~3ms（本机实测，见 T9 报告）⇒ 采样粒度与寿命同量级，
 /// 观测纯靠运气：本机 release 单跑 5 次漏配 4 次（parent b93267a 同样红 = 前存缺陷，非 T9 回归）。
 /// 快路径单次 ~0.1ms ⇒ 同一寿命内可采数十次；CI（更慢）余量更大。
+///
+/// 观测量是 Linux 专属（/proc）；macOS/Windows 无等价无特权观测面 ⇒ 本组辅助与用它的 EPIPE
+/// 用例均 `#[cfg(target_os = "linux")]`（Windows 侧同裁决，见 T9 报告）。
+#[cfg(target_os = "linux")]
 fn find_export_worker(dpid: u32) -> Option<i32> {
     for t in std::fs::read_dir(format!("/proc/{dpid}/task"))
         .into_iter()
@@ -521,6 +530,7 @@ fn find_export_worker(dpid: u32) -> Option<i32> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn wait_export_worker(dpid: u32, timeout: Duration) -> Option<i32> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -535,6 +545,7 @@ fn wait_export_worker(dpid: u32, timeout: Duration) -> Option<i32> {
 }
 
 /// 子进程已退出证据：`/proc/<pid>` 消失（已收尸），或 state == 'Z'（已退出待收尸）。
+#[cfg(target_os = "linux")]
 fn worker_exited(pid: i32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Err(_) => true,
@@ -679,6 +690,8 @@ fn hostile_row_names_and_ext_cannot_escape_target_dir() {
 /// （run_inner 的 writeln 失败臂 `return Ok(())`），stderr 无 panic 留痕——子 stderr 继承 daemon
 /// 的 stderr（= 本测试管道），父死后仍可读全。
 /// 牙：EPIPE 臂改成 unwrap/panic → 子 panic 落 stderr → 红。
+/// 用例本体绑定 Linux（子在场观测走 /proc 子进程表，见 find_export_worker）；非 Linux 无可信观测面 ⇒ 门控。
+#[cfg(target_os = "linux")]
 #[test]
 fn epipe_worker_exits_silently_when_parent_dies() {
     let dir = tempfile::tempdir().unwrap();
