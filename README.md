@@ -35,6 +35,9 @@
 
 - **删除文件恢复**（快速扫描）：文件名、目录结构、时间戳完整找回，附恢复质量分级（完整 / 可能损坏 / 仅雕刻）
 - **深度扫描**（文件雕刻）：元数据已丢失也能按文件签名找回，照片、视频、文档按类型归类
+- **三页图形界面（M1d）**：扫描（模式/进度/暂停取消）→ 结果（分页/过滤/质量徽标/多选）→ 预览
+  （图片/文本/信息卡，分片读取不整体加载）→ 恢复导出（选目录、实时进度、可取消、终报三计数 +
+  逐件清单）；导出走**独立降权子进程**，目标盘三重校验（异设备 / 已存在 / 余量），永不写回源设备
 - **APFS 快照恢复**（macOS）：从快照直接读取历史版本，成功率最高
 - **iOS 备份解析**：从 iTunes / Finder 本地备份中找回残留记录
 - **Android root 块设备恢复**
@@ -159,9 +162,10 @@ echo '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' | ./target/debug/x
 ```bash
 cargo test --workspace        # Rust：契约 golden + 处理器 + 集成（含真实二进制黑盒）
 bash scripts/e2e.sh           # 端到端冒烟：构建 → 生成镜像 → 发请求 → 断言
+bash scripts/e2e-loop.sh      # 真块设备端到端（环回+挂载，需免密 sudo；无则自动跳过）
 
 cd ui && flutter test         # UI：协议 golden + widget 测试
-cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真实 daemon 握手用例
+cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真 daemon 全链路（扫描→预览→导出逐字节）
 ```
 
 ## 路线图
@@ -188,8 +192,13 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真实 d
   `mode:"deep"` 深扫端到端（契约 v1.1：`quality:"carved"`/`byteOffset`）+ **断点续跑**（检查点配对写、
   杀进程重启无损续扫）+ 恢复率门禁（合成镜像 100%/0 假阳性进 CI）+ 两项量化（JPEG 预读 20046→2 次读、
   落库 139→>8000 条/秒）
+- **M1d**（本次合入）：UI 三页 + 导出——扫描/结果/预览/恢复四页接真 daemon（协议 v1.2：`fs.read`
+  分片预览、`export.start/cancel/progress/finished` 事件流与五枚错误码）；导出为**降权子进程**
+  （三重目标校验、逐字节精确、分片流式、逐件降级/失败报告、实取消）；全链路集成测试
+  （Rust 夹具镜像 → 真 daemon → 扫描 → 预览回读 → 导出 → 报告逐字节）进 CI，e2e-loop 增
+  「环回挂载点导出断言 `-32006` + 普通目录导出逐字节比对」真集成段
 
-M1 剩余切片：扫描/预览/恢复三页 UI 与导出、Windows/macOS 平台层与打包。
+M1 剩余切片：Windows/macOS 平台层与打包。
 目标：全端 1.0 约 9-12 个月（5-6 人团队，4 条工作流并行）。
 
 ---

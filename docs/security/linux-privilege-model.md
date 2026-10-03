@@ -157,7 +157,16 @@ reap 完成～state 落定之间的 µs 级窗内该 pid 已被回收，理论�
 （非 root 时内核按 uid 拒绝，无害；root 时本有 CAP_KILL，属误伤不属提权）。闭合归 M4（`pidfd`
 或子句柄 + `try_wait` 收口）。
 
+**T9 落地后的验证面（M1d 出口）**：`scripts/e2e-loop.sh` 的真环回段已扩到导出——
+环回只读设备**挂载**后导出到挂载点断言 `-32006`（同盘判定的真块设备臂），umount 后导出到
+普通目录并**逐字节**比对埋点原字节（含 `export.finished` 抢跑两序容忍）；CI 的 flutter job
+跑真 daemon 全链路集成测试（扫描/分片预览/导出/报告逐字节，`XD_DAEMON_BIN` 守卫）。
+以上均由非 root 用户身份执行（CI 免密 sudo 建环回，daemon 以 root 起、无 `PKEXEC_UID`
+⇒ 按设计**不降权**，stderr 留痕）——即：**覆盖面止于「流程与校验」，降权臂本身仍待真机**。
+
 **未验证（需真机 root/pkexec）**——本机非 root，集成/单测只覆盖纯决策函数（`drop_plan`）：
 - [ ] 真机 pkexec 拉起后导出：落盘文件属主 == `PKEXEC_UID` 用户（进程未降权时会是 root）。
 - [ ] `setgroups(0)` 生效（`/proc/<pid>/status` 的 `Groups` 为空，无残留附加组）。
 - [ ] `/etc/passwd` 无该 uid 时只降 uid 的警告路径（组属主保留 root，stderr 有留痕）。
+- [ ] 真 GTK 目录选择弹窗、真桌面文件管理器「打开目标文件夹」（CI 无桌面，按计划不引入
+      真 `xdg-open` 进程断言）——归 M1 出口手测。

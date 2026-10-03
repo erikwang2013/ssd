@@ -173,6 +173,22 @@ UI 选设备
 → 恢复报告（成功/降级/失败清单）。「先镜像后恢复」为专业版预留，但
 `xd-device` 从第一天按「可同时读源 + 写镜像流」设计接口。
 
+**实现注记（M1d，契约 v1.2）**：
+
+- **执行体**：导出由 daemon `spawn 自身 --export-worker` 的**独立子进程**完成（父只转发
+  子 stdout 的 JSON 事件行），root 且 `PKEXEC_UID` 存在时降权到调用者；模型与威胁面见
+  `docs/security/linux-privilege-model.md` §6。
+- **校验**：目标目录三重（存在 / 异设备 / 余量）——`-32006`（点在源设备上）/`-32007`/`-32010`；
+  同盘判定两道（`st_dev` 与源 `st_rdev` 相等 + sysfs 盘级祖先），sysfs 不可用时 fail-open 留痕。
+  读取侧 `fs.read` 分片、上限 64MiB（`-32009`，先于设备解析拒绝）；条目不存在 `-32008`。
+- **写盘**：4MiB 分块流式（无整文件物化）；落盘名过净化（`..`/分隔符/控制字符）后重名去重，
+  雕刻件 `carved_{idx:06}.{ext}`；条目标记删除且簇被复用 ⇒ 短交付计 degraded 并保留半成品，
+  失败件清残骸。
+- **事件**：`export.progress`（done/total/writtenBytes）+ `export.finished`（succeeded/
+  degraded/failed/canceled/targetDir/items——**成功件不进 items**）；响应可**后于** finished
+  通知到达（T3 底盘竞序），UI 侧在途寄存回放保证终报不丢。
+- **报告**：UI 三计数 + 逐件清单（落盘名一律取 `items[].name`）；`itemsTruncated` 提示。
+
 ### 4.6 性能底线
 
 - 扫描吞吐 ≥ 磁盘顺序读性能的 70%。
