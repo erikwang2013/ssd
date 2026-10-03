@@ -312,3 +312,119 @@ stderr 留痕（§6 语义），macOS 只剩精快路径。
 - [ ] root + 完全磁盘访问（FDA/TCC）下的真机打开/读取/扫描；FDA 缺失时 EPERM 与提示文案。
 - [ ] 真机枚举盘号/容量正确性（外接 USB 盘、Apple Fabric 命名差异）；`rdisk` 性能与权限评估。
 - [ ] 未签名包 + FDA 授权的 Gatekeeper 交互（归 Task 5/M2）。
+
+## 10. 提权会话生命周期与三平台命令构造（M1e-tail T4）
+
+**实现**：`ui/lib/core_client/elevation.dart`（命令构造纯函数 + 启动器 + 会话连接器）、
+`ui/lib/features/scan/scan_controller.dart`（-32001 → 提权引导 → 换 client → 重试）、
+`crates/xd-daemon/src/transport.rs::spawn_session_watchdog`（daemon 侧生命周期）、
+`crates/xd-daemon/src/portfile.rs::adopt_owner_of_dir`（属主交还）。
+
+### 10.1 三平台命令构造（逐字形态）
+
+三者同一形态 `--listen 127.0.0.1:0 --port-file <F> --owner-pid <P>`：**字面 IP**（`localhost`
+解析可能得 `::1` 或失败），端口 `0` 由内核选、实际端口写进 F（§7）。**命令面不含
+`--device`/`--image`**：提权 daemon 只靠启动枚举列设备（T4 同时补上 Windows/macOS 的
+`list_only` 与 `unix:`/`win:` opener 臂——§8/§9 登记的接线缺口）。理由：pkexec **不校验**
+argv（§3），能少一个「任意文件路径」参数就少一个攻击面。
+
+| 平台 | 命令 | 引用层次 |
+|------|------|----------|
+| Windows | `powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64 UTF-16LE>`；脚本 `Start-Process -Verb RunAs -WindowStyle Hidden -FilePath '<daemon>' -ArgumentList '<args>'` | ① 脚本正文只出现在 `-EncodedCommand`（base64，无 shell 解析）；② `-FilePath`/`-ArgumentList` 用 PowerShell 单引号字面量（唯一转义 = `''`）；③ daemon 参数串内部再经 Win32 `CreateProcess` 引用（含空格/制表/引号才加引号，反斜杠仅在引号前与结尾加倍） |
+| macOS | `osascript -e 'do shell script "<shell>" with administrator privileges'` | ① AppleScript 双引号字面量（`\\`/`\"`）；② shell 串经 POSIX 单引号（`'\''`）——`$`/反引号/分号在单引号内全字面化 |
+| Linux | `pkexec <daemon> --listen 127.0.0.1:0 --port-file <F> --owner-pid <P>` | argv 直给（`Process.start` 不经 shell），无引用问题 |
+
+**`-ArgumentList` 必须是单串**：PowerShell 传数组会按空格拼串（含空格路径被拆断），单串形式
+才是逐字透传——KAT 钉在 `ui/test/elevation_test.dart`。**注入用例**（8 组：空格、`"`、`'`、
+`$()`、反引号、`;|&>`、Windows 反斜杠尾）逐个还原断言；macOS 侧额外把 shell 串在 `/bin/sh` 上
+**真跑**一遍，断言参数逐字到达且 `$(touch /tmp/pwned)`/反引号**未被求值**。
+
+### 10.2 UI 侧生命周期（谁建、谁等、谁清）
+
+1. 扫描页 -32001 → 对话框「需要管理员权限访问该设备」→ [授权后重试]；
+2. UI 自建 **0700 会话目录**（`Directory.systemTemp.createTempSync('xiaodun-elev-')`，属主恒为
+   UI 用户）→ port-file 路径 `<dir>/session.port` → 构造平台计划（`--owner-pid` = UI 进程 pid）；
+3. 起提权进程与轮询**并行**：`connectElevatedSession` 轮询 port-file（≤30s、500ms——用户可能
+   在认证框上久置），读到就连接 + `ping` 握手探针；
+4. 成功后：换 `_client`（新 `SocketCoreClient` 提权会话）、关旧 client、清旧会话目录、重试
+   `scanStart`；失败 ⇒ 文案**「未获得授权（原因）」**+ 可重试（不静默、不悬挂）；macOS 上
+   **已提权仍 -32001** ⇒ 「已提权但仍缺完全磁盘访问（系统设置 > 隐私与安全性）」（osascript
+   提权 ≠ FDA，§9）。提权期间页面显示「等待授权…」并禁交互（`starting` 即 busy）。
+
+**两种半行形态都重试**（§7 的原子写只在 unix；Windows port-file 是直写）：读到 1 段（
+`FormatException`）与读到 2 段但 token 被截断（握手 -32001）都必须当作「未就绪」等下一拍；
+提权器非零退出/启动失败 ⇒ **快速**拒绝（用户取消授权不必白等 30s）。退出码只作提示：
+Windows `Start-Process` 在 UAC 结果之外立即返回 0，授权与否最终由「port-file 按时出现 +
+握手成功」判定。
+
+### 10.3 daemon 侧生命周期（`--owner-pid` 属主监督 + 空转自退）
+
+UAC/osascript 提权后父进程拿不到子进程句柄（这正是 TCP 会话存在的理由），pid 是唯一可传递
+的存活凭据。daemon 起 500ms tick 监督线程，两条规则（均在 `exit_cleaning` 里**清 port-file 后
+`exit 0`**，stdout 保持为空）：
+
+- **属主监督**：`--owner-pid` 给的进程消亡 ⇒ 退出（UI 崩溃/被杀不留 root 孤儿）；
+  探针 unix 用 `kill(pid, 0)`（`EPERM` = 存在但跨用户 ⇒ **视为存活**，失败方向选「宁可自退不
+  留孤儿」）；Windows 用 `OpenProcess(SYNCHRONIZE)` + 零超时 `WaitForSingleObject`
+  （`ERROR_ACCESS_DENIED` = 存在）。**未验证（需真机 UAC 链）**。
+- **空转自退**：出现过已认证连接、随后全部断开并持续 3s ⇒ 退出。同一 UI 多轮提权时，被替换的
+  旧会话在客户端关闭后自清，root daemon **不累积**；启动窗口（从未连接）不触发——那由属主
+  监督兜底（UI 崩在授权框上时 daemon 尚未被连过）。
+
+`--owner-pid` 与 `--listen`/`--port-file` 的配对是硬校验：`--owner-pid` 不带会话参数 ⇒ exit 2
+（不静默退 stdio）；只给 `--listen`/`--port-file` 之一 ⇒ exit 2。
+
+### 10.4 port-file 属主交还与残留风险（T4 落地时发现的 T1 缺口）
+
+0600 的语义是「**属主**可读」：root daemon 写的 port-file 属主 = root ⇒ UI 用户读不到令牌，
+**整条提权链在此断掉**（提权成功、会话建不起来）。修法：daemon 写 port-file 时若自身 euid 为
+root，把临时文件的属主/属组改成**目标目录的属主/属组**（`adopt_owner_of_dir`，紧接在原子
+`rename` 前）；UI 侧对应地用自己 0700 的临时目录，故交还后读者恒为 UI 用户。非提权写入
+（属主 == 目录属主）不改属主，行为与 §7 一致（测试
+`port_file_is_0600_and_leaves_no_temp_file` 断言这一点）。
+
+**残留风险（M1 接受，M2 收紧）**：
+
+- **规则而非校验**：「交给目录属主」意味着若调用方给的 port-file **父目录属主不是自己**
+  （比如共享 `/tmp` 下他人预设的目录），令牌会落到那个用户手里。M1 的调用方只有本项目 UI
+  （`createTempSync` 随机名 + `create_new`），风险面 = 同机其他用户**预先**用可预测路径诱导；
+  M2 改为 fd 传递或校验调用者 uid，去掉「按目录属主推断」这一环。
+- **交还只改属主不改目录权限**：目录权限由 UI 保证（0700）。UI 目录若被替换/软链，交还目标随之
+  变化——同样归 M2 的 fd 传递方案。
+
+### 10.5 已知限制（M1 明示接受）
+
+- **pid 复用窗口**：属主死后 pid 被系统复用给新进程 ⇒ 该轮 daemon 延迟自退（最长到空转自退/
+  进程退出）。窗口 = pid 复用延迟，无提权增益（新进程只是被误认为属主）；M2 以句柄/`SO_PEERCRED`
+  式校验替换 pid 探针。
+- **换会话瞬间双 daemon**：替换旧客户端到旧 daemon 空转自退（≤3s+1 tick）之间，机器上短暂有
+  两个 root daemon（各绑随机回环端口、各自 0600 令牌文件）；无跨会话能力提升。
+- **Windows port-file ACL 未收紧**（同 §7）：NTFS 无 0600 语义 ⇒ 属主交还在 Windows 是 no-op。
+- **UI 崩溃但会话仍活**：属主监督在 500ms tick 内收口，其间提权 daemon 仍监听回环（令牌文件
+  仍在 UI 的 0700 目录里，异用户读不到）。
+
+### 10.6 已验 / 未验证（需真机）
+
+**已验（本地门禁 + 假 daemon/假启动器实跑；CI 由 lead 预跑）**：
+
+- 命令构造：三平台 KAT + 8 组注入用例（macOS 侧在 `/bin/sh` 上真跑 argv）；`-EncodedCommand`
+  编解码往返。
+- 会话建立：真 socket + 假 daemon 全跑——成功、两种半行形态重试、超时收口（<2s）、取消快速
+  拒绝（<3s）、`spawnElevation` 真起进程返回退出码。
+- 扫描页：三平台 widget 流（走通换 client 并重试 `scanStart`、取消文案、macOS FDA 栏）。
+- daemon 生命周期（非 root 可跑）：属主消亡 ⇒ 自退 + 清 port-file（`daemon_exits_and_cleans_
+  port_file_when_owner_dies`）、末连接断开 ⇒ 空转自退（`daemon_exits_after_last_authenticated_
+  connection_drops`）、`--owner-pid` 单独给出被拒（`owner_pid_without_tcp_session_is_rejected`）。
+- **root 路径**（port-file 属主交还：root daemon 写 UI 目录、断言属主/0600/可读/自退/清理）：
+  测试 `root_daemon_hands_port_file_back_to_owner_user` 需免密 `sudo`，**本机无免密 sudo ⇒ 本地
+  跳过（eprintln 标注）**，由 CI runner（`sudo -n` 可用）实跑。
+
+**未验证（需真机）**：
+
+- [ ] 真 UAC 对话框 → 提权 daemon 起来的端到端（CI runner 无桌面/无交互会话）。
+- [ ] 真 osascript 授权框 + 真 FDA（TCC）交互：授权后仍 EPERM 的文案路径只在 widget 层验过。
+- [ ] pkexec + 已安装 polkit policy 的真实授权（本机 polkit/session D-Bus 缺位，§1 同款限制）。
+- [ ] Windows port-file 可读性 ACL 与 `process_alive` 的 `OpenProcess` 语义（真机 `icacls`）。
+- [ ] 真机 pid 复用窗口与双 daemon 并存窗口的可见性（需构造属主瞬时被杀）。
+- [ ] **UI 侧入口缺口（T4 已记录，未修）**：Windows 非提权时枚举为空 ⇒ 首页无设备 ⇒ 用户走
+      不到扫描页的 -32001 引导。M2 需在首页给提权入口（或非提权枚举面，§8）。
