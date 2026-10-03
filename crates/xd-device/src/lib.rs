@@ -90,7 +90,7 @@ pub(crate) fn read_at_fill(
     let mut done = 0usize;
     while done < buf.len() {
         match file.read_at(&mut buf[done..], offset + done as u64) {
-            Ok(0) => return Ok(done),
+            Ok(0) => break,
             Ok(n) => done += n,
             Err(e) => return Err(DeviceError::Io(e)),
         }
