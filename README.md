@@ -201,7 +201,9 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真 daem
 **已知限制（M1e 平台层）**：Windows 目标盘同源校验（-32006）M1 不做——Windows 无 `st_rdev`，
 `source_rdev` 恒 `None`（M2 补，卷句柄盘号比较）；Windows 物理盘枚举/只读打开**未验证（需真机）**
 （CI 只证枚举/读冒烟，且枚举需管理员权限）。macOS `/dev/diskN` 枚举/只读打开同样**未验证（需真机）**
-（非 root/无完全磁盘访问时枚举仅列盘、容量记 0）；两平台 transport/removable 提示字段与提权
+（非 root/无完全磁盘访问时枚举仅列盘、容量记 0）；macOS 的 -32006 亦实质未封——挂载卷
+`st_dev` 是分区 `dev_t`、源侧 `st_rdev` 是整盘 `dev_t`，且无 `/sys` 祖先链兜底（M2 以 IOKit 补，
+与 Windows 缺口同级）。两平台 transport/removable 提示字段与提权
 daemon 枚举接线归 T4/M2。细节见 `docs/security/linux-privilege-model.md` §8/§9。
 
 M1 剩余切片：Windows/macOS 平台层与打包。

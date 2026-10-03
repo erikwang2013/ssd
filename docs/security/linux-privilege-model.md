@@ -276,7 +276,7 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
 `pread` 循环补齐（同 Linux 口径）。daemon 侧 `--device /dev/diskN` 走同源打开（信任边界校验：
 仅整盘形态，分区/裸盘/任意路径拒绝）；FDA 缺失（EPERM）/非 operator 组（EACCES）→
 `ErrorKind::PermissionDenied`，daemon 打印「需在系统设置授权完全磁盘访问」提示。
-`source_rdev` 复用 `xd_device::source_rdev_of`（unix 共用，`linux.rs` 同函数）。
+`source_rdev` 复用 `crate::source_rdev_of`（`pub(crate)`，unix 共用，`linux.rs` 同函数）。
 
 **同盘校验（-32006）在 macOS 的语义**：精快路径 `st_dev(目标) == st_rdev(源)` 是**同式解码下的
 相等比较**——`xd-core::export` 的目标侧解码同为 glibc 式（其 `major_minor` 本地副本，跨 unix
@@ -285,9 +285,9 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
 见 `xd-device/src/lib.rs`）。盘级祖先第二道走 sysfs，macOS 无 `/sys` ⇒ 恒不可用 → fail-open +
 stderr 留痕（§6 语义），macOS 只剩精快路径。
 
-**已验（CI 实跑）**：`rust (macos-latest)` 实跑 `tests/macos_smoke.rs`（枚举 ≥1 **硬断言**；
+**已验（CI 实跑）**：`rust (macos-latest)` 实跑 `tests/macos_smoke.rs` 2/2（枚举 ≥1 **硬断言**；
 打开/读 512B **弱断言**——PermissionDenied 接受并 stderr 标注）与 `macos::tests` 纯函数单测
-（run id 随归档补引，照 §8 先例）。
+6/6 通过——CI run `37115788074`（HEAD `6304f92`）5/5 job 绿。
 
 **已知限制（M1 明示接受）**：
 
@@ -295,10 +295,15 @@ stderr 留痕（§6 语义），macOS 只剩精快路径。
   （普通用户 EACCES；现代 macOS 上 root 无 FDA 亦 EPERM）⇒ 普通用户上下文枚举出的盘
   `size_bytes=0`（该盘仍列入 + stderr 留痕——跳盘会让普通用户 `device.list` 全空；容量**成功
   读到 0** 的盘仍跳过）。macOS daemon 由 osascript 提权拉起（Task 4）⇒ 真机路径容量恒可查。
+- **-32006「源=整盘 / 目标=其分区」盲区在 macOS 实质未封（与 Windows 缺口同级；T6 总表将列）**：
+  精快路径 `st_dev(目标) == st_rdev(源)` 两侧对象不同——挂载卷的 `st_dev` 是其**分区** `dev_t`
+  （如 `disk0s2`），源侧 `st_rdev` 是**整盘** `dev_t`（`disk0`）⇒ 导出到源盘自己的分区**不会被拦**；
+  且 macOS 无 `/sys` ⇒ 盘级祖先第二道恒不可用（见上），无兜底。M1 明示接受，M2 以 IOKit
+  盘/分区归属补。
 - **transport 恒 None / removable 恒 false**：M1 不引 IOKit（计划裁定：`diskutil info -plist`
   子进程太慢），UI 分组提示在 macOS 暂缺；M2 用 IOKit 补（含 `kIOMediaRemovable`）。
 - **枚举接线缺口（与 Windows 同一枚，T4 统一修）**：daemon 的 macOS `list_only` 恒空 +
-  `DeviceOpener` 恒 `Noopener`（`main.rs` 本任务仅接 `--device` 臂）⇒ 提权 daemon 若只传
+  `DeviceOpener` 恒 `NoopOpener`（`main.rs` 本任务仅接 `--device` 臂）⇒ 提权 daemon 若只传
   `--listen/--port-file` 则列零设备、扫描走不通。T4 必须一并接线（枚举 → `list_only`；`unix:`
   id 的 opener 臂按平台分派；`image:` 拒绝语义保持）。
 
