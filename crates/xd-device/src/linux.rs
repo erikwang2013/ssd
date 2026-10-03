@@ -14,7 +14,7 @@
 
 use crate::{BlockDevice, DeviceError, DeviceInfo, DeviceKind};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileExt, FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 
 mod enumerate;
@@ -112,16 +112,7 @@ impl BlockDevice for LinuxBlockDevice {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        // lib.rs 契约：读取直到填满 buf 或到达 EOF；块设备短读常见，需循环补齐。
-        let mut done = 0usize;
-        while done < buf.len() {
-            match self.file.read_at(&mut buf[done..], offset + done as u64) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) => return Err(DeviceError::Io(e)),
-            }
-        }
-        Ok(done)
+        crate::read_at_fill(&self.file, offset, buf)
     }
 
     /// 覆写：fstat **已打开的 fd**（不重开路径、无写路径——只读铁律不破），取 `st_rdev`。

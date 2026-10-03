@@ -4,7 +4,8 @@
 //! 协议与威胁模型见 transport.rs 头注与 docs/security）。
 //! 提权归 M4；M1e 起 Linux 支持 --device 注册物理块设备 + 启动时 sysfs 枚举供 device.list
 //! （Windows 侧 --device 支持 `\\.\PhysicalDriveN`、macOS 侧支持 `/dev/diskN` 整盘只读打开，
-//! 真机语义均未验证，见 docs/security §8/§9），
+//! 真机语义均未验证，见 docs/security §8/§9）；Windows/macOS 的启动枚举与懒打开 opener
+//! 同源接通（T4：提权 daemon 只传会话参数即可列设备/扫描，见 [`DaemonOpener`]），
 //! 并在 root（pkexec 兜底）路径做 --image 参数纵深防御（privcheck，见 docs/security/linux-privilege-model.md）。
 //! M1b：扫描 worker 线程与主循环经唯一写口（`transport::write_line`）串行化；`--db` 指定任务库
 //! （缺省 XDG state 路径，打开失败降级内存库并 warn）。
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use xd_core::api::PROTOCOL_VERSION;
 use xd_core::export::ExportManager;
 use xd_core::handlers::CoreCtx;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use xd_core::scan_task::OpenError;
 use xd_core::scan_task::{DeviceOpener, NotifyFn, ScanCanceled, ScanManager};
 use xd_core::store::Store;
@@ -42,6 +43,51 @@ fn default_db_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".local/state/xiaodun/tasks.db"))
 }
 
+/// 启动枚举（`device.list` 的物理盘来源；零注册设备时的唯一 listing 面）。逐平台，失败不阻塞
+/// daemon 启动但留痕（UI 侧收集 stderr 可诊断）：
+/// - Linux：sysfs 枚举，零 `open()`；
+/// - Windows：SetupAPI 枚举**每盘一次只读 open**（盘号/容量只能经句柄查询）⇒ 物理盘读取需管理员
+///   权限，**非提权上下文列表为空**（UX 如实：提权由 UAC 引导拉起 TCP 会话，Task 4）；
+/// - macOS：`/dev/diskN` 枚举，无权限的盘仍列入、容量记 0（不跳盘——跳盘会让普通用户列表全空）。
+fn enumerate_startup_list() -> Vec<xd_device::DeviceInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        match xd_device::linux::BlockEnumerator::new().list() {
+            Ok(disks) => disks.iter().map(|d| d.device_info()).collect(),
+            Err(e) => {
+                eprintln!("warn: 物理磁盘枚举失败（listing 可能不完整）: {e}");
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match xd_device::windows::enumerate() {
+            Ok(disks) => disks.into_iter().map(|d| d.info).collect(),
+            Err(e) => {
+                eprintln!(
+                    "warn: 物理磁盘枚举失败（listing 可能不完整；物理盘枚举需管理员权限，非提权上下文列表为空）: {e}"
+                );
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        match xd_device::macos::enumerate() {
+            Ok(disks) => disks.into_iter().map(|d| d.info).collect(),
+            Err(e) => {
+                eprintln!("warn: 物理磁盘枚举失败（listing 可能不完整）: {e}");
+                Vec::new()
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // 导出子进程模式（父 daemon `spawn 自身 --export-worker …` 拉起）：首参即分派，
@@ -60,6 +106,8 @@ fn main() {
     let mut db_path: Option<PathBuf> = None;
     let mut listen: Option<std::net::SocketAddr> = None;
     let mut port_file: Option<PathBuf> = None;
+    // 提权会话的属主（UI）pid：消亡 ⇒ daemon 自退 + 清 port-file（transport::spawn_session_watchdog）。
+    let mut owner_pid: Option<u32> = None;
     // 提权兜底路径（pkexec 以 root 拉起）的准入判定，见 docs/security/linux-privilege-model.md。一次 /proc 读。
     #[cfg(target_os = "linux")]
     let euid = privcheck::effective_uid();
@@ -134,7 +182,7 @@ fn main() {
                 }
                 // macOS：只读整盘句柄（id `unix:/dev/diskN`；FDA 缺失 → EPERM/EACCES ⇒ 提示
                 // 完全磁盘访问；未验证=需真机，见 docs/security §9）。打开/形态校验同源，
-                // 见 xd-device/src/macos.rs。枚举接线（list_only/opener）归 T4。
+                // 见 xd-device/src/macos.rs；枚举与 opener 接线见 enumerate_startup_list/DaemonOpener。
                 #[cfg(target_os = "macos")]
                 match xd_device::macos::MacosBlockDevice::open(&PathBuf::from(&path)) {
                     Ok(dev) => devices.push(Arc::new(dev)),
@@ -188,6 +236,19 @@ fn main() {
                 };
                 port_file = Some(PathBuf::from(path));
             }
+            "--owner-pid" => {
+                let Some(raw) = args.next() else {
+                    eprintln!("error: --owner-pid requires a pid");
+                    std::process::exit(2);
+                };
+                match raw.parse::<u32>() {
+                    Ok(pid) if pid > 0 => owner_pid = Some(pid),
+                    _ => {
+                        eprintln!("error: --owner-pid 需为正整数 pid: {raw}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             other => {
                 eprintln!("error: unknown argument {other}");
                 std::process::exit(2);
@@ -197,26 +258,24 @@ fn main() {
 
     // `--listen`/`--port-file` 成对出现才进 TCP 模式；只给其一 = 参数错误（不静默退 stdio）。
     let tcp = match (listen, port_file) {
-        (Some(addr), Some(port_file)) => Some(transport::TcpOptions { addr, port_file }),
+        (Some(addr), Some(port_file)) => Some(transport::TcpOptions {
+            addr,
+            port_file,
+            owner_pid,
+        }),
         (None, None) => None,
         _ => {
             eprintln!("error: --listen 与 --port-file 须成对出现");
             std::process::exit(2);
         }
     };
+    // 属主监督只在提权会话（TCP）模式下有意义：单独给出 = 参数错误（不静默忽略）。
+    if owner_pid.is_some() && tcp.is_none() {
+        eprintln!("error: --owner-pid 仅在 --listen/--port-file 提权会话模式下有效");
+        std::process::exit(2);
+    }
 
-    // 启动枚举（Linux，零 open()）：失败不阻塞 daemon 启动，但留痕（UI 侧收集 stderr 可诊断）。
-    #[cfg(target_os = "linux")]
-    let list_only: Vec<xd_device::DeviceInfo> =
-        match xd_device::linux::BlockEnumerator::new().list() {
-            Ok(disks) => disks.iter().map(|d| d.device_info()).collect(),
-            Err(e) => {
-                eprintln!("warn: 物理磁盘枚举失败（listing 可能不完整）: {e}");
-                Vec::new()
-            }
-        };
-    #[cfg(not(target_os = "linux"))]
-    let list_only: Vec<xd_device::DeviceInfo> = Vec::new();
+    let list_only = enumerate_startup_list();
 
     // 装在 spawn 任何 worker 之前：取消用 unwind 标记作控制流，静默其对 stderr 的默认输出；
     // 真 panic 照常打印。
@@ -268,9 +327,9 @@ fn main() {
     // 导出管理器与扫描共享同一 store（父侧校验读同库）；子进程经 --db 只读打开同一文件。
     let exports = Arc::new(ExportManager::new(mgr.store_arc(), notify, export_db));
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let opener: Arc<dyn DeviceOpener> = Arc::new(DaemonOpener);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let opener: Arc<dyn DeviceOpener> = Arc::new(xd_core::scan_task::NoopOpener);
 
     let ctx = Arc::new(
@@ -296,10 +355,12 @@ fn main() {
 
 /// 懒打开物理设备（device.list 零 open 铁律的唯一出口）。`image:` 一律拒绝——镜像只能经
 /// 启动参数 `--image` 注册（root 走 privcheck 准入）；否则提权 daemon 会沦为任意路径读取器。
-#[cfg(target_os = "linux")]
+/// id 方案按平台分派：`win:\\.\PhysicalDriveN`（Windows）/ `unix:<节点>`（Linux 块设备节点、
+/// macOS 整盘 `/dev/diskN`）——枚举（[`enumerate_startup_list`]）与打开同源同 id。
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct DaemonOpener;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl DeviceOpener for DaemonOpener {
     fn open(&self, id: &str) -> Result<Arc<dyn BlockDevice>, OpenError> {
         if id.starts_with("image:") {
@@ -307,19 +368,51 @@ impl DeviceOpener for DaemonOpener {
                 "images must be registered via --image at startup".into(),
             ));
         }
-        let Some(path) = id.strip_prefix("unix:") else {
-            return Err(OpenError::Other(format!("unknown device id scheme: {id}")));
-        };
-        match xd_device::linux::LinuxBlockDevice::open(&PathBuf::from(path)) {
-            Ok(d) => Ok(Arc::new(d)),
-            Err(xd_device::DeviceError::Io(e))
-                if e.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                Err(OpenError::PermissionDenied)
+        #[cfg(target_os = "windows")]
+        {
+            let Some(path) = id.strip_prefix("win:") else {
+                return Err(OpenError::Other(format!("unknown device id scheme: {id}")));
+            };
+            match xd_device::windows::WindowsBlockDevice::open(path) {
+                Ok(d) => Ok(Arc::new(d)),
+                Err(xd_device::DeviceError::Io(e))
+                    if e.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    Err(OpenError::PermissionDenied)
+                }
+                Err(e) => {
+                    eprintln!("warn: 打开设备 {id} 失败: {e}");
+                    Err(OpenError::Other(e.to_string()))
+                }
             }
-            Err(e) => {
-                eprintln!("warn: 打开设备 {id} 失败: {e}");
-                Err(OpenError::Other(e.to_string()))
+        }
+        #[cfg(unix)]
+        {
+            let Some(path) = id.strip_prefix("unix:") else {
+                return Err(OpenError::Other(format!("unknown device id scheme: {id}")));
+            };
+            let path = PathBuf::from(path);
+            // 平台分派（T3 移交）：macOS 的 EPERM→PermissionDenied + FDA 提示只在该臂可达。
+            #[cfg(target_os = "linux")]
+            let opened = xd_device::linux::LinuxBlockDevice::open(&path);
+            #[cfg(target_os = "macos")]
+            let opened = xd_device::macos::MacosBlockDevice::open(&path);
+            match opened {
+                Ok(d) => Ok(Arc::new(d)),
+                Err(xd_device::DeviceError::Io(e))
+                    if e.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    // osascript 提权 ≠ FDA（T3 移交）：root 后仍可能 EPERM——提示这一格。
+                    #[cfg(target_os = "macos")]
+                    eprintln!(
+                        "hint: 已提权但仍无权限——需在系统设置授权完全磁盘访问（系统设置 > 隐私与安全性 > 完全磁盘访问）"
+                    );
+                    Err(OpenError::PermissionDenied)
+                }
+                Err(e) => {
+                    eprintln!("warn: 打开设备 {id} 失败: {e}");
+                    Err(OpenError::Other(e.to_string()))
+                }
             }
         }
     }

@@ -3,7 +3,9 @@
 //! 1) 握手（ping/device.list）+ 错误令牌 -32001 即断（含「首行非 auth」形态）；
 //! 2) port-file 0600 + 无临时文件残留（unix）；
 //! 3) 通知到达**同连接**（scan.start → scan.finished）；
-//! 4) 通知广播全部已认证连接 + 断连剔除后广播不受影响（transport.rs 头注的 M1 简化钉子）。
+//! 4) 通知广播全部已认证连接 + 断连剔除后广播不受影响（transport.rs 头注的 M1 简化钉子）；
+//! 5) 会话生命周期（T4）：属主消亡自退、连接全断后空转自退、`--owner-pid` 成对约束
+//!    ——三者都必须清 port-file，避免 root daemon 无主滞留/多轮提权累积（docs/security §10）。
 //!
 //! stdout 仅协议：TCP 模式全程断言 stdout 为空（诊断全 stderr）。
 
@@ -324,6 +326,108 @@ fn tcp_scan_notifications_reach_client() {
     assert_eq!(fin["params"]["foundCount"], 3);
 
     daemon.kill_and_assert_stdout_empty();
+}
+
+// ---- 会话生命周期（T4）：回环 TCP 全链路可验，不需要真提权 ----
+
+/// 属主（`--owner-pid`）消亡 ⇒ daemon 自退（退出码 0）并清理 port-file。
+/// 属主用**另一个 daemon 进程**扮演（stdin 管道保持打开即存活；kill = 模拟 UI 退出）——
+/// 跨平台同款，不引平台专有 sleep/dummy 进程。
+#[test]
+fn daemon_exits_and_cleans_port_file_when_owner_dies() {
+    let dir = tempfile::tempdir().unwrap();
+    let pf = dir.path().join("session.port");
+
+    let mut owner = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .stdin(Stdio::piped()) // 保持打开 ⇒ 属主 daemon 阻塞读 stdin，存活
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn owner daemon");
+    let owner_pid = owner.id().to_string();
+
+    let mut daemon = spawn_tcp(&["--owner-pid", &owner_pid], &pf);
+    let _ = wait_port_file(&pf);
+
+    owner.kill().expect("kill owner");
+    owner.wait().expect("reap owner");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = daemon.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "属主消亡后 daemon 必须在 10s 内自退（监督轮询 500ms + 宽限）"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        status.success(),
+        "自退是正常路径（非错误），退出码应为 0：{status:?}"
+    );
+    assert!(
+        !pf.exists(),
+        "自退时必须清理 port-file（令牌交接件不得滞留）"
+    );
+    daemon.kill_and_assert_stdout_empty();
+}
+
+/// 出现过已认证连接、随后全部断开 ⇒ 空转自退 + 清 port-file（同一 UI 多轮提权不累积 root daemon）。
+#[test]
+fn daemon_exits_after_last_authenticated_connection_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let pf = dir.path().join("session.port");
+    let mut daemon = spawn_tcp(&[], &pf);
+    let (port, token) = wait_port_file(&pf);
+
+    {
+        let (mut stream, reader) = connect_authed(port, &token);
+        let mut lines = Lines::new(reader);
+        // 认证无 ack：以一次往返确认「已注册」（注册先于 serve_lines ⇒ 收到响应即已注册）。
+        send(
+            &mut stream,
+            json!({"jsonrpc":"2.0","id":1,"method":"ping","params":null}),
+        );
+        assert_eq!(lines.response(1)["result"]["pong"], true);
+        // 关掉全部 fd（reader 持 try_clone 的 fd，必须一并 drop 才算断开）
+        drop(lines);
+        drop(stream);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = daemon.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "连接全断后 daemon 必须在 10s 内空转自退（宽限 3s + 轮询 500ms）"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "退出码应为 0：{status:?}");
+    assert!(!pf.exists(), "空转自退同样必须清理 port-file");
+    daemon.kill_and_assert_stdout_empty();
+}
+
+/// `--owner-pid` 只在提权会话模式（`--listen/--port-file`）下有意义：单独给出 = exit 2（不静默忽略）。
+#[test]
+fn owner_pid_without_tcp_session_is_rejected() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xd-daemon"))
+        .args(["--owner-pid", "1"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daemon");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--owner-pid"), "错误信息须点名参数：{err}");
 }
 
 #[test]

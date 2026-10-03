@@ -77,6 +77,27 @@ pub trait BlockDevice: Send + Sync {
     }
 }
 
+/// unix 系共用的 `read_at` 补齐循环（`linux.rs` 与 `macos.rs` 的 `impl` 都调这里；T4 抽共用，
+/// 消掉两份逐字拷贝）：契约——读取直到填满 `buf` 或到达 EOF；块设备短读常见，需循环补齐
+/// （`pread` 无文件游标，偏移随进度推进）。image/windows 各有自己的机理（钳位/游标锁），不并入。
+#[cfg(unix)]
+pub(crate) fn read_at_fill(
+    file: &std::fs::File,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, DeviceError> {
+    use std::os::unix::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        match file.read_at(&mut buf[done..], offset + done as u64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) => return Err(DeviceError::Io(e)),
+        }
+    }
+    Ok(done)
+}
+
 /// unix 系共用的源设备 rdev（`linux.rs` 与 `macos.rs` 各自 `impl` 都调这里）：
 /// fstat **已打开的 fd**（不重开路径、无写路径——只读铁律不破）→ `st_rdev` → (major, minor)。
 ///

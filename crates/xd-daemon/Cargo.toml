@@ -10,9 +10,15 @@ serde_json = { workspace = true }
 xd-core = { path = "../xd-core" }
 xd-device = { path = "../xd-device" }
 
-# 令牌生成（BCryptGenRandom，portfile.rs）。仅 windows 目标编译；运行语义未验证（需真机）。
+# 令牌生成（BCryptGenRandom，portfile.rs）+ 属主存活探针（OpenProcess/WaitForSingleObject，
+# transport.rs）。仅 windows 目标编译；运行语义未验证（需真机 UAC 链），CI windows runner 跑编译
+# 与 TCP 全链路（不覆盖真提权）。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", default-features = false, features = ["Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Security_Cryptography",  # BCryptGenRandom
+    "Win32_Foundation",             # CloseHandle/GetLastError/WAIT_TIMEOUT/ERROR_ACCESS_DENIED
+    "Win32_System_Threading",       # OpenProcess/WaitForSingleObject（属主监督）
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

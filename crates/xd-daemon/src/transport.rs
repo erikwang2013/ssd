@@ -11,21 +11,28 @@
 //! 注意：提权（root）daemon 的监听面**仅回环 + 令牌**——异用户读不到 0600 令牌文件即无法接入；
 //! 同用户攻击者本就有 uaccess 直读设备权限（无提权增益）。stdout 仅协议：TCP 模式下 stdout
 //! 不写任何东西，诊断全 stderr。
+//!
+//! **会话生命周期**（T4）：`--owner-pid` 属主监督 + 「连接全断后空转自退」——两条规则都在
+//! [`spawn_session_watchdog`]，威胁模型/已知限制见 docs/security §10。stdout 契约不受影响
+//! （自退只清 port-file + exit 0）。
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use xd_core::api::{Request, Response, RpcErr, RpcError};
 use xd_core::handlers::{CoreCtx, handle_request};
 
 use crate::portfile::{random_token, write_port_file};
 
-/// `--listen`/`--port-file` 成对给出的 TCP 模式参数。
+/// `--listen`/`--port-file`（+ 可选 `--owner-pid`）给出的 TCP 提权会话参数。
 pub(crate) struct TcpOptions {
     pub(crate) addr: SocketAddr,
     pub(crate) port_file: std::path::PathBuf,
+    /// 属主（UI）进程 pid：消亡即自退 + 清 port-file（生命周期方案见 [`spawn_session_watchdog`]）。
+    pub(crate) owner_pid: Option<u32>,
 }
 
 /// TCP 服务循环（不返回）：绑定 → 写 port-file → 每连接一线程。
@@ -47,12 +54,100 @@ pub(crate) fn serve_tcp(opts: TcpOptions, ctx: Arc<CoreCtx>, notifier: Arc<Notif
         std::process::exit(2);
     }
     eprintln!("xd-daemon: listening on 127.0.0.1:{port}");
+    spawn_session_watchdog(opts.owner_pid, opts.port_file, notifier.clone());
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let (token, ctx, notifier) = (token.clone(), ctx.clone(), notifier.clone());
         std::thread::spawn(move || handle_conn(stream, &token, &ctx, &notifier));
     }
     unreachable!()
+}
+
+/// 提权会话生命周期监督（T4 方案；威胁模型与已知限制见 docs/security §10）。两条规则：
+/// ① **属主监督**（`--owner-pid`）：UI 进程消亡 ⇒ 清 port-file 后退出——UAC/osascript 提权后
+///    父进程拿不到子进程句柄（这正是 TCP 会话存在的理由），pid 是唯一可传递的存活凭据；
+/// ② **空转自退**：出现过已认证连接、随后全部断开并持续 [`IDLE_EXIT`] ⇒ 清 port-file 后退出
+///    ——同一 UI 多轮提权时，被替换的旧会话在客户端关闭后自清，root daemon 不累积。
+///    启动窗口（从未连接）不触发：那由 ① 兜底（UI 崩溃于授权框上）。
+/// **已知限制**：pid 复用窗口（属主亡、pid 被复用给新进程 ⇒ 该轮延迟自退）——M1 接受，见 §10。
+pub(crate) fn spawn_session_watchdog(
+    owner_pid: Option<u32>,
+    port_file: std::path::PathBuf,
+    notifier: Arc<Notifier>,
+) {
+    const TICK: Duration = Duration::from_millis(500);
+    const IDLE_EXIT: Duration = Duration::from_secs(3);
+    std::thread::spawn(move || {
+        let mut empty_since: Option<Instant> = None;
+        loop {
+            std::thread::sleep(TICK);
+            if let Some(pid) = owner_pid
+                && !process_alive(pid)
+            {
+                exit_cleaning(&port_file, &format!("owner process {pid} gone"));
+            }
+            if !notifier.ever_registered() {
+                continue;
+            }
+            if notifier.sink_count() > 0 {
+                empty_since = None;
+            } else {
+                let since = *empty_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= IDLE_EXIT {
+                    exit_cleaning(&port_file, "no authenticated connection left");
+                }
+            }
+        }
+    });
+}
+
+/// 清 port-file 后退出（监督触发路径；0 = 正常自退，非错误）。
+fn exit_cleaning(port_file: &std::path::Path, reason: &str) -> ! {
+    eprintln!("xd-daemon: {reason} — 退出并清理 port-file");
+    let _ = std::fs::remove_file(port_file);
+    std::process::exit(0);
+}
+
+/// 属主进程存活探针（`kill(pid, 0)` 语义）：不存在 ⇒ false；存在但无权发信号（跨用户）⇒ true。
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, test_kill_process};
+    // 0 与 > i32::MAX 都不是合法 pid（`Pid::from_raw` 拒绝 0/负数；u32 高位在 debug 断言里炸）。
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = Pid::from_raw(raw) else {
+        return false;
+    };
+    match test_kill_process(pid) {
+        Ok(()) => true,
+        // EPERM = 进程存在但无权发信号（跨用户）⇒ 视为存活。
+        Err(e) => e == Errno::PERM,
+        // 其余（含 ESRCH = 不存在）按不存在处理（失败关闭：宁可自退不留孤儿）。
+    }
+}
+
+/// 属主进程存活探针（`OpenProcess(SYNCHRONIZE)` + 零超时等待）。未验证（需真机 UAC 链）。
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    // SAFETY: 打开的句柄由 CloseHandle 成对释放；WaitForSingleObject 超时 0 = 非阻塞查询。
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            // 打不开：无权限 = 进程存在（跨用户/受保护）⇒ 存活；其余（无此 pid）⇒ 不存在。
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let rc = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        rc == WAIT_TIMEOUT // 超时 = 尚未触发信号态 = 仍在运行
+    }
 }
 
 /// 单条连接：认证首行 → 逐行 JSON-RPC（与 stdio 同款）。断开/认证失败即注销通知写端。
@@ -160,6 +255,8 @@ impl<W: Write> Write for SharedSink<W> {
 pub(crate) struct Notifier {
     sinks: Mutex<Vec<(u64, Box<dyn Write + Send>)>>,
     next_id: AtomicU64,
+    /// 是否出现过已认证连接（空转自退判据：**从未连接** ≠ 连接断开——启动窗口不误杀）。
+    ever_registered: AtomicBool,
 }
 
 impl Notifier {
@@ -167,6 +264,7 @@ impl Notifier {
         Self {
             sinks: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            ever_registered: AtomicBool::new(false),
         }
     }
 
@@ -174,10 +272,21 @@ impl Notifier {
     pub(crate) fn register(self: &Arc<Self>, w: Box<dyn Write + Send>) -> SinkHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.sinks.lock().unwrap().push((id, w));
+        self.ever_registered.store(true, Ordering::Relaxed);
         SinkHandle {
             id,
             notifier: self.clone(),
         }
+    }
+
+    /// 当前已认证连接数（生命周期监督判据，见 [`spawn_session_watchdog`]）。
+    pub(crate) fn sink_count(&self) -> usize {
+        self.sinks.lock().unwrap().len()
+    }
+
+    /// 是否曾有连接注册（见字段注释）。
+    pub(crate) fn ever_registered(&self) -> bool {
+        self.ever_registered.load(Ordering::Relaxed)
     }
 
     /// 广播一行 JSON 到全部写端；写失败者剔除。
@@ -369,6 +478,50 @@ mod tests {
             count.load(Ordering::SeqCst),
             after_first,
             "drop 后不得再收到广播（注销失败 = 死写端常驻）"
+        );
+    }
+
+    // T4 生命周期监督的两枚判据钉（`spawn_session_watchdog`）：存活探针 + 连接计数。
+    // 1) `process_alive_sees_self_and_reaped_child` —— 杀「探针恒真/恒假」两类变异。
+    // 2) `notifier_tracks_connection_count_and_ever_registered` —— 杀「空转自退把启动窗口
+    //    （从未连接）误当连接断开」的变异（ever_registered 回落型）。
+
+    /// 存活探针（属主监督判据）：本进程恒活；`--list` 自跑（libtest 列出测试后即退）的子进程
+    /// 在 `wait` 回收后恒判不存在。跨平台（Windows 走 OpenProcess 臂）。
+    #[test]
+    fn process_alive_sees_self_and_reaped_child() {
+        assert!(process_alive(std::process::id()), "本进程必须探为存活");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn self --list");
+        let pid = child.id();
+        assert!(process_alive(pid), "存活子进程必须探为存活");
+        child.wait().expect("wait");
+        assert!(!process_alive(pid), "已回收子进程必须探为不存在");
+        assert!(!process_alive(u32::MAX), "不存在的 pid 必须探为不存在");
+    }
+
+    /// 生命周期判据：`sink_count` 反映在册连接数；`ever_registered` 一旦置位不回落——启动窗口
+    /// （从未连接）与「连接断开」必须可区分，否则空转自退会误杀还没连上的会话。
+    #[test]
+    fn notifier_tracks_connection_count_and_ever_registered() {
+        let notifier = Arc::new(Notifier::new());
+        assert_eq!(notifier.sink_count(), 0);
+        assert!(!notifier.ever_registered(), "未注册前不得视为曾连接");
+        let a = notifier.register(Box::new(CountSink(Arc::new(AtomicUsize::new(0)))));
+        let b = notifier.register(Box::new(CountSink(Arc::new(AtomicUsize::new(0)))));
+        assert_eq!(notifier.sink_count(), 2);
+        assert!(notifier.ever_registered());
+        drop(a);
+        assert_eq!(notifier.sink_count(), 1);
+        drop(b);
+        assert_eq!(notifier.sink_count(), 0);
+        assert!(
+            notifier.ever_registered(),
+            "断开不得让 ever_registered 回落"
         );
     }
 

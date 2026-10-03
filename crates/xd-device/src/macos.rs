@@ -25,7 +25,6 @@
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
@@ -65,12 +64,17 @@ fn ioctl_read<T: Default>(fd: RawFd, request: libc::c_ulong) -> Result<T, Device
     Ok(v)
 }
 
+/// 整盘容量乘法（纯函数，P8 钉：512B 与 4Kn 两种扇区口径须等值，见单测）。未验证（需真机）。
+fn size_bytes_of(block_size: u32, count: u64) -> u64 {
+    (block_size as u64).saturating_mul(count)
+}
+
 /// 整盘容量 = `DKIOCGETBLOCKSIZE`(u32) × `DKIOCGETBLOCKCOUNT`(u64)。未验证（需真机）。
 fn disk_size_bytes(file: &File) -> Result<u64, DeviceError> {
     let fd = file.as_raw_fd();
     let block_size: u32 = ioctl_read(fd, DKIOCGETBLOCKSIZE)?;
     let count: u64 = ioctl_read(fd, DKIOCGETBLOCKCOUNT)?;
-    Ok((block_size as u64).saturating_mul(count))
+    Ok(size_bytes_of(block_size, count))
 }
 
 /// 只读打开节点：`O_RDONLY`（rustix 默认带 `O_CLOEXEC`，这里显式重申）+ `O_NONBLOCK`
@@ -231,16 +235,8 @@ impl BlockDevice for MacosBlockDevice {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, DeviceError> {
-        // 同 Linux 口径：读取直到填满 buf 或到达 EOF；块设备短读常见，需循环补齐（pread 无游标）。
-        let mut done = 0usize;
-        while done < buf.len() {
-            match self.file.read_at(&mut buf[done..], offset + done as u64) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(e) => return Err(DeviceError::Io(e)),
-            }
-        }
-        Ok(done)
+        // 与 Linux 同函数（`crate::read_at_fill`，unix 共用；T4 抽共用前为逐字拷贝）。
+        crate::read_at_fill(&self.file, offset, buf)
     }
 
     /// 覆写：fstat **已打开的 fd**（不重开路径、无写路径——只读铁律不破），取 `st_rdev`。
@@ -333,6 +329,14 @@ mod tests {
             file: File::open(dir.path()).unwrap(),
         };
         assert!(dirdev.read_at(0, &mut none).is_err()); // 目录 fd 读报错 → Err（吞错变异在此被杀）
+    }
+
+    /// P8（T3 残余 S2 钉，4 行）：容量乘法纯函数——同一 1 TB 盘的 512B/4Kn 两种口径必须等值，
+    /// 杀掉「乘法写反/掉位/溢出截断」类变异（此前只在 enumerate 探针路径间接覆盖）。
+    #[test]
+    fn size_bytes_of_matches_both_sector_size_views() {
+        assert_eq!(size_bytes_of(512, 1_953_525_168), 1_000_204_886_016);
+        assert_eq!(size_bytes_of(4096, 244_190_646), 1_000_204_886_016);
     }
 
     #[test]
