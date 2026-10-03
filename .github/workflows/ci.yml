@@ -31,6 +31,11 @@ jobs:
         if: runner.os == 'macOS'
         # 弱断言分支取证（qual-m1e-t3 P7）：eprintln 在通过时被 cargo test 捕获不打印，
         # 单独跑 --nocapture 才能判别 runner 走 Ok（有权限）还是 PermissionDenied（无 FDA）分支。
+      - run: cargo test -p xd-daemon --test tcp_session --locked -- --nocapture root_daemon_hands_port_file_back_to_owner_user
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        # root 门控测试真执行/跳过二值取证（spec-m1e-t4 addendum）：`... ok` 分不出真跑与
+        # 免密 sudo 缺失的早退 skip——`--nocapture` 下「ran:」与「skip:」可辨。
+        # macOS 腿同样加：该测试在 `#[cfg(unix)]` 之内，此前无任何日志直证（无 sudo 即打 skip）。
       - run: cargo test --workspace --release --locked --no-fail-fast
         if: runner.os == 'Linux'
         # release 档矩阵：debug/release 行为分歧型缺陷（如 exFAT C1 分配帽）只跑 debug 会漏（qual-t2 注记）

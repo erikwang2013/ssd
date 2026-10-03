@@ -561,6 +561,9 @@ fn root_daemon_hands_port_file_back_to_owner_user() {
         0o600,
         "属主交还不得放松权限位（令牌仍仅属主可读）"
     );
+    // `--nocapture` 下与上面 skip 分支二值可辨：passing test 的 stderr 默认被 cargo 捕获，
+    // 单看 `... ok` 分不出「真执行」与「早退 skip」（macos_smoke 同款陷阱）。
+    eprintln!("ran: root owner-handback exercised (port-file uid == dir owner)");
 
     let (mut stream, reader) = connect_authed(port, &token);
     let mut lines = Lines::new(reader);
