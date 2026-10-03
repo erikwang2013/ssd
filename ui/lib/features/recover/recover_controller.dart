@@ -76,6 +76,13 @@ class RecoverController extends ChangeNotifier {
     if (dir == null || _state == RecoverUiState.exporting) return;
     _state = RecoverUiState.exporting;
     _error = null;
+    // 每次导出从零起（重开路径：done/canceled → 选择 → 开始）：残留 _exportId 会把
+    // 新导出的抢跑 finished 挡在寄存之外（永久停在导出中）、把「取消」指到旧导出，
+    // 并在首条新进度到达前显示旧计数。
+    _exportId = null;
+    _done = 0;
+    _total = 0;
+    _writtenBytes = 0;
     _pendingFinished = null;
     _starting = true;
     _notify();
@@ -87,7 +94,13 @@ class RecoverController extends ChangeNotifier {
       _starting = false;
       final pending = _pendingFinished;
       _pendingFinished = null;
-      if (pending != null) _applyFinished(pending); // 内含 exportId 二次校验
+      if (pending != null) {
+        try {
+          _applyFinished(pending); // 内含 exportId 二次校验
+        } catch (_) {
+          // 畸形 finished（契约外）：忽略——不得落入外层 catch 把在跑的导出误判 failed
+        }
+      }
     } catch (e) {
       if (_disposed) return;
       _starting = false;
