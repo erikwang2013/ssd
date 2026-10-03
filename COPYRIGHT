@@ -23,7 +23,8 @@
   # 预期输出：Good "erik-xyz-provenance" signature
 
 重新生成并签名：
-  git ls-files | grep -vE '^provenance\.' | sort | xargs sha256sum > provenance.sha256
+  git ls-files -z | grep -zvE '^provenance\.' | sort -z | xargs -0 sha256sum > provenance.sha256
+  # （NUL 分隔：非 ASCII 文件名——如 packaging/windows/README-安装.txt——需免 git 的 C-quote 转义；v0.4.0 起）
   ssh-keygen -Y sign -f ~/.ssh/id_rsa -n erik-xyz-provenance -O hashalg=sha512 provenance.sha256
 
 图片：SVG 内嵌 <metadata> 与角落署名；PNG/ICO 含版权元数据（tEXt）。

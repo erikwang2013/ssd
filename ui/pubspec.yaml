@@ -2,7 +2,7 @@
 name: xiaodun_ui
 description: "小盾（Xiaodun）· 跨平台数据恢复工具界面"
 publish_to: 'none'
-version: 0.3.0+3
+version: 0.4.0+4
 
 environment:
   sdk: ^3.13.4

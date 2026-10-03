@@ -218,7 +218,7 @@ bash scripts/e2e-package-smoke.sh
 
 ## 项目状态
 
-**M1 进行中**。已完成并发布：
+**M1 已收官**。已发布：
 - **M0 地基**（v0.1.0）：契约 v0、只读镜像后端、stdio daemon、Flutter 骨架、CI 三平台矩阵
 - **M1a / M1a2 / M1e**（v0.2.0）：FAT12/16/32 与 exFAT 只读引擎、Linux 平台层（枚举/提权/打包）
 - **M1b**（v0.3.0）：契约 v1（`scan.*` 事件流）+ 扫描编排端到端——状态机（暂停/恢复/取消）、
@@ -234,7 +234,7 @@ bash scripts/e2e-package-smoke.sh
   （三重目标校验、逐字节精确、分片流式、逐件降级/失败报告、实取消）；全链路集成测试
   （Rust 夹具镜像 → 真 daemon → 扫描 → 预览回读 → 导出 → 报告逐字节）进 CI，e2e-loop 增
   「环回挂载点导出断言 `-32006` + 普通目录导出逐字节比对」真集成段
-- **M1e 尾段 · 平台收口**（本次合入）：TCP 回环提权会话（`--listen/--port-file` 令牌 0600 文件 +
+- **M1e 尾段 · 平台收口**（v0.4.0）：TCP 回环提权会话（`--listen/--port-file` 令牌 0600 文件 +
   `--owner-pid` 监督 + 空转自退；Windows UAC / macOS osascript / Linux pkexec 三平台引导）；Windows
   （SetupAPI）与 macOS（`/dev/diskN`）平台层（枚举 + 只读句柄 + 属主交还）；Windows 便携 zip 与
   macOS staged zip 打包（CI 手动 job `packaging=true` + 产物冒烟）；F1 测试活锁拆弹 + 全链路回归钉
@@ -251,7 +251,7 @@ transport/removable 提示字段：Windows 已映射（BusType → usb/sata/nvme
 macOS 恒 `None`/`false`（M2 以 IOKit 补）。打包产物**未签名**：macOS 首次打开需右键-打开，
 Windows SmartScreen 需「仍要运行」。细节见 `docs/security/linux-privilege-model.md` §8/§9/§10/§11。
 
-**M1e 尾段已完成开发**；出口验收（全矩阵 CI + 未验证边界总表）收官后 M1 完整合入。
+**M1 已完整合入**（M1e-tail 出口验收通过：CI 全 7 job 绿，含 Windows/macOS 打包真跑）。
 真机手测清单索引见 `docs/security/linux-privilege-model.md` §12（M1e 边界总表）与 §5（Linux 平台项）。
 目标：全端 1.0 约 9-12 个月（5-6 人团队，4 条工作流并行）。
 
