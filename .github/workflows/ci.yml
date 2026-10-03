@@ -27,6 +27,10 @@ jobs:
         # --no-fail-fast（T9 可移植性修复轮申报偏离）：默认 fail-fast 会在首个红测试目标处
         # 中止本轮——Windows 上 xd-core 一红，xd-daemon（export_ipc/scan_ipc…）整轮都跑不到，
         # 多平台修复轮每次只暴露 1 个红点。开全跑后单轮暴露全部红点。
+      - run: cargo test -p xd-device --test macos_smoke --locked -- --nocapture
+        if: runner.os == 'macOS'
+        # 弱断言分支取证（qual-m1e-t3 P7）：eprintln 在通过时被 cargo test 捕获不打印，
+        # 单独跑 --nocapture 才能判别 runner 走 Ok（有权限）还是 PermissionDenied（无 FDA）分支。
       - run: cargo test --workspace --release --locked --no-fail-fast
         if: runner.os == 'Linux'
         # release 档矩阵：debug/release 行为分歧型缺陷（如 exFAT C1 分配帽）只跑 debug 会漏（qual-t2 注记）

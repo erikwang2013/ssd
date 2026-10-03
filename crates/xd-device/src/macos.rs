@@ -48,6 +48,13 @@ const DKIOCGETBLOCKCOUNT: libc::c_ulong = ior(b'd', 25, 8);
 
 /// 经 fd 读一个 ioctl 出参（`_IOR` 约定：第三参为出参指针）。未验证（需真机）。
 fn ioctl_read<T: Default>(fd: RawFd, request: libc::c_ulong) -> Result<T, DeviceError> {
+    // 宽度配对护栏：request 的 _IOC 长度字段必须 == T 字节宽（调用点互换/手滑在 debug/CI 立即红；
+    // 内核按声明宽度写，配错即栈越界）。
+    debug_assert_eq!(
+        ((request >> 16) & 0x1fff) as usize,
+        std::mem::size_of::<T>(),
+        "ioctl 请求宽度与出参类型不匹配"
+    );
     let mut v = T::default();
     // SAFETY: request 为 DKIOC* 常量，内核按 _IOR 声明的宽度全量写入 v（u32/u64 均为 Copy 类型，
     // 写满后读取无未初始化字节）；fd 由调用方保证为有效只读 fd。
@@ -122,6 +129,17 @@ pub fn enumerate() -> Result<Vec<MacosDisk>, DeviceError> {
 
 /// 注入根版（单测用假 /dev；生产恒 `/dev`）。
 pub(crate) fn enumerate_in(dev_dir: &Path) -> Result<Vec<MacosDisk>, DeviceError> {
+    enumerate_in_with(dev_dir, &|node| {
+        open_readonly(node).and_then(|f| disk_size_bytes(&f))
+    })
+}
+
+/// 探针注入版：`Ok(0)`=无媒体/幻影盘跳过；`Ok(n)` 直通；`Err`=仍列入、size 记 0 + 留痕
+/// （容量策略由此单测钉死，不依赖载体文件类型；生产探针 = 只读 open + DKIOC ioctl）。
+pub(crate) fn enumerate_in_with(
+    dev_dir: &Path,
+    probe_size: &dyn Fn(&Path) -> Result<u64, DeviceError>,
+) -> Result<Vec<MacosDisk>, DeviceError> {
     let entries = std::fs::read_dir(dev_dir).map_err(DeviceError::Io)?;
     let mut found: Vec<(u32, MacosDisk)> = Vec::new();
     for e in entries.flatten() {
@@ -132,7 +150,7 @@ pub(crate) fn enumerate_in(dev_dir: &Path) -> Result<Vec<MacosDisk>, DeviceError
             continue; // 分区/裸盘/其他一律不列
         }
         let node = dev_dir.join(&name);
-        let size_bytes = match open_readonly(&node).and_then(|f| disk_size_bytes(&f)) {
+        let size_bytes = match probe_size(&node) {
             Ok(0) => continue, // 无媒体/幻影盘（零盘跳过口径）
             Ok(size) => size,
             Err(err) => {
@@ -186,13 +204,15 @@ impl MacosBlockDevice {
         }
         let file = open_readonly(node)?;
         let size_bytes = disk_size_bytes(&file)?;
-        let name = node
+        // 规范路径（与 linux.rs 同口径）：id 与枚举项必须逐字一致（T4 去重依赖）
+        let canon = std::fs::canonicalize(node).unwrap_or_else(|_| node.to_path_buf());
+        let name = canon
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| node.display().to_string());
+            .unwrap_or_else(|| canon.display().to_string());
         Ok(Self {
             info: DeviceInfo {
-                id: format!("unix:{}", node.display()),
+                id: format!("unix:{}", canon.display()),
                 name,
                 kind: DeviceKind::Physical,
                 size_bytes,
@@ -262,6 +282,8 @@ mod tests {
             "/tmp/disk0",           // 非 /dev（信任边界）
             "disk0",                // 相对路径
             "/dev/disk99999999999", // 超出 u32
+            "/dev/sub/disk0",       // /dev 子目录（父目录必须恰为 /dev，非 starts_with）
+            "/dev/../dev/disk0",    // 含 .. 段（拒绝即可，无需归一）
         ] {
             assert_eq!(parse_disk_node(Path::new(bad)), None, "应拒绝: {bad}");
         }
@@ -281,6 +303,39 @@ mod tests {
     }
 
     #[test]
+    fn read_at_fills_buf_stops_at_eof_and_errors() {
+        // 载体常规文件（macOS CI 真跑）：偏移推进/EOF 短读/纯 EOF/错误四态覆盖 pread 循环
+        let info = DeviceInfo {
+            id: "unix:/dev/disk0".into(),
+            name: "disk0".into(),
+            kind: DeviceKind::Physical,
+            size_bytes: 600,
+            removable: false,
+            fs_guess: None,
+            transport: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![7u8; 600]).unwrap();
+        let dev = MacosBlockDevice {
+            info: info.clone(),
+            file: File::open(&path).unwrap(),
+        };
+        let mut buf = [0u8; 512];
+        assert_eq!(dev.read_at(0, &mut buf).unwrap(), 512); // 读满
+        assert!(buf.iter().all(|b| *b == 7));
+        let mut tail = [0u8; 512];
+        assert_eq!(dev.read_at(512, &mut tail).unwrap(), 88); // 偏移推进 + EOF 前短读
+        let mut none = [0u8; 16];
+        assert_eq!(dev.read_at(600, &mut none).unwrap(), 0); // 纯 EOF → 0，不挂死
+        let dirdev = MacosBlockDevice {
+            info,
+            file: File::open(dir.path()).unwrap(),
+        };
+        assert!(dirdev.read_at(0, &mut none).is_err()); // 目录 fd 读报错 → Err（吞错变异在此被杀）
+    }
+
+    #[test]
     fn disk_size_on_non_device_is_err_not_panic() {
         // 常规文件上 DKIOC ioctl 必失败（ENOTTY）→ Err（不 panic、不假造容量）
         let f = tempfile::NamedTempFile::new().unwrap();
@@ -294,13 +349,16 @@ mod tests {
         for name in ["disk0", "disk10", "disk2", "disk0s1", "rdisk0", "diskX"] {
             std::fs::write(root.path().join(name), b"").unwrap();
         }
-        let disks = enumerate_in(root.path()).unwrap();
+        let disks = enumerate_in_with(root.path(), &|_| {
+            Err(DeviceError::Io(std::io::Error::other("ENOTTY")))
+        })
+        .unwrap();
         let names: Vec<&str> = disks
             .iter()
             .map(|d| d.node.file_name().unwrap().to_str().unwrap())
             .collect();
         assert_eq!(names, ["disk0", "disk2", "disk10"]); // 盘号序，非字符串序
-        // 常规文件 ioctl 必失败 → size 0 且仍列入（列表不依赖权限/可读性）
+        // 容量探针必失败 → size 0 且仍列入（列表不依赖权限/可读性）
         assert!(disks.iter().all(|d| d.info.size_bytes == 0));
         assert!(
             disks
@@ -313,5 +371,23 @@ mod tests {
                 .iter()
                 .all(|d| d.info.transport.is_none() && !d.info.removable)
         );
+    }
+
+    #[test]
+    fn zero_size_disk_is_skipped_and_size_passes_through() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("disk0"), b"").unwrap();
+        std::fs::write(root.path().join("disk1"), b"").unwrap();
+        let disks = enumerate_in_with(root.path(), &|p| {
+            if p.ends_with("disk0") {
+                Ok(0)
+            } else {
+                Ok(1024)
+            }
+        })
+        .unwrap();
+        assert_eq!(disks.len(), 1, "容量读到 0 的盘跳过");
+        assert!(disks[0].node.ends_with("disk1"));
+        assert_eq!(disks[0].info.size_bytes, 1024, "容量直通不折半");
     }
 }

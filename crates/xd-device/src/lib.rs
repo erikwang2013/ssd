@@ -98,3 +98,19 @@ pub(crate) fn dev_major_minor(dev: u64) -> (u64, u64) {
     let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
     (major, minor)
 }
+
+#[cfg(all(test, unix))]
+mod decode_contract_tests {
+    use super::dev_major_minor;
+
+    #[test]
+    fn dev_major_minor_is_glibc_form_for_all_unix() {
+        // 契约：恒 glibc 式（gnu_dev_major/minor），与 xd-core::export 本地副本同式——
+        // -32006 是 st_dev(目标)==st_rdev(源) 的相等比较，两侧必须同式（改一侧 ⇔ 静默失效）。
+        assert_eq!(dev_major_minor(0x800), (8, 0)); // Linux sda
+        assert_eq!(dev_major_minor(0x1_0305), (259, 5)); // makedev(259,5) 往返
+        // Darwin raw disk0（major 1/minor 0）在 glibc 式下的解——(0,4096) 非 Darwin 语义，
+        // 但**故意如此**：任何单侧改 Darwin 解码会被这行钉红。
+        assert_eq!(dev_major_minor(0x0100_0000), (0, 4096));
+    }
+}
