@@ -145,9 +145,11 @@ pub fn probe(dev: &dyn BlockDevice) -> Result<FsKind, ProbeError> {
     let n = dev.read_at(0, &mut buf).map_err(|_| ProbeError::Unsupported)?;
     if n >= 11 && &buf[3..11] == b"EXFAT   " { return Ok(FsKind::Exfat); }
     if n >= 11 && &buf[3..11] == b"NTFS    " { return Ok(FsKind::Ntfs); }   // OEM ID（VBR 偏移 3）
-    // ext4：超级块 magic 0xEF53 位于卷内 1024+56 = 1080（0x438）
-    if n >= 1082 && buf[1080] == 0x53 && buf[1081] == 0xEF { return Ok(FsKind::Ext4); }
     // …既有 FAT BPB 粗筛（零改动）
+    // ext4：超级块 magic 0xEF53 位于卷内 1024+56 = 1080（0x438）。
+    // （T1 lead 裁定 2026-10-03：ext4 殿后——防 FAT16 卷 FAT1 区恰撞 0xEF53 被抢判；
+    //   真 ext4 过不了 FAT 闸，真实设备判定结果不变）
+    if n >= 1082 && buf[1080] == 0x53 && buf[1081] == 0xEF { return Ok(FsKind::Ext4); }
 }
 ```
   `FsKind` 加 `Ntfs`/`Ext4` 二变体 + `as_str()`/`FromStr`（`"ntfs"`/`"ext4"`；未知仍 `ProbeError::Unsupported`）。
@@ -474,7 +476,14 @@ pub fn media_hints(dev: &str) -> (Option<&'static str>, Option<bool>)
 
 ## 执行记录
 
-（留空——各任务 impl→spec→qual 完成后按 M1e 先例逐任务填写：提交沿革 / 交付 / 独立核验 / 变异 / 移交项。）
+### T1（契约 v1.3 + probe/FsKind + store v6 + 双引擎骨架）—— impl-m2-t1。提交沿革：`a34b51a`（主）→ `b9d5ed7`（.gitattributes 禁 CRLF——Windows 字节断言红点根因修复）→ `3c3be10`（qual 补测扩版：probe 改序 + 顺序钉 4 例/边界/panic/拒绝层 + 注释毛刺）。DONE → spec **PASS** → qual **APPROVED**（32 变异 24 KILL / 8 SURVIVE→4 缺口补钉落地）→ 收口增复 APPROVED（T1 关闭；workspace **483/0**；flutter 140+2 / 带 daemon 142；CI 全绿 @ `3c3be10`）
+
+- **交付**：契约 v1.3 纯增量（`recordId` 三态 0 合法/缺省省略；fs 域 ntfs|ext4；`daemon.shutdown` 契约面；golden 36→40 只增不改——FNV-1a64 摘要表钉旧 36 字节）；store v6 迁移（模板同构 + 列探测 + v5→v6 测试）；probe 单读 2048B 识别；双引擎骨架（Error non_exhaustive 同构，三签名恒 `Err(Unsupported)` 不 panic）；4 分派点 8 臂穷尽（无 `_` 通配，删臂=编译错）；fs_read 单漏斗「缺 recordId → -32603 不猜读」。
+- **★ lead 裁定（改序）**：qual 发现 FAT16（reserved=1）FAT1 区偏移 1080 恰为 `0xEF53` 时被 ext4 判据抢判（~1/65536/卷）→ 裁定 **probe 顺序 exFAT→NTFS→FAT→ext4**（真 ext4 过不了 FAT 闸，真实设备结果不变）；顺序钉 4 例（O-A/B/C 变异各死其定制断言）；引擎侧 fail-closed 仍为 T2/T4 硬要求（纵深）。
+- **spec 独立核验**：36 golden sha256+FNV 双独立复算（非自证）；CI 面终条款（Windows 腿测试名直取、release 腿闭环、packaging skip=门控设计）；`.gitattributes` 根因链 + 三态检出复现。
+- **记录项（落 M2 出口文档/T12）**：R-1 测试字面量 7 文件 9 处（impl 申报 6 处不准）；R-2 `protocol_v12_test.dart` 36→40 漏列申报；R-3 骨架 4 分派点/8 臂（lead 清单「5 臂」笔误）；S-1 三文件 >500 行系既有债（scan_task 1250 / store 1078 / contract_v1 721——里程碑中不拆，T12 评估）；N-1 FAT 卷带 NTFS OEM 误判面 + 新序残余 ~1e-5（T2/T4 fail-closed 兜底）；cosmetic `scan_task.rs:65` 语序 nit（不修）。
+- **移交**：T2=勿重复已就位映射/快扫臂；填引擎时删 `Unsupported`；observer「后序+quality 终值」须镜像或声明偏离。T4=superblock 结构校验（fail-closed 硬要求）。T7=shutdown handler（契约已钉，Dart 分发臂同步）。共享热点=4 分派点穷尽 + golden 集合断言 3 处联动。
+- **未验证**：真卷/真设备 probe（T2 oracle 首检）、真块设备 2048B 读语义、Windows 本地检出复现（CI 代）、packaging×`-text` 交互未演练。
 
 ---
 
