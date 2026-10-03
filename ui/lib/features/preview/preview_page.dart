@@ -117,6 +117,7 @@ class _PreviewPageState extends State<PreviewPage> {
       return Center(
         child: Image.memory(
           bytes,
+          cacheWidth: 2048,
           errorBuilder: (context, error, stackTrace) =>
               const Center(child: Text('数据损坏，无法预览')),
         ),

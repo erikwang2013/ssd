@@ -100,7 +100,13 @@ void main() {
       reason: '1MiB/片，次片 offset = 首片实收字节数',
     );
     final image = tester.widget<Image>(find.byType(Image));
-    expect((image.image as MemoryImage).bytes, tinyPng, reason: '两片须按序无损拼装');
+    final provider = image.image as ResizeImage;
+    expect(provider.width, 2048, reason: '解码上界钉死：大图不得按原始分辨率解码（防 OOM）');
+    expect(
+      (provider.imageProvider as MemoryImage).bytes,
+      tinyPng,
+      reason: '两片须按序无损拼装',
+    );
     expect(find.text('实际数据短于声明大小'), findsNothing, reason: 'eof 且实收==声明大小');
     await unload(tester);
   });
