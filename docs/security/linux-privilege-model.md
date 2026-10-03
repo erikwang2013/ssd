@@ -459,14 +459,16 @@ UI 用户。非提权写入
 
 **CI**：`package-windows`/`package-macos` 两个 job 由 `workflow_dispatch` 输入 `packaging=true`
 门控（flutter build windows/macos 重成本，常规轮次不摊）；artifact `xiaodun-windows-zip`/
-`xiaodun-macos-zip`（`dist/*.zip`）。
+`xiaodun-macos-{arm64,x64}-zip`（`dist/*.zip`）。macOS 为矩阵两腿（M2 T11）：`macos-15`（arm64）/
+`macos-15-intel`（x64，GitHub 最后一代 Intel 镜像，**2027-08 退役**），两腿各自跑冒烟；旧名
+`xiaodun-macos-zip` 不保留兼容映射。
 
 **签名/公证（M2 T10 实现）**：`scripts/notarize.sh` 真链——逐嵌套 codesign（先
 `Contents/MacOS/xd-daemon`，再 Frameworks 内层→framework 目录，最后整包；`--force --options
 runtime --timestamp`，**不用 `--deep`**）→ `codesign --verify --strict` 断言 seal 有效 →
 `notarytool submit --wait` → `stapler staple` + `spctl -a -vv` 断言。Apple 凭据走 CI secrets
 （`APPLE_CERT_P12_BASE64`/`APPLE_CERT_PASSWORD`/`APPLE_TEAM_ID`/`APPLE_ID`/`APPLE_APP_PASSWORD`，
-不入仓）；**缺任一 ⇒ 具名 `skip:` 行 + exit 0，产物名不变（未签名包）——绝不产半签包**；
+不入仓；T11 起 ci.yml job 级 `env:` 注入，未配置 = 空串 ⇒ 同走 skip 分支）；**缺任一 ⇒ 具名 `skip:` 行 + exit 0，产物名不变（未签名包）——绝不产半签包**；
 `package-macos.sh` 在 staple 之后重出交付 zip（包内 .app 与票据一致）。**F2 修复**：App Sandbox
 entitlement 移除（数据恢复与沙箱不兼容：/dev/diskN 裸读、提权 helper spawn），保留 Flutter JIT；
 「签名有效」以 `codesign --verify` 为准（未公证时 `spctl` 必然拒，故 spctl 仅在真公证路径断言）。

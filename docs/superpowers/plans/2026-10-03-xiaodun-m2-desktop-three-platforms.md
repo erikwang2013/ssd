@@ -57,7 +57,7 @@
 
 ### R7. x64 物证（⑧）= `macos-15-intel` runner
 
-- packaging 的 macos job 改**矩阵**：`macos-15`（arm64）与 `macos-15-intel`（x64，GitHub 最后一代 Intel 镜像，**2027-08 退役**——时效写进文档）；artifact 名分列 `xiaodun-macos-zip`（arm64）/`xiaodun-macos-x64-zip`；两腿各自跑冒烟。
+- packaging 的 macos job 改**矩阵**：`macos-15`（arm64）与 `macos-15-intel`（x64，GitHub 最后一代 Intel 镜像，**2027-08 退役**——时效写进文档）；artifact 名分列 `xiaodun-macos-arm64-zip`/`xiaodun-macos-x64-zip`（T11 裁定：旧名 `xiaodun-macos-zip` 不保留兼容映射）；两腿各自跑冒烟。
 - 现有 `package-macos.sh` 按宿主架构产物不变（矩阵天然覆盖两架构）。
 
 ### R8. 范围与 cut 线（需 lead 裁定，见「开放问题」）

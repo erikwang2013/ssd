@@ -6,10 +6,17 @@
 //! - `runner_rc_metadata_is_xiaodun`：Runner.rc 版本资源收口为「小盾 (Xiaodun)」；
 //! - `smoke_reports_signature_state`：macOS 冒烟脚本如实打印签名状态（签/未签都过但留证据）；
 //! - `shell_scripts_avoid_unbraced_var_adjacent_to_non_ascii`：全仓 tracked `*.sh` 里 `$var`
-//!   后紧邻非 ASCII 字节 ⇒ macOS bash 3.2 并名 + `set -u` unbound（CI 二红真根因）的静态钉。
+//!   后紧邻非 ASCII 字节 ⇒ macOS bash 3.2 并名 + `set -u` unbound（CI 二红真根因）的静态钉；
+//! - `ci_packaging_macos_matrix_two_legs_and_secret_injection`（T11）：ci.yml 的 package-macos
+//!   矩阵两腿（macos-15/arm64、macos-15-intel/x64 成对）+ `fail-fast: false` + artifact 名带
+//!   `${{ matrix.arch }}`（旧名 `xiaodun-macos-zip` 不得回归）+ job 级 secrets env 注入
+//!   （Apple 五件套 / Windows 两件套，空串语义由 notarize.sh `add_missing` 承接）。
+//!   T11 只能以 dispatch 实证两腿，CI 改动此前无任何本地门禁——本钉即那门禁。
 //!
 //! 脚本钉（`#[cfg(unix)]`，mock codesign/xcrun/security/ditto/spctl 取证，Linux/macOS 腿真跑）：
 //! - `notarize_script_skips_named_without_credentials`：缺凭据 ⇒ 具名 `skip:` 行 + exit 0（绝不产半签包）；
+//! - `notarize_script_skips_named_when_credentials_are_empty_strings`（T11）：五件套**空串**
+//!   （CI job 级 env 注入未配置 secrets 的真形态）⇒ 同样具名 skip + exit 0——门控须判空非判存在；
 //! - `notarize_script_orders_nested_sign_first`：逐嵌套签名顺序 = 引擎 → Frameworks 内层 → framework
 //!   目录 → .app；无 `--deep`；顺序 sign → zip → submit → staple → spctl，且每次签名都带
 //!   `--force --options runtime --timestamp`（计划 T10 Step 1 的机器断言）。
@@ -242,6 +249,162 @@ fn shell_scripts_avoid_unbraced_var_adjacent_to_non_ascii() {
     );
 }
 
+/// ci.yml 中 `job` 块（缩进 2 的 `  job:` 头 → 下一个同级 job 头或 EOF）的代码行（剔整行注释）。
+///
+/// 必须剔除注释：本仓 ci.yml 的注释里天然写着 `macos-15`/`macos-15-intel`/旧 artifact 名，
+/// 直接对全文 `contains` 断言会被注释骗过（删了真腿照样绿）——结构断言必须落在代码行上。
+fn ci_job_code_lines<'a>(ci: &'a str, job: &str) -> Vec<&'a str> {
+    let header = format!("  {job}:");
+    let mut inside = false;
+    let mut out = Vec::new();
+    for l in ci.lines() {
+        if !inside {
+            inside = l.trim_end() == header;
+            continue;
+        }
+        // 下一个 job 头（缩进恰 2 个空格、非注释、以 ':' 结尾）⇒ 块结束。
+        if l.starts_with("  ")
+            && !l.starts_with("   ")
+            && l.trim_end().ends_with(':')
+            && !l.trim_start().starts_with('#')
+        {
+            break;
+        }
+        if !l.trim_start().starts_with('#') {
+            out.push(l);
+        }
+    }
+    assert!(inside, "ci.yml 缺 job `{job}`");
+    assert!(
+        !out.is_empty(),
+        "ci.yml job `{job}` 代码行为空（解析假设失效）"
+    );
+    out
+}
+
+/// `steps:` 下的 run 行（序列项 `- run: <cmd>`；容忍 `- ` 前缀）。
+fn is_run_step(l: &str, cmd: &str) -> bool {
+    l.trim().trim_start_matches("- ").trim() == format!("run: {cmd}")
+}
+
+/// 从 matrix `include:` 段抽 (runner, arch) 成对腿——钉「runner↔arch 配对」，防换 runner 不换 arch。
+fn matrix_legs(code: &[&str]) -> Vec<(String, String)> {
+    let mut legs: Vec<(String, String)> = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    let val = |t: &str, prefix: &str| {
+        t.strip_prefix(prefix)
+            .map(|v| v.split('#').next().unwrap_or("").trim().to_string())
+    };
+    for l in code {
+        let t = l.trim();
+        if let Some(r) = val(t, "- runner:") {
+            if let Some(p) = cur.take() {
+                legs.push(p);
+            }
+            cur = Some((r, String::new()));
+        } else if let Some(a) = val(t, "arch:")
+            && let Some((r, _)) = cur.take()
+        {
+            cur = Some((r, a));
+        }
+    }
+    if let Some(p) = cur {
+        legs.push(p);
+    }
+    legs
+}
+
+#[test]
+fn ci_packaging_macos_matrix_two_legs_and_secret_injection() {
+    let ci = read(".github/workflows/ci.yml");
+    let macos = ci_job_code_lines(&ci, "package-macos");
+
+    assert!(
+        macos
+            .iter()
+            .any(|l| l.trim() == "if: github.event.inputs.packaging == 'true'"),
+        "package-macos 必须保持 workflow_dispatch 手动门控（packaging=true）"
+    );
+
+    // 两腿 runner↔arch 成对：删腿 / 换 runner / 换 arch 任一回归都红（矩阵无序，按集合比）。
+    let mut legs = matrix_legs(&macos);
+    legs.sort();
+    assert_eq!(
+        legs,
+        vec![
+            ("macos-15".to_string(), "arm64".to_string()),
+            ("macos-15-intel".to_string(), "x64".to_string()),
+        ],
+        "package-macos 矩阵须为 macos-15/arm64 + macos-15-intel/x64 两腿（计划 R7：x64 物证 = Intel runner 真跑）"
+    );
+    assert!(
+        macos.iter().any(|l| l.trim() == "fail-fast: false"),
+        "矩阵须 fail-fast: false——一腿红不得吞另一腿的物证"
+    );
+    assert!(
+        macos
+            .iter()
+            .any(|l| l.trim() == "runs-on: ${{ matrix.runner }}"),
+        "runs-on 须走 ${{ matrix.runner }}（不得回退单 runner）"
+    );
+
+    // artifact：arch 变量命名；旧名不得回归（T11 裁定，README/§11 同口径）。
+    assert!(
+        macos
+            .iter()
+            .any(|l| l.trim() == "name: xiaodun-macos-${{ matrix.arch }}-zip"),
+        "artifact 名须为 xiaodun-macos-${{ matrix.arch }}-zip"
+    );
+    assert!(
+        !macos.iter().any(|l| l.trim() == "name: xiaodun-macos-zip"),
+        "T11 裁定旧名 xiaodun-macos-zip 不保留兼容映射（README 打包节）"
+    );
+
+    // 两腿各自跑打包 + 产物冒烟（x64 腿绿的物证前提：包内 daemon 在本腿真 exec）。
+    assert!(
+        macos
+            .iter()
+            .any(|l| is_run_step(l, "bash scripts/package-macos.sh")),
+        "package-macos 须跑打包脚本"
+    );
+    assert!(
+        macos
+            .iter()
+            .any(|l| is_run_step(l, "bash scripts/e2e-package-smoke.sh")),
+        "package-macos 两腿须各自跑产物冒烟"
+    );
+
+    // job 级 secrets env 注入（Apple 五件套）：缩进恰 6 = 直属 job 的 `env:`（step 级 env 更深）；
+    // 未配置 = 空串 ⇒ notarize.sh `add_missing` 逐件判空走具名 skip。
+    for v in [
+        "APPLE_CERT_P12_BASE64",
+        "APPLE_CERT_PASSWORD",
+        "APPLE_TEAM_ID",
+        "APPLE_ID",
+        "APPLE_APP_PASSWORD",
+    ] {
+        let needle = format!("{v}: ${{{{ secrets.{v} }}}}");
+        let l = macos
+            .iter()
+            .find(|l| l.trim() == needle)
+            .unwrap_or_else(|| panic!("package-macos 缺 job 级 env 注入: {needle}"));
+        let indent = l.len() - l.trim_start().len();
+        assert_eq!(indent, 6, "{v} 须在 job 级 env（缩进 6）注入: {l}");
+    }
+
+    // Windows 腿：job 级 env 两键仍在（T11 未动名/未删；空串 ⇒ package-windows.ps1 `-not` skip）。
+    let win = ci_job_code_lines(&ci, "package-windows");
+    for v in ["WINDOWS_CERT_PFX_BASE64", "WINDOWS_CERT_PASSWORD"] {
+        let needle = format!("{v}: ${{{{ secrets.{v} }}}}");
+        let l = win
+            .iter()
+            .find(|l| l.trim() == needle)
+            .unwrap_or_else(|| panic!("package-windows 缺 env 注入: {needle}"));
+        let indent = l.len() - l.trim_start().len();
+        assert_eq!(indent, 6, "{v} 须在 job 级 env（缩进 6）注入: {l}");
+    }
+}
+
 #[cfg(unix)]
 mod scripts {
     use super::repo_root;
@@ -259,7 +422,14 @@ mod scripts {
         "APPLE_SIGN_IDENTITY",
     ];
 
-    fn run_notarize(app: &Path, zip: Option<&Path>, creds: bool, path_env: &str) -> Output {
+    /// 凭据注入形态：`None` = 未设置（本地开发）；`Empty` = 设置为空串（T11 起 CI 真形态，
+    /// job 级 `env:` 注入未配置 secrets = 空串）。「齐备」形态由 mock 链测试自建命令。
+    enum Creds {
+        None,
+        Empty,
+    }
+
+    fn run_notarize(app: &Path, zip: Option<&Path>, creds: Creds, path_env: &str) -> Output {
         let mut cmd = Command::new("bash");
         cmd.arg(repo_root().join("scripts/notarize.sh")).arg(app);
         if let Some(z) = zip {
@@ -268,12 +438,13 @@ mod scripts {
         for v in CRED_VARS {
             cmd.env_remove(v);
         }
-        if creds {
-            cmd.env("APPLE_CERT_P12_BASE64", "ZmFrZQ==")
-                .env("APPLE_CERT_PASSWORD", "pw")
-                .env("APPLE_TEAM_ID", "TEAMID1234")
-                .env("APPLE_ID", "dev@example.com")
-                .env("APPLE_APP_PASSWORD", "app-pw");
+        match creds {
+            Creds::None => {}
+            Creds::Empty => {
+                for v in &CRED_VARS[..5] {
+                    cmd.env(v, "");
+                }
+            }
         }
         cmd.env("PATH", path_env)
             .current_dir(repo_root())
@@ -297,7 +468,7 @@ mod scripts {
     fn notarize_script_skips_named_without_credentials() {
         let path = std::env::var("PATH").unwrap();
         // 计划 T10 Step 6 的字面命令形态：单参数（zip 可省）也必须 skip + exit 0。
-        let out = run_notarize(Path::new("/tmp/fake.app"), None, false, &path);
+        let out = run_notarize(Path::new("/tmp/fake.app"), None, Creds::None, &path);
         assert!(
             out.status.success(),
             "缺凭据必须 exit 0（绝不产半签包）；stderr: {}",
@@ -315,6 +486,40 @@ mod scripts {
         assert!(
             stdout.contains("未签名") && stdout.contains("未公证"),
             "跳过时须如实声明本产物未签名/未公证；实际: {stdout}"
+        );
+    }
+
+    #[test]
+    fn notarize_script_skips_named_when_credentials_are_empty_strings() {
+        // T11 新增不变量：ci.yml 在 job 级 env 注入五件套，未配置的 secrets = **空串**
+        // （不是未设置——GitHub 官方语义：unset secret 的表达式值为空串）。凭据门控必须
+        // 「判空」而非「判存在」：存在性判定（`${VAR+x}` 形态）在空串下会误判「凭据齐备」，
+        // 进而 base64 -d 空输入 / notarytool 空凭据中途硬失败。本钉把 CI 真形态钉死。
+        let out = run_notarize(
+            Path::new("/tmp/fake.app"),
+            None,
+            Creds::Empty,
+            &std::env::var("PATH").unwrap(),
+        );
+        assert!(
+            out.status.success(),
+            "五件套全为空串必须 exit 0（绝不产半签包）；stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("skip:"),
+            "空串形态须走具名 skip；实际: {stdout}"
+        );
+        for v in &CRED_VARS[..5] {
+            assert!(
+                stdout.contains(v),
+                "skip 行须具名全部五个缺失凭据（含 {v}）；实际: {stdout}"
+            );
+        }
+        assert!(
+            stdout.contains("未签名") && stdout.contains("未公证"),
+            "空串跳过时须如实声明未签名/未公证；实际: {stdout}"
         );
     }
 
@@ -519,7 +724,12 @@ mod scripts {
         fs::write(&app, b"untouched").unwrap();
         let before_mtime = fs::metadata(&app).unwrap().modified().unwrap();
         let zip = tmp.path().join("dist/out.zip");
-        let out = run_notarize(&app, Some(&zip), false, &std::env::var("PATH").unwrap());
+        let out = run_notarize(
+            &app,
+            Some(&zip),
+            Creds::None,
+            &std::env::var("PATH").unwrap(),
+        );
         assert!(out.status.success(), "skip 路径必须 exit 0");
         assert!(!zip.exists(), "skip 不得产出 zip（绝不产半签包）");
         assert_eq!(

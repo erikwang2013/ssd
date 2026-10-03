@@ -96,6 +96,11 @@ jobs:
     if: github.event.inputs.packaging == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # 签名凭据（T10 钩子，T11 起 job 级注入）：secrets 未配置 ⇒ 空串 ⇒ package-windows.ps1
+      # 具名 skip（产物 = 未签名包，绝不产半签包）；${{ }} 在 env 段安全（无 shell 展开面）。
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,10 +118,28 @@ jobs:
           if-no-files-found: error
 
   package-macos:
-    # 同 package-windows（手动门控）；zip 架构 = runner 架构（macos-latest 目前 arm64）。
+    # 同 package-windows（手动门控）；zip 架构 = runner 架构（M2 T11 矩阵两腿）：
+    # macos-15 = arm64；macos-15-intel = x64（GitHub 最后一代 Intel 镜像，2027-08 退役）。
+    # fail-fast: false——一腿红不吞另一腿的物证（两腿各自跑产物冒烟）。
     if: github.event.inputs.packaging == 'true'
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15        # arm64
+            arch: arm64
+          - runner: macos-15-intel  # x64（GitHub 最后一代 Intel 镜像，2027-08 退役）
+            arch: x64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    env:
+      # 签名/公证凭据（T10 真链，T11 起 job 级注入）：secrets 未配置 ⇒ 空串 ⇒ notarize.sh
+      # 逐件判空走具名 skip（绝不产半签包，当前 CI 验收面即此路径）。
+      APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -129,6 +152,7 @@ jobs:
       - run: bash scripts/e2e-package-smoke.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: xiaodun-macos-zip
+          # T11 更名：旧 xiaodun-macos-zip 不保留兼容映射（手动 job 无既有消费者，见 README）。
+          name: xiaodun-macos-${{ matrix.arch }}-zip
           path: dist/*.zip
           if-no-files-found: error
