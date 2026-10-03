@@ -431,4 +431,35 @@ mod tests {
         );
         assert!(eof, "短交付 = 已到可得末端");
     }
+
+    #[test]
+    fn ntfs_ext4_entry_without_record_id_rejected_at_record_id_layer() {
+        // 契约 v1.3：缺 recordId 的 NTFS/ext4 旧行是坏行——必须在 recordId 层拒绝（-32603），
+        // 绝不退化为记录 0 / inode 0 的「猜读」。骨架期引擎亦恒 Err，两者只有消息可区分——
+        // 故以消息判定拒绝层归属（T3/T4 填实引擎后此测仍承重：unwrap_or(0) 会被打回）。
+        let (_f, dev) = crate::testutil::dev_from_bytes(&[0u8; 4096]);
+        let e = ScanEntry {
+            idx: 0,
+            name: "X.BIN".into(),
+            path: "/".into(),
+            ext: "bin".into(),
+            size_bytes: 16,
+            deleted: false,
+            is_dir: false,
+            quality: "complete".into(),
+            first_cluster: 6,
+            byte_offset: None,
+            contiguous: None,
+            record_id: None,
+        };
+        for fs in [FsKind::Ntfs, FsKind::Ext4] {
+            match read_entry_range(&*dev, fs, &e, 0, 16) {
+                Err(ReadError::Internal(m)) => assert!(
+                    m.contains("recordId"),
+                    "必须是 recordId 层拒绝（{fs:?}），实得消息：{m}"
+                ),
+                other => panic!("{fs:?}: 缺 recordId 必须 Internal 拒绝，实得 {other:?}"),
+            }
+        }
+    }
 }

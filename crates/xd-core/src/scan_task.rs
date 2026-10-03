@@ -60,8 +60,8 @@ pub enum ProbeError {
     Unsupported,
 }
 
-/// 引导区签名粗筛（唯一 1 次读放大到 2048B——ext4 超级块在 1080，须越过首扇区）。
-/// 判定顺序写死：exFAT → NTFS → ext4 → FAT（FAT 为最粗筛，兜底）。exFAT/NTFS 签名定死；
+/// 引导区签名粗筛（唯一 1 次读放大到 2048B——ext4 超级块在卷内 1024、magic 在 1080，须越过首扇区）。
+/// 判定顺序写死：exFAT → NTFS → FAT → ext4（结构性粗筛在前，仅 2 字节的 magic 判据殿后）。exFAT/NTFS 签名定死；
 /// ext4 认 superblock magic 0xEF53（卷内 1024+56）；FAT 做 0x55AA + BPB 字段合理性粗筛，
 /// 完整校验留给引擎（worker 内 parse 失败 → 任务 failed）。**n 之外的字节不是输入**：
 /// 一切签名判定都以实际读到的 n 为界（设备短读不得误判）。
@@ -76,10 +76,6 @@ pub fn probe(dev: &dyn BlockDevice) -> Result<FsKind, ProbeError> {
     if n >= 11 && &buf[3..11] == b"NTFS    " {
         return Ok(FsKind::Ntfs); // OEM ID（VBR 偏移 3）
     }
-    // ext4：超级块 magic 0xEF53（LE：字节序 0x53,0xEF）位于卷内 1024+56 = 1080（0x438）
-    if n >= 1082 && buf[1080] == 0x53 && buf[1081] == 0xEF {
-        return Ok(FsKind::Ext4);
-    }
     if n >= 512 {
         let bps = u16::from_le_bytes([buf[11], buf[12]]);
         let spc = buf[13];
@@ -92,6 +88,14 @@ pub fn probe(dev: &dyn BlockDevice) -> Result<FsKind, ProbeError> {
         {
             return Ok(FsKind::Fat);
         }
+    }
+    // ext4：超级块 magic 0xEF53（LE：字节序 0x53,0xEF）位于卷内 1024+56 = 1080（0x438）。
+    // 殿后（lead 裁定，规格变更）：ext4 判别仅 2 字节 magic，FAT 判别为 0x55AA+BPB 多字段结构
+    // 粗筛——结构性更强的先判，防 FAT 卷 FAT 表区恰撞 magic 被抢判（FAT16 卷 FAT1 偏移 1080
+    // 的簇 284 项恰为 0xEF53 即此构型）；真 ext4 的 510..511 为 0（或非 BPB 构型）过不了
+    // FAT 闸，判定结果不变。
+    if n >= 1082 && buf[1080] == 0x53 && buf[1081] == 0xEF {
+        return Ok(FsKind::Ext4);
     }
     Err(ProbeError::Unsupported)
 }
@@ -1142,6 +1146,13 @@ mod tests {
             ),
             "n=8：NTFS OEM ID 不完整，不得误判"
         );
+        assert!(
+            matches!(
+                short(10, ntfs_skeleton_image()),
+                Err(ProbeError::Unsupported)
+            ),
+            "n=10：NTFS OEM ID 末字节在 n 之外，不得误判（n>=11 闸门下边界）"
+        );
         // 对照：同内容读满 → 正判（防「一律 Unsupported」的假修复）
         assert_eq!(short(1082, ext4_skeleton_image()).unwrap(), FsKind::Ext4);
         assert_eq!(short(11, ntfs_skeleton_image()).unwrap(), FsKind::Ntfs);
@@ -1173,5 +1184,87 @@ mod tests {
         let (_f, dev) = exfat_fixture();
         let s = m.start(dev).unwrap();
         wait_for_state(&m, s.task_id, ScanState::Completed, Duration::from_secs(10));
+    }
+
+    /// 判定顺序（lead 裁定，规格变更）：exFAT → NTFS → FAT → ext4——结构性粗筛（FAT 的
+    /// 0x55AA+BPB 多字段）先于仅 2 字节的 ext4 magic。歧义卷必须落到靠前判据（引擎随后
+    /// 诚实拒绝是既定代价，spec N-1），顺序本身不得被后续重构静默调换。
+    #[test]
+    fn probe_signature_precedence_is_pinned() {
+        // 公共底板：合法 FAT16 BPB（512B/扇区 · 8 扇区/簇 · 2 FAT · 0x55AA 尾签）
+        let fat_valid = |img: &mut Vec<u8>| {
+            img[11] = 0x00;
+            img[12] = 0x02;
+            img[13] = 8;
+            img[16] = 2;
+            img[510] = 0x55;
+            img[511] = 0xAA;
+        };
+
+        // (a) FAT 合法 BPB + NTFS OEM → Ntfs（NTFS 优先于 FAT 与 ext4）
+        let mut img = vec![0u8; 4096];
+        img[3..11].copy_from_slice(b"NTFS    ");
+        fat_valid(&mut img);
+        let (_f, dev) = crate::testutil::dev_from_bytes(&img);
+        assert_eq!(probe(&*dev).unwrap(), FsKind::Ntfs, "NTFS 先于 FAT");
+
+        // (b) NTFS OEM 与 ext4 magic 同现 → Ntfs（ext4 不得前移）
+        img[1080] = 0x53;
+        img[1081] = 0xEF;
+        let (_f, dev) = crate::testutil::dev_from_bytes(&img);
+        assert_eq!(probe(&*dev).unwrap(), FsKind::Ntfs, "NTFS 先于 ext4");
+
+        // (c) 回归钉（旧序 exFAT→NTFS→ext4→FAT 在本例误判 ext4）：FAT 合法 BPB +
+        //     1080/1081 = EF53 → 必须 Fat。真实构型：FAT16 卷 FAT1 区偏移 1080
+        //     （簇 284 的 FAT 项）恰为 0xEF53——纯签名序会把整卷判给 ext4。
+        let mut img2 = vec![0u8; 4096];
+        img2[3..11].copy_from_slice(b"NOPE    ");
+        fat_valid(&mut img2);
+        img2[1080] = 0x53;
+        img2[1081] = 0xEF;
+        let (_f, dev) = crate::testutil::dev_from_bytes(&img2);
+        assert_eq!(
+            probe(&*dev).unwrap(),
+            FsKind::Fat,
+            "FAT 结构闸先于 ext4 magic"
+        );
+
+        // (d) 抹去 0x55AA 尾签 → FAT 闸不过 → ext4 magic 生效（防 (c) 把真 ext4 一并抢判）
+        img2[510] = 0;
+        img2[511] = 0;
+        let (_f, dev) = crate::testutil::dev_from_bytes(&img2);
+        assert_eq!(probe(&*dev).unwrap(), FsKind::Ext4);
+    }
+
+    /// 骨架三入口的类型化契约：恒 `Err(Unsupported)`——不 panic（崩溃隔离边界内「未实现」
+    /// 不得伪装成崩溃）、不 Ok（不得静默空扫）。`unsupported_fs_skeleton_fails_cleanly` 测的是
+    /// 编排层终态，快扫 panic 会被 catch_unwind 抹平成同一个 failed——此条直接钉引擎边界。
+    #[test]
+    fn skeleton_engines_return_err_without_panic() {
+        let (_f, dev) = crate::testutil::dev_from_bytes(&[0u8; 4096]);
+        assert!(matches!(
+            xd_fs_ntfs::scan_with_observer(&*dev, &mut |_| {}),
+            Err(xd_fs_ntfs::NtfsError::Unsupported(_))
+        ));
+        assert!(matches!(
+            xd_fs_ntfs::unallocated_runs(&*dev),
+            Err(xd_fs_ntfs::NtfsError::Unsupported(_))
+        ));
+        assert!(matches!(
+            xd_fs_ntfs::read_file_range(&*dev, 0, 0, 16),
+            Err(xd_fs_ntfs::NtfsError::Unsupported(_))
+        ));
+        assert!(matches!(
+            xd_fs_ext4::scan_with_observer(&*dev, &mut |_| {}),
+            Err(xd_fs_ext4::Ext4Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            xd_fs_ext4::unallocated_runs(&*dev),
+            Err(xd_fs_ext4::Ext4Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            xd_fs_ext4::read_file_range(&*dev, 0, 0, 16),
+            Err(xd_fs_ext4::Ext4Error::Unsupported(_))
+        ));
     }
 }

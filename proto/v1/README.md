@@ -169,7 +169,8 @@ v0 字段不变，**新增 `transport`**：
 无新错误码。
 
 - `scan.start` 结果 `fs` 值域增 `"ntfs"` | `"ext4"`（`"fat"`/`"exfat"` 不变）——daemon 侧按
-  卷首结构识别（exFAT OEM ID → NTFS OEM ID → ext4 超级块 magic `0xEF53`@1080 → FAT BPB 粗筛），
+  卷首结构识别（exFAT OEM ID → NTFS OEM ID → FAT BPB 粗筛 → ext4 超级块 magic `0xEF53`@1080；
+  ext4 判别仅 2 字节 magic，殿后防 FAT 卷 FAT 表区恰撞 magic 被抢判），
   读到字节数不足以判定时**不猜**（判错 FS 比拒绝更坏）→ `-32002`。
 - `ScanEntry.recordId`（可选 u64，序列化省略缺省）：**FS 元数据记录号**——NTFS = MFT 记录号；
   ext4 = inode 号；fat/exfat/雕刻件缺失。读取路径以它重定位（与 `byteOffset` 分工：后者恒为
