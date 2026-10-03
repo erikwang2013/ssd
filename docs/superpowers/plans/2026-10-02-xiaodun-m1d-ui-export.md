@@ -728,11 +728,11 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 - Create: `ui/lib/features/preview/{preview_page.dart, preview_controller.dart}`
 - Create: `ui/test/preview_page_test.dart`
 
-**PreviewController：** 按 ext 分派：图片（jpg/jpeg/png）→ **分片拉全量**（1MiB/次循环到 eof，上限 32MiB——超限显示"文件过大，暂不支持预览"）→ `Image.memory`（含 `errorBuilder`：数据坏时显示"数据损坏，无法预览"而非红屏）；文本（txt/log/md/json…）→ 前 256KiB → `SelectableText`（utf8 allowMalformed）；其它 → 仅信息卡。信息卡恒显：名称/路径/大小/删除状态/质量徽标/`byteOffset`（雕刻件展示"偏移"）；**exFAT VDL 说明**：若 `sizeBytes < 实际可读` 无从得知（契约不含 DL）→ 不显示猜测，仅对短交付显示「实际数据短于声明大小」。
+**PreviewController：** 按 ext 分派：图片（jpg/jpeg/png）→ **分片拉全量**（1MiB/次循环到 eof，上限 32MiB——超限显示"文件过大，暂不支持预览"）→ `Image.memory`（含 `errorBuilder`：数据坏时显示"数据损坏，无法预览"而非红屏；**T7 归档硬化 `cacheWidth: 2048`**（防大图按原始分辨率解码 OOM））；文本（txt/log/md/json…）→ 前 256KiB → `SelectableText`（utf8 allowMalformed）；其它 → 仅信息卡。信息卡恒显：名称/路径/大小/删除状态/质量徽标/`byteOffset`（雕刻件展示"偏移"）；**exFAT VDL 说明**：若 `sizeBytes < 实际可读` 无从得知（契约不含 DL）→ 不显示猜测，仅对短交付显示「实际数据短于声明大小」。
 
 - [ ] **Step 1: 页面结构（规范级）**：AppBar=displayName；body=加载态→内容；底部信息卡；[恢复此文件] 按钮 → RecoverPage(taskId,[idx])。
 - [ ] **Step 2: preview_page_test.dart**
-1. 图片：Fake 分两片返回 TINY_PNG（68B）→ 断言两次 `fsRead`（offset 0/68? 第二片 length 到 eof）、`Image.memory` 出现（`find.byType(Image)`）。
+1. 图片：Fake 分两片返回 TINY_PNG（**67B**——T7 归档勘误：原 68B 系笔误，实测 67B 且真可解码；Rust 夹具 70B 为另一物）→ 断言两次 `fsRead`（offset 0/67 第二片 length 到 eof）、`Image.memory` 出现（`find.byType(Image)`）。
 2. 损坏图片：返回随机字节 → errorBuilder 文案出现。
 3. >32MiB：Fake 报 sizeBytes 大 → 不调用 fsRead、显示"文件过大"。
 4. 文本：返回 UTF-8 中文 → SelectableText 内容匹配。
@@ -857,6 +857,17 @@ Scaffold('恢复文件')
 - **★ F1（spec+qual 双抓，高危真缺口）**：`entry_tile` 的 `true` 臂不看 quality → 删除+连续+`maybeDamaged`（**删后被部分复用=必经场景**）文案「完整性高」与徽标「可能损坏」打架，且与引擎「位图逐簇全空才算 Complete」冲突 → 门控 `true when quality=='complete'` + `null`→`_`（穷尽性，spec 的"一行"实为两处）+ 测试（含未知档前向兼容）。
 - **qual 变异 12 条**：8 KILL；3 缺口补测（G1 `_generation` 仓库零回归网→移植 P8a/P8b 脚本化 client；G2 未知档整记录断言；G3 降序点选）；`false,complete` 软冲突 by-design over-warn（记录）。**FAT 删除文案裁定：维持保守「恢复质量见分级」**——更正后的理由：fat 分级虽逐簇查 FAT 表，但「假设 run 空闲」≠文件真实簇序（碎片化不可考），且 null 混迁移前 exFAT 旧行（链读），无措辞对三义皆成立。
 - 过程趣闻：spec 曾报"并发写者告警"——实为 qual 的变异作业（改-测-还原），确认后已把「qual 变异振荡属正常」记入团队记忆。
+
+### T7（预览页）—— impl-m1d-t7。（跨会话续跑：实现 `c4078cc` 在上会话完成，本会话评审关闭——上会话中断遗留 qual 变异残骸 `offset +=`，lead 还原后重启管线。）提交沿革：`c4078cc`（主）→ `1f27824`（-32009 同文案追补）→ `425b6f9`（qual 补测八枚）→ `a3db50e`（P2 硬化）。DONE → spec **PASS** → qual ISSUES（14 存活变异）→ 补测有牙 + P2 修复 → qual 增量 **APPROVED**（T7 关闭；80+1 跳过 / 带 daemon 81/0）
+
+- **交付**：预览页 7→15 枚测试（计划六枚 + 导航 + 8 补测）；ext 三分派（jpg/jpeg/png 图片、txt/log/md/json 文本、其余仅信息卡）；1MiB 分片循环到 eof（上限 32MiB：恰界放行、+1 零读取拒绝）；文本 256KiB 前缀 utf8(allowMalformed)；信息卡恒显（byteOffset「偏移」仅非空显示——"不猜 VDL"）；短交付判定 `eof && 实收<声明`（实收>声明不报）；`QualityBadge`/`entryQualityNote` 由 entry_tile 提取为上收件（零行为变化）；-32009 与本地 cap 同文案「文件过大，暂不支持预览」且原始 `Entry too large` 不泄漏 UI。
+- **P2 硬化（qual 抓，lead 裁定本轮落地）**：`Image.memory(cacheWidth: 2048)` 封大图原分辨率解码 OOM 面（`ResizeImage` 默认 allowUpscaling=false，小图零代价）；钉测 `ResizeImage.width==2048`；残余 PNG 解码瞬态归 M4/M5。
+- **spec 独立核验**：8 枚探针全绿；两条契约外防御分支"两读"（删防御①非 eof 零交付 → 探针红；删防御②越上限 → 探针红）；残留变异 `offset +=` 独立 kill（探针 3 红 + 仓库套件挂死=死循环防线本体）；cap 恰界/短交付四边界/错误映射双路/信息卡字段。**计划 68B 系笔误**（实测 67B、Rust 夹具 70B）→ 本归档修订任务书。
+- **qual 变异 24 条**：10 KILL → 14 SURVIVE 全为测试缺口（分派臂 png/json、cap `>`/`>=`、短交付去 `eof &&`、allowMalformed、null 偏移照显、`_disposed` 守卫、循环防御行、ext toLowerCase 等）→ 8 枚补测成品（+161 行）**14/14 KILL 归因干净**；P2 落码后仓库侧 **24/24 KILL**（新增 M20 删 cacheWidth=KILL）。
+- **工件更替记录**：qual 权威件 v1（`4ebeae…`）CI format 门禁不过 → qual 落地期重写 v2（`32629c…`/399 行）；impl 对 v1 的机械 format 结果与 v2 **逐字节相同**（cmp exit 0；6 处纯空白/换行逐处记录）。**裁定：绑定 v2**（`32629c98…`），v1 废止。
+- **记录级偏差（裁定归档）**：① 提交信息非逐字（T6 先例）；② 超 Files 清单改 2 文件（QualityBadge 提取 + results_page 调用点透传=编译必需，无夹带）；③ 68B 笔误修订。
+- **P3/P4 记录不修（归 M4/M5）**：P3 文本 >256KiB 无截断提示；P3 同位重建 State 复用（**T8/T9 勿在同槽位重建 PreviewPage**）；P4：eof 检查先于越限（撒谎件 ≤33MiB 界内多收 1 片）、takeBytes 2× 峰值 ≤66MiB+base64 瞬态、失败臂无重试按钮、QualityBadge 第三消费者出现时按 util/errors 先例上收。
+- **移交 T8/T9**：T8=RecoverPage 接导出链路时同步 `preview_page.dart:51` 调用点（传 client）；错误映射复用 `describeCoreError`；-32006/-32010 文案按计划 773。T9=-32009 集成须用文本件（图片被 32MiB 本地截先行）；雕刻件预览断言 `fsRead(idx)`+字节；qual 24 条变异并入 T9 抽检池。未验证：真 daemon 分片/eof 行为、-32009 真路径、大图真解码耗时/内存、eof+cap 同片多收。
 
 ---
 
