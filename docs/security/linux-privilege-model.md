@@ -164,6 +164,11 @@ reap 完成～state 落定之间的 µs 级窗内该 pid 已被回收，理论�
 以上均由非 root 用户身份执行（CI 免密 sudo 建环回，daemon 以 root 起、无 `PKEXEC_UID`
 ⇒ 按设计**不降权**，stderr 留痕）——即：**覆盖面止于「流程与校验」，降权臂本身仍待真机**。
 
+**非 unix 构建边界（T9 可移植性修复链）**：Windows/macOS 编译档下，同盘校验与导出取消**显式拒绝**
+（`PlatformUnsupported` → -32603 + stderr 留痕，不静默放行——「写回源盘」的防护不得无声通过）；
+余量预检因无 `statvfs` 打 warn 后跳过（UX 预检非安全边界，写失败由逐件 degraded/failed 报告兜底）。
+平台层真实现（`GetDiskFreeSpaceEx` 等）归 M1e-tail；CI 3 OS 矩阵已绿（含 Windows 全 workspace 测试）。
+
 **未验证（需真机 root/pkexec）**——本机非 root，集成/单测只覆盖纯决策函数（`drop_plan`）：
 - [ ] 真机 pkexec 拉起后导出：落盘文件属主 == `PKEXEC_UID` 用户（进程未降权时会是 root）。
 - [ ] `setgroups(0)` 生效（`/proc/<pid>/status` 的 `Groups` 为空，无残留附加组）。

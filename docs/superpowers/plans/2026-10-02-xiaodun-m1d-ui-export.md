@@ -481,9 +481,9 @@ impl ExportManager {
 1. `idxs` 去重非空、≤ MAX_IDXS，否则 `NoEntries`/`Internal`（handlers 侧把空/超限映射为 -32602）。
 2. 逐 idx `store.entry(task_id, idx)` → 缺任一 → `EntryNotFound`；`estimated = Σ size_bytes`。
 3. 目标校验（unix）：
-   - `PathBuf::from(target_dir)`：不存在/非目录 → `TargetNotWritable(dir)`。
-   - `source_rdev = Some(rdev)` 时：`rustix::fs::stat(target)` 的 `st_dev`（拆 major/minor）== rdev → `TargetOnSource(dir)`。
-   - `rustix::fs::statvfs(target)` → `f_bavail * f_frsize < estimated` → `InsufficientSpace(estimated)`。
+   - `PathBuf::from(target_dir)`：不存在/非目录 → `TargetNotWritable(dir)`。（平台中性检查，先于 cfg 臂）
+   - `source_rdev = Some(rdev)` 时：`st_dev`（拆 major/minor）== rdev → `TargetOnSource(dir)`。（**T9 归档同步**：实现改用 `std::os::unix::fs::MetadataExt::dev(&md)` 复用同一 metadata 快照——跨 Linux/macOS 类型统一；同盘判定整组 `#[cfg(unix)]`）
+   - `statvfs(target)` → `f_bavail * f_frsize < estimated` → `InsufficientSpace(estimated)`。（**T9 归档同步**：`#[cfg(unix)]`；非 unix 无 statvfs → warn 后**跳过余量预检**——UX 预检非安全边界，写失败逐件 degraded/failed 兜底；非 unix 的同盘校验/取消为显式 `PlatformUnsupported`，真实现归 M1e-tail）
 4. 起子进程：`Command::new(std::env::current_exe()?)` `.arg("--export-worker").arg("--db").arg(db_path).arg("--task").arg(task_id.to_string()).arg("--export-id").arg(id).arg("--target").arg(target_dir)`，`pkexec_uid` 时 `.env("PKEXEC_UID", uid)`（继承即可——子自行读）；stdin piped（写 idxs JSON 数组后 `drop(stdin)`），stdout piped，stderr 继承（留痕）。
 5. 转发线程：`BufReader::new(child.stdout).lines()` → 按 `type` 分派：
    - `"progress"` → 节流 ≥250ms 转发 `export.progress`（字段透传）；
@@ -882,6 +882,18 @@ Scaffold('恢复文件')
 - **记录不修（归 M4/M5）**：`start()` 不清 `_report`（单引用被下次 finished 替换、exporting 不渲染 → 无泄漏/无陈旧显示，清理代价大于收益）；非 Linux SnackBar 臂无测试缝；清单渲染非懒加载（≤1000 量级可接受）；cancel 后 `_error` 瞬态残留。
 - **★ 环境前置（T9 首步）**：GATE2（XD_DAEMON_BIN 集成）红——target 中 daemon 二进制过期（构建早于 T3 起全部引擎改动），报 `-32601 Method not found: fs.read`；父提交 94c61fb 同红，**非 T8 回归**。T9 首步 `cargo build`（debug+release）刷新后复跑确认。
 - **移交 T9**：集成须覆盖真 daemon exportId 过滤与至少一次真抢跑时序；-32006/-32010 可直接断言 UI 文案；不得引入真 xdg-open 进程断言；变异池 54 枚可抽检（`matrix2_result.json`）；-32009 集成须用文本件（>64MiB）；雕刻件预览断言 `fsRead(idx)`+字节。未验证：真 GTK 弹窗、真 xdg-open、真 daemon 全流程（GATE2 绿态待刷新复跑）。
+
+### T9（全链路集成测试 + 出口验收）—— impl-m1d-t9。提交沿革：`6cc05db`（夹具 example）→ `cf36919`（Dart 全链路集成）→ `8a79df8`（e2e-loop 增段）→ `4cc5a54`（EPIPE 观测快路径=前存假红修复）→ `7fc6601`（出口文档）→ **可移植性修复链** `e4b59c9` → `f44efb1` → `b349d14` → `5a1ae39` → `c069efa`（qual A/B 补覆盖落码）。DONE → spec **PASS**（5 偏离全 ACCEPT）→ qual **APPROVED**（Step 4 七项 + 附加矩阵 + 三笔链终审）→ T9 关闭
+
+- **交付**：Rust 夹具 example `make_carve_fixture`（live 4141B / 删除 65536B / 雕刻 2045B@96768 / 坏卡声明大件 BIG.TXT 68157441）；Dart 真 daemon 全链路（quick 扫描 → fsRead 逐字节 → **-32009 同文案** → 深扫雕刻回读逐字节 → **两笔并发导出**：exportId 互异 + 报告 2/0/0 与 1/0/0 + 落盘逐字节 + 订阅先行全量寄存两序）；`e2e-loop.sh` 3c/3d（**真环回挂载**导出断言 -32006 + umount 后逐字节 `cmp skip=26112 count=2045`）；README / security §6 / 设计 §4.5 文档。**ci.yml 原计划增补零 diff**（`cargo build -p xd-daemon` 前置 + `XD_DAEMON_BIN` 早在 `bbca93f`；本轮新增仅 `--no-fail-fast` 见下）。
+- **★ 可移植性修复链（并行预推 CI 在出口前抓出 3 OS 编译/运行回归；本会话最大增量）**：macOS `st_dev` i32/u64（→ `MetadataExt::dev` 统一 u64）；Windows 三批 unix-only 未门控（`rustix::process`/`Errno::SRCH`/测试 symlink → `statvfs` → `check_space` dead_code，最后一处由 impl **cfg-flip 探针**自抓）；Windows 运行期 1 枚（`-32008` 用例 unix 路径字面量撞 `is_absolute()` 边界校验 → tempdir 绝对路径中立化）；ci.yml `--no-fail-fast`（申报偏离——前 3 轮 fail-fast 下 Windows 从未跑到 xd-daemon 测试目标，逐轮只见 1 红）。
+- **可移植性裁定（lead）**：非 unix 同盘校验/取消 = **显式 `PlatformUnsupported`**（-32603 + 留痕，不静默）；**余量预检特例 = warn 后跳过**（UX 预检非安全边界、逐件 degraded 兜底、保住 Windows 测试矩阵运行资格）；真实现归 M1e-tail。
+- **qual A/B 补覆盖（产出 → `git apply` 逐字节落码，blob 级复核）**：多片导出 4MiB+1 逐字节（A2 偏移不推进变异 = **只有逐字节比对能杀**——终报仍 succeeded=1、长度正确、首差字节 @4194304）+ EPIPE 宽夹具硬化（B0 对照臂直证旧窗静默通过；`dir_names<30`）。A3「CHUNK 改小」不红属可观测等价变异（lead 期望被实证驳回，接受）。
+- **Step 4 七项（qual 全 KILL/记录核验，带重编译实证）**：eof 恒 true/false（4/8 红）；skip_bytes fat+exfat；雕刻 run 界（恰 1 红）；重名去重；sanitize；降权（记录项，与 security §6/e2e/README 三处口径一致）；cancel kill。附加：A1d 旧 /proc 慢扫**不稳定红**（承重成立）。
+- **CI 沿革（并行预跑 4 轮）**：`37106733704`（macos 类型 + windows 6 错）→ `37107356111`（macos ✓、windows 1 错）→ `37107808841`（编译全绿、windows 1 运行期）→ `37108287985` **5/5 全绿**（Windows 首次全 workspace 跑通且含 e2e-loop 的 ubuntu 真跑）。
+- **本地不可跑项**：e2e-loop 无免密 sudo → **特权容器真跑逐字脚本**（`LOOP E2E OK`：-32006 拒 + 逐字节 == 埋点）；真 pkexec 降权 / 真 GTK 弹窗 / 真 xdg-open 未验证（security 清单一致）；真实 cf 交叉编译被 libsqlite3-sys C 构建挡 → cfg-flip 探针为等价替代。
+- **记录不修（归 M4/M5）**：eprintln 未含 M1e-tail 字样（指向在模块 doc/注释）；A1a zombie 封口无回归测试（vacuous-pass 低危）；`formatBytes` 类同 T8。
+- 未验证：真机 root/pkexec；CI 2vCPU 实测耗时（按本机外推，超时余量 ≥30×）；B 断言 30× 余量极端压测。
 
 ---
 
