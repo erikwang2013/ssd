@@ -528,6 +528,235 @@ fn vdl_zero_with_dl_positive_returns_empty() {
     assert!(read_file(&dev, &e).unwrap().is_empty(), "VDL=0 → 空交付");
 }
 
+/// range/全读对拍：对同一镜像同一拓扑，`read_file_range` 的每个窗口必须逐字节等于
+/// `read_file` 的对应切片（含短交付截断点——差分测试，range 版不得有独立裁定）。
+fn assert_range_matches_full(dev: &dyn xd_device::BlockDevice, name: &str) {
+    // (offset, length)：含簇界横跨、恰界、越尾、整读、零长、超大 length（不物化整文件的旁证）
+    const CASES: [(u64, u64); 9] = [
+        (0, 10),
+        (4090, 20),
+        (4096, 1),
+        (8192, 9000),
+        (8999, 2),
+        (9000, 1),
+        (12000, 500),
+        (0, 1 << 40),
+        (0, 0),
+    ];
+    let e = scan(dev)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap();
+    let full = read_file(dev, &e).unwrap();
+    for (off, len) in CASES {
+        let got = read_file_range(dev, &e, off, len).unwrap();
+        let s = off.min(full.len() as u64) as usize;
+        let t = (off + len).min(full.len() as u64) as usize;
+        assert_eq!(
+            got,
+            &full[s..t],
+            "{name} offset={off} len={len}（全读 {} 字节）",
+            full.len()
+        );
+    }
+}
+
+#[test]
+fn ranged_read_matches_full_read_slices() {
+    // 五种拓扑 × 九组窗口：live 连续 / live 链式（乱序簇）/ 删除连续 / 删除 stale 链 /
+    // 删除+中段被占（短交付）——range 恒等于全读切片（同裁定，零独立行为）
+    let d9000: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+    let d12000: Vec<u8> = (0..12000u32).map(|i| (i % 239) as u8).collect();
+    let cases: [(&str, Vec<u8>); 5] = [
+        (
+            "V.BIN",
+            xd_fixtures::ExfatImageBuilder::new()
+                .add_file("/", "V.BIN", &d9000)
+                .build(),
+        ),
+        (
+            "F.BIN",
+            xd_fixtures::ExfatImageBuilder::new()
+                .add_file_in_clusters("/", "F.BIN", &d9000, &[7, 6, 8], false)
+                .build(),
+        ),
+        (
+            "G.BIN",
+            xd_fixtures::ExfatImageBuilder::new()
+                .add_file("/", "G.BIN", &d9000)
+                .delete("/", "G.BIN")
+                .build(),
+        ),
+        (
+            "G.BIN",
+            xd_fixtures::ExfatImageBuilder::new()
+                .add_file_chained("/", "G.BIN", &d9000)
+                .delete("/", "G.BIN")
+                .build(),
+        ),
+        (
+            "G.BIN",
+            xd_fixtures::ExfatImageBuilder::new()
+                .add_file("/", "G.BIN", &d12000)
+                .delete("/", "G.BIN")
+                .add_file_in_clusters("/", "NEW.BIN", &[5u8; 100], &[7], true)
+                .build(),
+        ),
+    ];
+    for (name, image) in cases {
+        let (_f, dev) = dev_for(&image);
+        assert_range_matches_full(&dev, name);
+    }
+    // 截断设备（物理尾在簇 7 中段）：全读短交付 4096+200，range 同点截断
+    let truncated = {
+        let image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file("/", "A.BIN", &d9000)
+            .build();
+        image[..32 * 512 + 4 * 4096 + 4096 + 200].to_vec()
+    };
+    let (_f, dev) = dev_for(&truncated);
+    assert_range_matches_full(&dev, "A.BIN");
+    // 破损 live 链（FAT[6]=EOC → 单个簇前缀）与自环链（首个回访点前截断）
+    let broken = {
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_chained("/", "A.BIN", &d9000)
+            .build();
+        image[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        image
+    };
+    let (_f, dev) = dev_for(&broken);
+    assert_range_matches_full(&dev, "A.BIN");
+    let looped = {
+        let mut image = xd_fixtures::ExfatImageBuilder::new()
+            .add_file_in_clusters("/", "L.BIN", &d9000, &[6, 7, 8], false)
+            .build();
+        image[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&6u32.to_le_bytes());
+        image
+    };
+    let (_f, dev) = dev_for(&looped);
+    assert_range_matches_full(&dev, "L.BIN");
+}
+
+#[test]
+fn ranged_read_offset_beyond_end_is_empty() {
+    let data: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+    let image = xd_fixtures::ExfatImageBuilder::new()
+        .add_file_with_vdl("/", "V.BIN", &data, 5000) // 交付上界 = VDL = 5000
+        .build();
+    let (_f, dev) = dev_for(&image);
+    let e = scan(&dev)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "V.BIN")
+        .unwrap();
+    assert_eq!(e.size_bytes, 5000);
+    assert!(
+        read_file_range(&dev, &e, 5000, 100).unwrap().is_empty(),
+        "越尾"
+    );
+    assert!(read_file_range(&dev, &e, 0, 0).unwrap().is_empty(), "零长");
+    assert_eq!(
+        read_file_range(&dev, &e, 4999, 100).unwrap(),
+        data[4999..5000],
+        "末字节短交付"
+    );
+    assert_eq!(
+        read_file_range(&dev, &e, 4999, u64::MAX).unwrap(),
+        data[4999..5000],
+        "length 无上界不 panic、不越 VDL"
+    );
+    assert!(
+        read_file_range(&dev, &e, u64::MAX, 1).unwrap().is_empty(),
+        "offset 极大"
+    );
+}
+
+#[test]
+fn ranged_read_deleted_stale_chain_stops_at_occupied() {
+    // 删除+非连续+簇 7/8 被复用：全读只交付首簇（4096）。range 必须同点截断——
+    // offset 落截断点之后 → 空；跨窗口 → 短交付前缀；绝不跳过被占簇续读
+    let data: Vec<u8> = (0..9000u32).map(|i| (i % 239) as u8).collect();
+    let image = xd_fixtures::ExfatImageBuilder::new()
+        .add_file_chained("/", "OLD.BIN", &data)
+        .delete("/", "OLD.BIN")
+        .add_file_in_clusters("/", "NEW.BIN", &[5u8; 4500], &[7, 8], false)
+        .build();
+    let (_f, dev) = dev_for(&image);
+    let e = scan(&dev)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "OLD.BIN")
+        .unwrap();
+    assert_eq!(read_file(&dev, &e).unwrap().len(), 4096);
+    assert_eq!(read_file_range(&dev, &e, 0, 9000).unwrap(), data[..4096]);
+    assert_eq!(read_file_range(&dev, &e, 0, 100).unwrap(), data[..100]);
+    assert_eq!(
+        read_file_range(&dev, &e, 4000, 200).unwrap(),
+        data[4000..4096]
+    );
+    assert!(read_file_range(&dev, &e, 4096, 100).unwrap().is_empty());
+    assert!(
+        read_file_range(&dev, &e, 5000, 100).unwrap().is_empty(),
+        "offset 越截断点 → 空（不得从被占簇续读）"
+    );
+}
+
+#[test]
+fn ranged_read_deleted_unreachable_is_empty() {
+    // 可达界卫（range 版）：链 253→6→7 无回访但越过可达（253 是末簇，reachable=1 < need=3）
+    // → 空交付；删界卫则沿链交付 [253,6,7] 的 12288 字节错位数据
+    let image = xd_fixtures::ExfatImageBuilder::new()
+        .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[253], false)
+        .delete("/", "OLD.BIN")
+        .build();
+    let mut patched = image.clone();
+    let stream = SET + 32;
+    patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+    patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3
+    patched[FAT_B + 253 * 4..FAT_B + 253 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // FAT[253]=6
+    patched[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&7u32.to_le_bytes()); // FAT[6]=7
+    refix_deleted_checksum(&mut patched, SET, 3);
+    let (_f, dev) = dev_for(&patched);
+    let e = scan(&dev).unwrap().into_iter().find(|e| e.deleted).unwrap();
+    assert_eq!(
+        read_file(&dev, &e).unwrap(),
+        Vec::<u8>::new(),
+        "全读同判（前提）"
+    );
+    assert!(
+        read_file_range(&dev, &e, 0, 4096).unwrap().is_empty(),
+        "物理不可能的链 → 空（不得交付错位字节）"
+    );
+}
+
+#[test]
+fn ranged_read_deleted_revisit_is_empty() {
+    // 前缀回访（range 版）：删除+非连续、链 [6,6,…]（FAT[6]=6 自环、簇 6 位图空闲——
+    // 界卫不拦：reachable=249 ≥ need=3）→ 查重必须空交付；删查重则重复交付同一簇 3 次（伪造序）
+    let image = xd_fixtures::ExfatImageBuilder::new()
+        .add_file_in_clusters("/", "OLD.BIN", &[7u8; 4000], &[6], false)
+        .delete("/", "OLD.BIN")
+        .build();
+    let mut patched = image.clone();
+    let stream = SET + 32;
+    patched[stream + 8..stream + 16].copy_from_slice(&12288u64.to_le_bytes()); // VDL
+    patched[stream + 24..stream + 32].copy_from_slice(&12288u64.to_le_bytes()); // DL：need=3
+    patched[FAT_B + 6 * 4..FAT_B + 6 * 4 + 4].copy_from_slice(&6u32.to_le_bytes()); // 自环
+    refix_deleted_checksum(&mut patched, SET, 3);
+    let (_f, dev) = dev_for(&patched);
+    let e = scan(&dev).unwrap().into_iter().find(|e| e.deleted).unwrap();
+    assert_eq!(
+        read_file(&dev, &e).unwrap(),
+        Vec::<u8>::new(),
+        "全读同判（前提）"
+    );
+    assert!(
+        read_file_range(&dev, &e, 0, 4096).unwrap().is_empty(),
+        "回访链 → 空（不得重复交付同一簇）"
+    );
+}
+
 #[test]
 fn pick_bitmap_prefers_active_and_falls_back() {
     // 纯函数级：texFAT 双位图选择（随 pick_bitmap 迁入本模块）

@@ -6,7 +6,7 @@ pub mod bpb;
 pub mod dirent;
 pub mod fat;
 pub mod freespace;
-mod read;
+pub mod read;
 pub mod scan;
 
 #[cfg(test)]

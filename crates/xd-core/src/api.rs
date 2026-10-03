@@ -20,6 +20,11 @@ pub struct ScanEntry {
     /// 雕刻条目在未分配空间内的起始字节坐标；FS 条目恒 None（序列化省略）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_offset: Option<u64>,
+    /// exfat 专用拓扑提示：`Some(true)` = NoFatChain（规范保证连续）；`Some(false)` = 走 FAT 链。
+    /// fat/carved/迁移前旧行为 None（序列化省略）——反构造读取时按 `false` 处理（只信链，
+    /// 不猜连续）；旧客户端缺省解析为 None，语义与 M1d 前一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contiguous: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +73,32 @@ pub struct ScanResultsParams {
     pub limit: u64,
     #[serde(default)]
     pub deleted_only: bool,
+}
+
+/// `fs.read` 参数（契约 v1.2）：`length` ∈ 1..=1048576，由 handlers 校验。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsReadParams {
+    pub task_id: u64,
+    pub idx: u64,
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// `export.start` 参数（契约 v1.2）：`idxs` 去重后非空且 ≤100000，`targetDir` 为绝对路径。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportStartParams {
+    pub task_id: u64,
+    pub idxs: Vec<u64>,
+    pub target_dir: String,
+}
+
+/// `export.cancel` 参数（契约 v1.2）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportIdParams {
+    pub export_id: u64,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -161,6 +192,47 @@ impl RpcError {
         Self {
             code: -32005,
             message: "Cannot determine free space".into(),
+        }
+    }
+
+    /// -32006：恢复目标落在源设备上（`st_dev(目标) == st_rdev(源块设备)`，或目标所在文件系统
+    /// 设备位于源设备节点之下——盘级祖先判定；root 降权前判定）。
+    pub fn target_on_source(dir: &str) -> Self {
+        Self {
+            code: -32006,
+            message: format!("Target is on the source device: {dir}"),
+        }
+    }
+
+    /// -32007：目标目录不存在/非目录/不可写。
+    pub fn target_not_writable(dir: &str) -> Self {
+        Self {
+            code: -32007,
+            message: format!("Target not writable: {dir}"),
+        }
+    }
+
+    /// -32008：条目不存在（`taskId`+`idx` 无此条目）。
+    pub fn entry_not_found(idx: u64) -> Self {
+        Self {
+            code: -32008,
+            message: format!("Entry not found: {idx}"),
+        }
+    }
+
+    /// -32009：条目过大（`fs.read` 预览上限，导出不受此限）。
+    pub fn entry_too_large(size: u64) -> Self {
+        Self {
+            code: -32009,
+            message: format!("Entry too large: {size}"),
+        }
+    }
+
+    /// -32010：目标盘余量不足（`need` = 预估交付字节上界）。
+    pub fn insufficient_space(need: u64) -> Self {
+        Self {
+            code: -32010,
+            message: format!("Insufficient space on target: need {need} bytes"),
         }
     }
 

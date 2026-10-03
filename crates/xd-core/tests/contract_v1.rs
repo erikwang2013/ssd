@@ -15,10 +15,11 @@ fn golden(name: &str) -> serde_json::Value {
     serde_json::from_str(text.trim()).unwrap_or_else(|e| panic!("parse {name}: {e}"))
 }
 
-/// golden 集合收口：新增/删除契约文件必须同步改测试（23 个 = v1 冻结 21 + M1c 雕刻页 1
-/// + M1c -32005 错误页 1）。
+/// golden 集合收口：新增/删除契约文件必须同步改测试（36 个 = v1 冻结 21 + M1c 雕刻页 1 +
+/// M1c -32005 错误页 1 + M1d v1.2 增量 13）。Dart 侧同款集合测试见
+/// `ui/test/protocol_v1_test.dart`——改一侧必红，两侧同步。
 #[test]
-fn golden_set_is_exactly_the_23_contract_files() {
+fn golden_set_is_exactly_the_36_contract_files() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto/v1/examples");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
@@ -29,9 +30,22 @@ fn golden_set_is_exactly_the_23_contract_files() {
         "device_list.request.json",
         "device_list.response.json",
         "error_device_permission.response.json",
+        "error_entry_not_found.response.json",
+        "error_entry_too_large.response.json",
+        "error_insufficient_space.response.json",
+        "error_target_not_writable.response.json",
+        "error_target_on_source.response.json",
         "error_task_not_active.response.json",
         "error_unallocated_unavailable.response.json",
         "error_unsupported_fs.response.json",
+        "export_cancel.request.json",
+        "export_cancel.response.json",
+        "export_finished.notification.json",
+        "export_progress.notification.json",
+        "export_start.request.json",
+        "export_start.response.json",
+        "fs_read.request.json",
+        "fs_read.response.json",
         "ping.request.json",
         "ping.response.json",
         "scan_cancel.request.json",
@@ -355,4 +369,208 @@ fn error_constructor_messages_pin_contract_text() {
             message: "Internal error".into(),
         }
     );
+
+    // v1.2 五码：参数化反钉（qual-m1d-t1）——调用值刻意异于 golden 值，
+    // 构造器若退化为硬编码 golden 值，此处必红。
+    assert_eq!(
+        RpcError::target_on_source("/media/stick/Recovered"),
+        RpcError {
+            code: -32006,
+            message: "Target is on the source device: /media/stick/Recovered".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::target_not_writable("/tmp/ro"),
+        RpcError {
+            code: -32007,
+            message: "Target not writable: /tmp/ro".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::entry_not_found(7),
+        RpcError {
+            code: -32008,
+            message: "Entry not found: 7".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::entry_too_large(67108865), // 64MiB + 1：README「预览上限 64MiB」语义边界
+        RpcError {
+            code: -32009,
+            message: "Entry too large: 67108865".into(),
+        }
+    );
+    assert_eq!(
+        RpcError::insufficient_space(999),
+        RpcError {
+            code: -32010,
+            message: "Insufficient space on target: need 999 bytes".into(),
+        }
+    );
+}
+
+#[test]
+fn v12_request_goldens_typed_params() {
+    // 契约 v1.2（M1d）：请求 envelope 全等 + params 强类型逐字段。
+    let fr = request_golden("fs_read.request.json", 21, "fs.read");
+    let p: FsReadParams = serde_json::from_value(fr.params.clone().unwrap()).unwrap();
+    assert_eq!(p.task_id, 1);
+    assert_eq!(p.idx, 0);
+    assert_eq!(p.offset, 0);
+    assert_eq!(p.length, 16);
+
+    let es = request_golden("export_start.request.json", 22, "export.start");
+    let p: ExportStartParams = serde_json::from_value(es.params.clone().unwrap()).unwrap();
+    assert_eq!(p.task_id, 1);
+    assert_eq!(p.idxs, vec![0, 1]);
+    assert_eq!(p.target_dir, "/home/user/Recovered");
+
+    let ec = request_golden("export_cancel.request.json", 23, "export.cancel");
+    let p: ExportIdParams = serde_json::from_value(ec.params.clone().unwrap()).unwrap();
+    assert_eq!(p.export_id, 1);
+
+    // 强类型字段名即契约 camelCase：缺键/改名必 decode 失败（反向钉死）。
+    assert!(
+        serde_json::from_value::<FsReadParams>(serde_json::json!({
+            "task_id": 1, "idx": 0, "offset": 0, "length": 16
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ExportStartParams>(serde_json::json!({
+            "taskId": 1, "idxs": [0], "target_dir": "/x"
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<ExportIdParams>(serde_json::json!({"export_id": 1})).is_err());
+    // 负值/别名反钉（qual-m1d-t1）：u64 必须拒绝负数；未知别名不得解码。
+    assert!(
+        serde_json::from_value::<ExportStartParams>(serde_json::json!({
+            "taskId": 1, "idxs": [-1], "targetDir": "/x"
+        }))
+        .is_err(),
+        "negative idx must be rejected"
+    );
+    assert!(
+        serde_json::from_value::<ExportIdParams>(serde_json::json!({ "eid": 1 })).is_err(),
+        "unknown alias must not decode"
+    );
+}
+
+#[test]
+fn fs_read_response_matches_golden() {
+    // bytesBase64 = "hello, xiaodun!"（15 字节）的 base64；eof=true（短交付即条目尾）。
+    let (_, result) = ok_result("fs_read.response.json");
+    assert_eq!(
+        result["bytesBase64"],
+        serde_json::json!("aGVsbG8sIHhpYW9kdW4h")
+    );
+    assert_eq!(result["eof"], serde_json::json!(true));
+}
+
+#[test]
+fn export_start_and_cancel_responses_match_golden() {
+    let (_, result) = ok_result("export_start.response.json");
+    assert_eq!(result["exportId"], serde_json::json!(1));
+    assert_eq!(result["fileCount"], serde_json::json!(2));
+    assert_eq!(result["estimatedBytes"], serde_json::json!(16007));
+
+    // state ∈ "canceled" | "completed"（终态幂等原样返回）；非 ScanState 枚举，逐字钉死。
+    let (_, result) = ok_result("export_cancel.response.json");
+    assert_eq!(result["exportId"], serde_json::json!(1));
+    assert_eq!(result["state"], serde_json::json!("canceled"));
+}
+
+#[test]
+fn export_progress_notification_matches_golden() {
+    let n = golden("export_progress.notification.json");
+    assert_eq!(n["jsonrpc"], serde_json::json!("2.0"));
+    assert!(n.get("id").is_none(), "通知不得携带 id");
+    assert_eq!(n["method"], serde_json::json!("export.progress"));
+    let p = &n["params"];
+    assert_eq!(p["exportId"], serde_json::json!(1));
+    assert_eq!(p["done"], serde_json::json!(1));
+    assert_eq!(p["total"], serde_json::json!(2));
+    assert_eq!(p["writtenBytes"], serde_json::json!(12000));
+    assert_eq!(p["elapsedMs"], serde_json::json!(300));
+    assert_eq!(
+        xd_core::notify::notification("export.progress", n["params"].clone()),
+        n
+    );
+}
+
+#[test]
+fn export_finished_notification_matches_golden() {
+    let n = golden("export_finished.notification.json");
+    assert_eq!(n["jsonrpc"], serde_json::json!("2.0"));
+    assert!(n.get("id").is_none(), "通知不得携带 id");
+    assert_eq!(n["method"], serde_json::json!("export.finished"));
+    let p = &n["params"];
+    assert_eq!(p["exportId"], serde_json::json!(1));
+    assert_eq!(p["succeeded"], serde_json::json!(1));
+    assert_eq!(p["degraded"], serde_json::json!(1));
+    assert_eq!(p["failed"], serde_json::json!(0));
+    assert_eq!(p["canceled"], serde_json::json!(false));
+    assert_eq!(p["targetDir"], serde_json::json!("/home/user/Recovered"));
+    assert_eq!(p["itemsTruncated"], serde_json::json!(false));
+    // items 仅降级/失败（≤1000），逐字段：idx/name/status/reason。
+    let items = p["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["idx"], serde_json::json!(0));
+    assert_eq!(items[0]["name"], serde_json::json!("IMG_0001.JPG"));
+    assert_eq!(items[0]["status"], serde_json::json!("degraded"));
+    assert_eq!(items[0]["reason"], serde_json::json!("short read"));
+    assert_eq!(
+        xd_core::notify::notification("export.finished", n["params"].clone()),
+        n
+    );
+}
+
+#[test]
+fn v12_error_responses_match_golden() {
+    // 五个 v1.2 错误码：构造器文案与 golden 逐字（message 即契约）。
+    for (name, id, error) in [
+        (
+            "error_target_on_source.response.json",
+            22,
+            RpcError::target_on_source("/mnt/usb/Recovered"),
+        ),
+        (
+            "error_target_not_writable.response.json",
+            22,
+            RpcError::target_not_writable("/root/nope"),
+        ),
+        (
+            "error_entry_not_found.response.json",
+            21,
+            RpcError::entry_not_found(999),
+        ),
+        (
+            "error_entry_too_large.response.json",
+            21,
+            RpcError::entry_too_large(1073741824),
+        ),
+        (
+            "error_insufficient_space.response.json",
+            22,
+            RpcError::insufficient_space(16007),
+        ),
+    ] {
+        let v = golden(name);
+        let parsed: Response = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            parsed,
+            Response::Err(RpcErr {
+                jsonrpc: "2.0".into(),
+                id: serde_json::json!(id),
+                error,
+            }),
+            "{name}"
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            v,
+            "{name} re-encode"
+        );
+    }
 }

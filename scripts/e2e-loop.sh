@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 # 真块设备端到端（Linux）：镜像 → 环回只读设备 → LinuxBlockDevice 字节级 + daemon device.list
-# + M1b quick 真扫描全链路 + M1c deep 深扫（恢复率门禁的真设备臂，carved 恰 1 条）。
+# + M1b quick 真扫描全链路 + M1c deep 深扫（恢复率门禁的真设备臂，carved 恰 1 条）
+# + M1d 导出：环回挂载后导出到挂载点断言 -32006（同盘判定真集成），umount 后导出到普通目录
+#   并逐字节比对（carved 埋点原字节）。
 # 无免密 sudo（本机日常）自动跳过；GitHub ubuntu-latest 免密 sudo → 真跑。
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -10,11 +12,16 @@ sudo -n true 2>/dev/null || { echo "skip: 无免密 sudo（真块设备 e2e 需 
 
 img=$(mktemp /tmp/xd-loop-$$-XXXX.img)
 tmpdb=$(mktemp /tmp/xd-loop-db-XXXXXX)
-loop=""
+# 步骤 3c 的挂载点/导出目录（trap 需要，提前声明为可清态；root 属主文件非 root 删不掉 → sudo）
+loop=""; mnt=""; outdir=""; expdir=""
 rm -f "$tmpdb"   # 让 sqlite 自建；步骤 2/3 共用——防 sudo 下写 root/真实 HOME 状态库（同增补 1 类纪律）
 # trap 兜底：清理失败不得反噬脚本退出码（set -euo pipefail）——tmpdb 由 root 属主 daemon 建，
 # 非 root 在 sticky /tmp 上 rm -f 会 EPERM，必须 sudo + || true；其余清理同款兜底防中断。
-trap 'if [ -n "$loop" ]; then sudo losetup -d "$loop" || true; fi; rm -f "$img" || true; [ -z "$tmpdb" ] || sudo rm -f "$tmpdb" || true' EXIT
+trap 'if mountpoint -q "${mnt:-/nonexistent}" 2>/dev/null; then sudo umount "$mnt" || true; fi;
+      if [ -n "$loop" ]; then sudo losetup -d "$loop" || true; fi;
+      rm -f "$img" || true;
+      [ -z "$tmpdb" ] || sudo rm -f "$tmpdb" || true;
+      for d in "$mnt" "$outdir" "$expdir"; do [ -z "$d" ] || sudo rm -rf "$d" || true; done' EXIT
 
 cargo run -q --locked -p xd-fixtures --example gen_fat_image -- "$img"
 cargo build -q --locked -p xd-daemon
@@ -83,6 +90,49 @@ grep -qF '"byteOffset":26112,' <<<"$dres_line" || { echo "FAIL: carved byteOffse
 grep -qF '"sizeBytes":2045}' <<<"$dres_line" || { echo "FAIL: carved sizeBytes 非 2045"; echo "$dres_line"; exit 1; }
 [ "$(grep -oF '"quality":"carved"' <<<"$dres_line" | wc -l)" = 1 ] || { echo "FAIL: carved 条目非恰 1 条（假阳性？）"; echo "$dres_line"; exit 1; }
 echo "deep: task $deep_task completed，恰 1 条 carved（byteOffset=26112）经 IPC 可见"
+
+# 3c) M1d 导出真集成：同盘判定（-32006）的真块设备臂——把源挂载起来，导出目标取其上的既有
+#     目录（-o ro 挂载不可新建；-32006 在写前拦截，与目标可写性无关）。挂载点用 mktemp -d
+#     而非固定 /mnt/xd-test（路径无断言意义，避免 CI /mnt 权限面）。
+mnt=$(mktemp -d)
+sudo mount -o ro "$loop" "$mnt" || { echo "FAIL: 环回设备挂载失败（内核拒认夹具 FAT？）"; exit 1; }
+[ -d "$mnt/DCIM" ] || { echo "FAIL: 挂载后未见 DCIM（夹具几何漂移？）"; exit 1; }
+carved_idx=$(grep -o '"idx":[0-9]*[^}]*"quality":"carved"' <<<"$dres_line" \
+  | sed -n 's/.*"idx":\([0-9]*\).*/\1/p')
+[ -n "$carved_idx" ] || { echo "FAIL: 未能从深扫结果提取 carved idx"; echo "$dres_line"; exit 1; }
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"export.start\",\"params\":{\"taskId\":$deep_task,\"idxs\":[$carved_idx],\"targetDir\":\"$mnt/DCIM\"}}" >&"${XD[1]}"
+while :; do
+  IFS= read -r -t 30 line <&"${XD[0]}" || { echo "FAIL: 等 -32006 响应超时/断流"; exit 1; }
+  # 只认响应行（"id":30 后随逗号定界；通知行无 id）
+  case "$line" in *'"id":30,'*) e1="$line"; break;; esac
+done
+grep -qF '"code":-32006' <<<"$e1" || { echo "FAIL: 导出到源设备挂载点未回 -32006"; echo "$e1"; exit 1; }
+sudo umount "$mnt"; rmdir "$mnt"; mnt=""
+echo "-32006: 目标在源设备（环回挂载点）上被拒"
+
+# 3d) 导出到普通目录（mktemp -d）：export.start → finished → 落盘字节 == 镜像内埋点原字节。
+#     进程为 root（CI 免密 sudo）且无 PKEXEC_UID → worker 按设计不降权（stderr 有留痕），
+#     落盘 root 属主；outdir/expdir 清理走 sudo。
+outdir=$(mktemp -d); expdir=$(mktemp -d)
+dd if="$img" of="$expdir/expected.bin" bs=1 skip=26112 count=2045 status=none   # 埋点原字节
+printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"export.start\",\"params\":{\"taskId\":$deep_task,\"idxs\":[$carved_idx],\"targetDir\":\"$outdir\"}}" >&"${XD[1]}"
+exp_id=""; fin_line=""
+while :; do
+  IFS= read -r -t 30 line <&"${XD[0]}" || { echo "FAIL: 等导出 finished 超时/断流"; exit 1; }
+  case "$line" in
+    *'"id":31,'*) exp_id=$(sed -n 's/.*"exportId":\([0-9]*\).*/\1/p' <<<"$line");;
+    *'"method":"export.finished"'*) fin_line="$line";;
+  esac
+  [ -n "$exp_id" ] && [ -n "$fin_line" ] && break   # 抢跑（finished 先于响应）也在此收口
+done
+grep -qF "\"exportId\":$exp_id," <<<"$fin_line" || { echo "FAIL: finished exportId 与响应不符"; echo "$fin_line"; exit 1; }
+grep -qF '"succeeded":1' <<<"$fin_line" || { echo "FAIL: 导出未 succeeded=1"; echo "$fin_line"; exit 1; }
+exported=$(ls -A "$outdir")
+n=$(printf '%s\n' "$exported" | wc -l)
+[ "$n" = 1 ] && [ -f "$outdir/$exported" ] || { echo "FAIL: 目标目录落盘件数非 1（got: $exported）"; exit 1; }
+cmp "$outdir/$exported" "$expdir/expected.bin" || { echo "FAIL: 导出字节与埋点原字节不符"; exit 1; }
+echo "export: task $deep_task idx=$carved_idx → $exported 逐字节 == 埋点（26112,2045）"
+sudo rm -rf "$outdir" "$expdir"; outdir=""; expdir=""
 
 eval "exec ${XD[1]}>&-"   # 关 stdin → daemon 收 EOF 退出
 wait "$XD_PID"

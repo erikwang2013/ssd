@@ -1,71 +1,27 @@
 // © 2026 erik · https://erik.xyz · erik@erik.xyz​‍‍​​‍​‍​‍‍‍​​‍​​‍‍​‍​​‍​‍‍​‍​‍‍​​‍​‍‍‍​​‍‍‍‍​​​​‍‍‍‍​​‍​‍‍‍‍​‍​
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:xiaodun_ui/core_client/core_client.dart';
 import 'package:xiaodun_ui/core_client/protocol.dart';
 import 'package:xiaodun_ui/home_page.dart';
 
-class FakeCoreClient implements CoreClient {
-  FakeCoreClient(this.devices);
-  final List<DeviceInfo> devices;
-
-  @override
-  Future<PingResult> ping() async =>
-      const PingResult(pong: true, version: 'test', protocol: 1);
-
-  @override
-  Future<List<DeviceInfo>> listDevices() async => devices;
-
-  @override
-  Future<void> close() async {}
-}
-
-class FailingCoreClient implements CoreClient {
-  @override
-  Future<PingResult> ping() async => throw const RpcException(-1, 'boom');
-
-  @override
-  Future<List<DeviceInfo>> listDevices() async =>
-      throw const RpcException(-1, 'boom');
-
-  @override
-  Future<void> close() async {}
-}
-
-class FlakyCoreClient implements CoreClient {
-  FlakyCoreClient(this.devices);
-  final List<DeviceInfo> devices;
-  var calls = 0;
-
-  @override
-  Future<PingResult> ping() async =>
-      const PingResult(pong: true, version: 'test', protocol: 1);
-
-  @override
-  Future<List<DeviceInfo>> listDevices() async {
-    calls++;
-    if (calls == 1) throw const RpcException(-1, 'boom');
-    return devices;
-  }
-
-  @override
-  Future<void> close() async {}
-}
+import 'fake_core_client.dart';
 
 void main() {
   testWidgets('shows device list from client', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
         home: HomePage(
-          client: FakeCoreClient(const [
-            DeviceInfo(
-              id: 'image:test.img',
-              name: 'test.img',
-              kind: 'image',
-              sizeBytes: 4096,
-              removable: false,
-            ),
-          ]),
+          client: FakeCoreClient(
+            devices: const [
+              DeviceInfo(
+                id: 'image:test.img',
+                name: 'test.img',
+                kind: 'image',
+                sizeBytes: 4096,
+                removable: false,
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -76,7 +32,13 @@ void main() {
 
   testWidgets('shows error state with retry', (tester) async {
     await tester.pumpWidget(
-      MaterialApp(home: HomePage(client: FailingCoreClient())),
+      MaterialApp(
+        home: HomePage(
+          client: FakeCoreClient(
+            failWith: (_) => const RpcException(-1, 'boom'),
+          ),
+        ),
+      ),
     );
     await tester.pumpAndSettle();
     expect(find.textContaining('boom'), findsOneWidget);
@@ -84,15 +46,21 @@ void main() {
   });
 
   testWidgets('retry re-invokes the client', (tester) async {
-    final client = FlakyCoreClient(const [
-      DeviceInfo(
-        id: 'image:retry.img',
-        name: 'retry.img',
-        kind: 'image',
-        sizeBytes: 2048,
-        removable: false,
-      ),
-    ]);
+    var calls = 0;
+    final client = FakeCoreClient(
+      devices: const [
+        DeviceInfo(
+          id: 'image:retry.img',
+          name: 'retry.img',
+          kind: 'image',
+          sizeBytes: 2048,
+          removable: false,
+        ),
+      ],
+      failWith: (method) => method == 'listDevices' && calls++ == 0
+          ? const RpcException(-1, 'boom')
+          : null,
+    );
     await tester.pumpWidget(MaterialApp(home: HomePage(client: client)));
     await tester.pumpAndSettle();
     expect(find.text('重试'), findsOneWidget);
@@ -103,9 +71,35 @@ void main() {
 
   testWidgets('shows empty state when no devices', (tester) async {
     await tester.pumpWidget(
-      MaterialApp(home: HomePage(client: FakeCoreClient(const []))),
+      MaterialApp(home: HomePage(client: FakeCoreClient())),
     );
     await tester.pumpAndSettle();
     expect(find.text('未发现设备'), findsOneWidget);
+  });
+
+  testWidgets('tapping a device opens the scan page (M1d T5)', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          client: FakeCoreClient(
+            devices: const [
+              DeviceInfo(
+                id: 'image:nav.img',
+                name: 'nav.img',
+                kind: 'image',
+                sizeBytes: 1024,
+                removable: false,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('nav.img'));
+    await tester.pumpAndSettle();
+    expect(find.text('nav.img'), findsOneWidget); // 扫描页 AppBar
+    expect(find.text('快速扫描'), findsOneWidget);
+    expect(find.text('开始扫描'), findsOneWidget);
   });
 }

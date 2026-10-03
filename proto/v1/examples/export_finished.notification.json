@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"export.finished","params":{"exportId":1,"succeeded":1,"degraded":1,"failed":0,"canceled":false,"targetDir":"/home/user/Recovered","items":[{"idx":0,"name":"IMG_0001.JPG","status":"degraded","reason":"short read"}],"itemsTruncated":false}}

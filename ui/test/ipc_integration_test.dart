@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xiaodun_ui/core_client/ipc_transport.dart';
+import 'package:xiaodun_ui/core_client/protocol.dart';
 
 void main() {
   final bin = Platform.environment['XD_DAEMON_BIN'];
@@ -39,6 +40,36 @@ void main() {
       final images = devices.where((d) => d.kind == 'image').toList();
       expect(images, hasLength(1));
       expect(images.single.sizeBytes, 4096);
+
+      // M1d v1.2 新链路真 daemon 往返：方法路由/参数形状/错误解码全过真线上。
+      // 零填充镜像非合法 FS → scan.start 确定返回 -32002；happy path 归 Rust 侧
+      // scan_ipc/export_ipc 与 e2e-loop（Dart 侧无镜像夹具生成能力）。
+      await expectLater(
+        client.scanStart(images.single.id),
+        throwsA(
+          isA<RpcException>()
+              .having((e) => e.code, 'code', -32002)
+              .having((e) => e.message, 'message', 'Unsupported file system'),
+        ),
+      );
+      Future<void> expectTaskNotFound(Future<Object?> call) => expectLater(
+        call,
+        throwsA(
+          isA<RpcException>()
+              .having((e) => e.code, 'code', -32003)
+              .having((e) => e.message, 'message', 'Task not found: 7'),
+        ),
+      );
+      await expectTaskNotFound(client.scanStatus(7));
+      await expectTaskNotFound(client.scanResults(7));
+      await expectTaskNotFound(client.scanPause(7));
+      await expectTaskNotFound(client.fsRead(7, 0));
+      await expectTaskNotFound(client.exportStart(7, const [0], dir.path));
+      // -32602 的 message 为诊断文本（非契约，README「错误」节）——只钉码
+      await expectLater(
+        client.exportCancel(9),
+        throwsA(isA<RpcException>().having((e) => e.code, 'code', -32602)),
+      );
     } finally {
       await client.close();
     }

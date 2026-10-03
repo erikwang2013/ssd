@@ -3,14 +3,19 @@ import 'package:flutter/material.dart';
 
 import 'core_client/core_client.dart';
 import 'core_client/protocol.dart';
+import 'features/scan/scan_page.dart';
+import 'util/format.dart';
 
 /// 吉祥物资源路径（与应用图标同款形象的小盾）。
 const _mascotAsset = 'assets/xiaodun.png';
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key, required this.client});
+  const HomePage({super.key, required this.client, this.onClientReplaced});
 
   final CoreClient client;
+
+  /// 扫描页特权重启客户端后的换用回调（见 main.dart）。
+  final void Function(CoreClient client)? onClientReplaced;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -29,6 +34,18 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _devices = widget.client.listDevices();
     });
+  }
+
+  void _openScan(DeviceInfo device) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ScanPage(
+          client: widget.client,
+          device: device,
+          onClientReplaced: widget.onClientReplaced,
+        ),
+      ),
+    );
   }
 
   @override
@@ -89,8 +106,10 @@ class _HomePageState extends State<HomePage> {
           return ListView.separated(
             itemCount: devices.length,
             separatorBuilder: (_, _) => const Divider(height: 1),
-            itemBuilder: (context, index) =>
-                _DeviceTile(device: devices[index]),
+            itemBuilder: (context, index) => _DeviceTile(
+              device: devices[index],
+              onTap: () => _openScan(devices[index]),
+            ),
           );
         },
       ),
@@ -99,9 +118,10 @@ class _HomePageState extends State<HomePage> {
 }
 
 class _DeviceTile extends StatelessWidget {
-  const _DeviceTile({required this.device});
+  const _DeviceTile({required this.device, required this.onTap});
 
   final DeviceInfo device;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -109,21 +129,7 @@ class _DeviceTile extends StatelessWidget {
       leading: const Icon(Icons.storage),
       title: Text(device.name),
       subtitle: Text('${device.kind} · ${formatBytes(device.sizeBytes)}'),
-      onTap: () {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('扫描功能将在 M1 接入')));
-      },
+      onTap: onTap,
     );
   }
-}
-
-String formatBytes(int bytes) {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  var value = bytes.toDouble();
-  var unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit++;
-  }
-  return '${value.toStringAsFixed(1)} ${units[unit]}';
 }

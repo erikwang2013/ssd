@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -431,7 +437,9 @@ dependencies = [
 name = "xd-core"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -446,6 +454,7 @@ dependencies = [
 name = "xd-daemon"
 version = "0.2.0"
 dependencies = [
+ "rustix",
  "serde_json",
  "tempfile",
  "xd-core",

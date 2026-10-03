@@ -103,6 +103,7 @@ fn fat_to_entry(e: &xd_fs_fat::scan::FatEntry) -> ScanEntry {
         },
         first_cluster: e.first_cluster,
         byte_offset: None,
+        contiguous: None, // fat 无 NoFatChain 概念：拓扑由 deleted 决定（删除件走连续回退）
     }
 }
 
@@ -121,6 +122,7 @@ fn exfat_to_entry(e: &xd_fs_exfat::scan::ExfatEntry) -> ScanEntry {
         },
         first_cluster: e.first_cluster,
         byte_offset: None,
+        contiguous: Some(e.contiguous), // exfat 拓扑提示：反构造读取时承重（NoFatChain/链）
     }
 }
 
@@ -275,6 +277,7 @@ impl CarveProgress<'_> {
                     quality: "carved".into(),
                     first_cluster: 0,
                     byte_offset: Some(e.byte_offset),
+                    contiguous: None, // 雕刻件无拓扑：读取走 read_back（byte_offset 分支）
                 };
                 self.found += 1; // idx 先占位后自增：条目编号与 found 计数恒一致
                 let _ = self.store.insert_entries(

@@ -199,6 +199,161 @@ pub fn read_file(dev: &dyn BlockDevice, entry: &ExfatEntry) -> Result<Vec<u8>, E
     Ok(out)
 }
 
+/// 分片读取：交付 `[offset, offset+length)` ∩ `[0, min(VDL,DL))` 的字节（流式，绝不物化整文件）。
+/// 拓扑与 `read_file` **逐条同裁定**（live 链式只信链含前缀回访截断；删除+非连续只沿 stale 链、
+/// 含可达界卫与回访弃链；删除+连续=规范保证）——本函数是同一簇序列的滑窗版，
+/// 停点条件与 `read_prefix` 一一对应（见 `read_range`）。
+pub fn read_file_range(
+    dev: &dyn BlockDevice,
+    entry: &ExfatEntry,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, ExfatError> {
+    let size = entry.size_bytes.min(entry.data_length); // 交付上界（同 read_file）
+    if entry.first_cluster < 2 || offset >= size || length == 0 {
+        return Ok(Vec::new());
+    }
+    let take = length.min(size - offset);
+    let boot = boot::parse(dev)?;
+    let fat = Fat32::new(dev, &boot);
+    let cb = boot.cluster_bytes();
+    let need = entry.data_length.div_ceil(cb);
+    let bitmap = if entry.deleted {
+        load_bitmap(dev, &boot, &fat)
+    } else {
+        None
+    };
+    let mut out = Vec::with_capacity(take.min(4 * 1024 * 1024) as usize);
+    let mut buf = vec![0u8; cb as usize];
+
+    if entry.deleted && !entry.contiguous {
+        // (a) 裁定 + 三道界卫：与 read_file 同源（可达界卫 → stale 链 → 前缀回访弃链）
+        let max_cluster = boot.cluster_count as u64 + 1;
+        let fc = entry.first_cluster as u64;
+        if !(2..=max_cluster).contains(&fc) || need > max_cluster - fc + 1 {
+            return Ok(Vec::new());
+        }
+        let chain = fat.chain(entry.first_cluster).unwrap_or_default();
+        let n = (need as usize).min(chain.len());
+        let mut sorted = chain[..n].to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Ok(Vec::new());
+        }
+        read_range(
+            dev,
+            &boot,
+            chain[..n].iter().copied(),
+            bitmap.as_ref(),
+            offset,
+            take,
+            &mut out,
+            &mut buf,
+        );
+        return Ok(out);
+    }
+    if !entry.deleted && !entry.contiguous {
+        // live 链式：只信链 + 首个回访点截断（与 read_file 同规则）
+        let chain = fat.chain(entry.first_cluster).unwrap_or_default();
+        let scan_end = (need as usize).min(chain.len());
+        let end = (0..scan_end)
+            .find(|&i| chain[..i].contains(&chain[i]))
+            .unwrap_or(chain.len());
+        let n = (need as usize).min(end);
+        read_range(
+            dev,
+            &boot,
+            chain[..n].iter().copied(),
+            None,
+            offset,
+            take,
+            &mut out,
+            &mut buf,
+        );
+        return Ok(out);
+    }
+
+    let Some(resolved) = resolve_clusters(&boot, &fat, entry.first_cluster, need, entry.contiguous)
+    else {
+        return Ok(Vec::new());
+    };
+    match resolved {
+        Resolved::Chain(chain) => read_range(
+            dev,
+            &boot,
+            chain.iter().copied(),
+            bitmap.as_ref(),
+            offset,
+            take,
+            &mut out,
+            &mut buf,
+        ),
+        Resolved::Contiguous { first, n } => read_range(
+            dev,
+            &boot,
+            (0..n).map(|i| (first as u64 + i) as u32),
+            bitmap.as_ref(),
+            offset,
+            take,
+            &mut out,
+            &mut buf,
+        ),
+    }
+    Ok(out)
+}
+
+/// 簇序列上取 `[offset, offset+take)` 滑窗：停点条件与 `read_prefix` 一一对应（坏读/设备外/
+/// 短读/删除项占用簇即停），但**只收窗口内字节**——窗口前的整簇仍按序读（停点语义与
+/// read_prefix 严格同构），只是不复制其字节；跨窗簇按簇内偏移截取。
+/// `produced` = 自簇序列起点的逻辑字节进度（= read_prefix 的 out.len()）。
+/// ponytail: 窗口前整簇的空读 — 预览逐片翻页为 O(offset/cb) 每片。「无 bitmap 门时可跳过
+/// read_at」的快速路径**不成立**（qual 实证）：坏读/零读/短读三停点都能在窗口前发生，跳过会
+/// 破坏 `range == read_file 切片` 差分契约。性能升级（如需）：以差分网格为裁判，须覆盖窗口前
+/// 坏读/零读/短读三停点。
+#[allow(clippy::too_many_arguments)] // 与 fat 侧同构 + 对齐 read_prefix 停点语义：参数即入参，不引入结构体
+fn read_range(
+    dev: &dyn BlockDevice,
+    boot: &ExfatBoot,
+    clusters: impl Iterator<Item = u32>,
+    bitmap: Option<&Bitmap>,
+    offset: u64,
+    take: u64,
+    out: &mut Vec<u8>,
+    buf: &mut [u8],
+) {
+    let window_end = offset + take; // take ≤ size - offset ⇒ 无溢出
+    let mut produced: u64 = 0;
+    for c in clusters {
+        if produced >= window_end {
+            break; // 窗口取满（先于 read_prefix 的 size 停点，绝不续读）
+        }
+        if let Some(b) = bitmap
+            && !matches!(b.is_free(c), Ok(true))
+        {
+            break;
+        }
+        let n = match dev.read_at(boot.cluster_to_byte(c), buf) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let chunk_start = produced;
+        produced += n as u64;
+        if produced > offset {
+            let from = offset.saturating_sub(chunk_start) as usize;
+            let to = (window_end.saturating_sub(chunk_start) as usize).min(n);
+            if from < to {
+                out.extend_from_slice(&buf[from..to]);
+            }
+        }
+        if n < buf.len() {
+            break; // 短读只收已读部分（不得拿上一簇残字节当数据）
+        }
+    }
+}
+
 /// 逐簇读取前缀：坏读/设备外/短读即停；删除项遇被占用簇即停（保守前缀，流式截断，
 /// 替代先物化簇表再 `truncate`——qual-t5 修订注 I1）。`out` 只收已读字节，绝不伪造。
 fn read_prefix(

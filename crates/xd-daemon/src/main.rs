@@ -5,6 +5,7 @@
 //! M1b：扫描 worker 线程与主循环经唯一 stdout 写口（`write_line`）串行化；`--db` 指定任务库
 //! （缺省 XDG state 路径，打开失败降级内存库并 warn）。
 
+mod export_worker;
 #[cfg(target_os = "linux")]
 mod privcheck;
 
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use xd_core::api::{PROTOCOL_VERSION, Request, Response, RpcErr, RpcError};
+use xd_core::export::ExportManager;
 use xd_core::handlers::{CoreCtx, handle_request};
 #[cfg(target_os = "linux")]
 use xd_core::scan_task::OpenError;
@@ -36,12 +38,25 @@ fn default_db_path() -> Option<PathBuf> {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // 导出子进程模式（父 daemon `spawn 自身 --export-worker …` 拉起）：首参即分派，
+    // 不进常规 arg 循环（参数集与 CLI 不重叠）；语义与权限序见 export_worker 模块头注。
+    if argv.first().map(String::as_str) == Some("--export-worker") {
+        match export_worker::parse_args(&argv[1..]) {
+            Ok(a) => std::process::exit(export_worker::run(a)),
+            Err(msg) => {
+                eprintln!("error: --export-worker: {msg}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
     let mut db_path: Option<PathBuf> = None;
     // 提权兜底路径（pkexec 以 root 拉起）的准入判定，见 docs/security/linux-privilege-model.md。一次 /proc 读。
     #[cfg(target_os = "linux")]
     let euid = privcheck::effective_uid();
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--image" => {
@@ -151,21 +166,22 @@ fn main() {
     );
 
     let db = db_path.or_else(default_db_path);
-    let store = match &db {
+    // `export_db` = 导出子进程 `--db`：仅真文件库时可用（内存库降级 → None → export.start 诚实 -32603）
+    let (store, export_db) = match &db {
         Some(p) => {
             // sqlite 不建父目录：没有就自己建；失败留给 Store::open 报错并降级。
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             match Store::open(p) {
-                Ok(s) => s,
+                Ok(s) => (s, Some(p.clone())),
                 Err(e) => {
                     eprintln!("warn: 任务库打开失败（{e}），改用内存库（重启后结果不保留）");
-                    Store::open_memory().expect("sqlite in-memory")
+                    (Store::open_memory().expect("sqlite in-memory"), None)
                 }
             }
         }
-        None => Store::open_memory().expect("sqlite in-memory"),
+        None => (Store::open_memory().expect("sqlite in-memory"), None),
     };
 
     // 用 `Stdout` 而非 `StdoutLock<'static>`：现 std 的锁句柄含 `ReentrantLockGuard`（!Send），
@@ -176,10 +192,12 @@ fn main() {
         Arc::new(move |v: serde_json::Value| write_line(&out, &v))
     };
     // `tasks` 持设备句柄至 daemon 退出（M1c 现场续跑复用）；USB 安全弹出前的关句柄策略归 M1d/M2。
-    let mgr = Arc::new(ScanManager::new(store, notify));
+    let mgr = Arc::new(ScanManager::new(store, notify.clone()));
     if let Err(e) = mgr.recover_after_restart() {
         eprintln!("warn: 遗留任务状态修复失败: {e}");
     }
+    // 导出管理器与扫描共享同一 store（父侧校验读同库）；子进程经 --db 只读打开同一文件。
+    let exports = Arc::new(ExportManager::new(mgr.store_arc(), notify, export_db));
 
     #[cfg(target_os = "linux")]
     let opener: Arc<dyn DeviceOpener> = Arc::new(DaemonOpener);
@@ -188,7 +206,8 @@ fn main() {
 
     let ctx = CoreCtx::new(devices)
         .with_list_only(list_only)
-        .with_scan(mgr, opener);
+        .with_scan(mgr, opener)
+        .with_export(exports);
     let stdin = std::io::stdin();
 
     for line in stdin.lock().lines() {

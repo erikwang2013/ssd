@@ -481,9 +481,9 @@ impl ExportManager {
 1. `idxs` 去重非空、≤ MAX_IDXS，否则 `NoEntries`/`Internal`（handlers 侧把空/超限映射为 -32602）。
 2. 逐 idx `store.entry(task_id, idx)` → 缺任一 → `EntryNotFound`；`estimated = Σ size_bytes`。
 3. 目标校验（unix）：
-   - `PathBuf::from(target_dir)`：不存在/非目录 → `TargetNotWritable(dir)`。
-   - `source_rdev = Some(rdev)` 时：`rustix::fs::stat(target)` 的 `st_dev`（拆 major/minor）== rdev → `TargetOnSource(dir)`。
-   - `rustix::fs::statvfs(target)` → `f_bavail * f_frsize < estimated` → `InsufficientSpace(estimated)`。
+   - `PathBuf::from(target_dir)`：不存在/非目录 → `TargetNotWritable(dir)`。（平台中性检查，先于 cfg 臂）
+   - `source_rdev = Some(rdev)` 时：`st_dev`（拆 major/minor）== rdev → `TargetOnSource(dir)`。（**T9 归档同步**：实现改用 `std::os::unix::fs::MetadataExt::dev(&md)` 复用同一 metadata 快照——跨 Linux/macOS 类型统一；同盘判定整组 `#[cfg(unix)]`）
+   - `statvfs(target)` → `f_bavail * f_frsize < estimated` → `InsufficientSpace(estimated)`。（**T9 归档同步**：`#[cfg(unix)]`；非 unix 无 statvfs → warn 后**跳过余量预检**——UX 预检非安全边界，写失败逐件 degraded/failed 兜底；非 unix 的同盘校验/取消为显式 `PlatformUnsupported`，真实现归 M1e-tail）
 4. 起子进程：`Command::new(std::env::current_exe()?)` `.arg("--export-worker").arg("--db").arg(db_path).arg("--task").arg(task_id.to_string()).arg("--export-id").arg(id).arg("--target").arg(target_dir)`，`pkexec_uid` 时 `.env("PKEXEC_UID", uid)`（继承即可——子自行读）；stdin piped（写 idxs JSON 数组后 `drop(stdin)`），stdout piped，stderr 继承（留痕）。
 5. 转发线程：`BufReader::new(child.stdout).lines()` → 按 `type` 分派：
    - `"progress"` → 节流 ≥250ms 转发 `export.progress`（字段透传）；
@@ -551,6 +551,8 @@ git commit -m "feat(export): 恢复导出——父侧校验/转发 + --export-wo
 ---
 
 ### Task 4: Dart 传输层 v1.2（参数化调用 + 通知流 + pkexec 启动）
+
+> **T1 移交（spec-m1d-t1 观察 C + qual 细化）**：README 声明「两侧逐字断言」，但新 13 golden 目前 Dart 侧仅集合测试（零值级）。`protocol_v12_test.dart` 需补**四类**：(i) 五码 -32006..-32010 的 `expectRpcError` 逐字（与既有旧错误页同款）；(ii) `fs_read.response` 的 `bytesBase64`/`eof` 值级解码；(iii) `export_start`/`export_cancel` response 字段；(iv) 两个 export 通知的无 id 信封 + params 形状。
 
 **Files:**
 - Modify: `ui/lib/core_client/{protocol.dart, core_client.dart, ipc_transport.dart}`
@@ -645,6 +647,8 @@ git commit -m "feat(ui): 传输层 v1.2——参数化调用/通知流/pkexec �
 
 ### Task 5: 扫描页（模式选择 / 真实进度 / 暂停恢复取消 / EACCES 引导）
 
+> **T4 移交（qual-m1d-t4 错误语义实测）**：transport 文案保持诊断原样；**展示层映射**：`on StateError` → 「核心服务已退出，请重启应用」（-15 是用户在途退出的正常路径，直接 `'$e'` 会渲染 `Bad state: daemon exited with code -15`）；`TimeoutException` → 「核心服务无响应」（close 后的新调用是挂 10s 超时，非 StateError）；其余沿用现有文案。另 `"id":null` 应答行会被当通知入流（契约片段如此）→ **分发器必须容忍 `method==null`**。
+
 **Files:**
 - Create: `ui/lib/features/scan/scan_page.dart`（+`scan_controller.dart`）
 - Modify: `ui/lib/home_page.dart`（设备项 onTap → 进入 ScanPage）、`ui/lib/main.dart`（路由）
@@ -679,11 +683,17 @@ Scaffold(appBar: 设备名 + 返回)
 
 ### Task 6: 结果浏览页（虚拟化分页 / 过滤 / 多选 / 质量徽标）
 
+> **T4 移交铁律（spec-m1d-t4 观察 b）**：`ScanEntry.displayName`（空名→`carved_%06d.%ext`）**仅供展示**——它不做 sanitize、与 worker 落盘名可能不同（ext 注入等）。**本页与 T8 报告页一律以 `ExportReportItem.name` 为实际落盘名**；任何写路径（导出/打开文件/预览另存）不得消费 displayName。
+>
+> **T5 移交（unawaited 陷阱 + 错误文案）**：① broadcast 流订阅的 `await sub.cancel()` 在 flutter_test fake async 下**永不收敛**（Dart null-future）——订阅取消一律 `unawaited(...)`（dispose 中同理），本页/T8 都别 await 它；② 展示层错误文案：`RpcException` 只显示 `message`（契约文案），StateError→「核心服务已退出，请重启应用」、TimeoutException→「核心服务无响应」；③ T5 的桩 `ResultsPage({required int taskId})` 由本页整体替换 body（签名兼容）。
+
 **Files:**
 - Create: `ui/lib/features/results/{results_page.dart, results_controller.dart, entry_tile.dart}`
 - Create: `ui/test/results_page_test.dart`
 
 **ResultsController：** 分页状态机——`pageSize=200`，`loadMore()` 在滚动到 80% 时触发（`ScrollController`）；`total` 来自首页响应；`deletedOnly` 与 `quality` 过滤切换时**重置分页**（offset=0 清列表）；`selected: Set<int>`（idx）多选；服务端排序即 `idx` 序（无本地排序）。
+
+> **qual-m1d-t5 移交（实施前必读）**：① **契约 `scan.results` 只有 `{taskId, offset, limit, deletedOnly?}`——没有 quality 参数**（proto/v1/README:27）；`deletedOnly` 走服务端（重置分页重拉），**`quality` 只能对已加载页做客户端过滤**——必须写清 `loadMore() × 客户端 quality 过滤` 的组合语义（过滤只作用当前已加载集合；继续滚动加载更多，过滤集合增量扩大；`total` 显示语义写明是"已加载/过滤命中"而非全量），**禁止扩 v1.2 契约**（golden 冻结）。② 多选 `selected` 跨"过滤切换/重置分页"的存留语义要显式（建议：过滤切换即清选择）。③ O3 记录（M4/产品）：扫描中返回/切页不打断 daemon 任务（PopScope 二次确认归 M4）；`_confirmCancel` await 后无 mounted 复检（离页即作废意图，M4 裁定）。
 
 - [ ] **Step 1: 页面结构（规范级）**
 ```
@@ -697,7 +707,7 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 └── 点击条目 → PreviewPage(taskId, entry)
 ```
 - [ ] **Step 2: 文案铁律检查表（写进 results_page.dart 头注，widget 测试逐条断言）**
-  1. 删除+**连续**（exFAT）：「已删除 · 簇未被占用（完整性高）」；
+  1. 删除+**连续**（exFAT）**且 `quality == complete`**：「已删除 · 簇未被占用（完整性高）」；**（T6 执行精化/F1：连续但质量非 complete（含未知档）→ 落保守臂「已删除 · 恢复质量见分级」——位图证据不足或簇已被占时徽标已示"可能损坏"，行文案不得称完整性高；`null` 臂改 `_` 满足穷尽性；`(false, complete)` 软冲突 by-design over-warn 记录备查）**
   2. 删除+**非连续**（`contiguous==false`）：「已删除 · 按删除链恢复，可能不完整」；
   3. **任何文案不得出现"连续假设"**（grep 断言测试：源码不含该四字）；
   4. carved → 仅「仅雕刻 · 可能不完整」；
@@ -718,11 +728,11 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 - Create: `ui/lib/features/preview/{preview_page.dart, preview_controller.dart}`
 - Create: `ui/test/preview_page_test.dart`
 
-**PreviewController：** 按 ext 分派：图片（jpg/jpeg/png）→ **分片拉全量**（1MiB/次循环到 eof，上限 32MiB——超限显示"文件过大，暂不支持预览"）→ `Image.memory`（含 `errorBuilder`：数据坏时显示"数据损坏，无法预览"而非红屏）；文本（txt/log/md/json…）→ 前 256KiB → `SelectableText`（utf8 allowMalformed）；其它 → 仅信息卡。信息卡恒显：名称/路径/大小/删除状态/质量徽标/`byteOffset`（雕刻件展示"偏移"）；**exFAT VDL 说明**：若 `sizeBytes < 实际可读` 无从得知（契约不含 DL）→ 不显示猜测，仅对短交付显示「实际数据短于声明大小」。
+**PreviewController：** 按 ext 分派：图片（jpg/jpeg/png）→ **分片拉全量**（1MiB/次循环到 eof，上限 32MiB——超限显示"文件过大，暂不支持预览"）→ `Image.memory`（含 `errorBuilder`：数据坏时显示"数据损坏，无法预览"而非红屏；**T7 归档硬化 `cacheWidth: 2048`**（防大图按原始分辨率解码 OOM））；文本（txt/log/md/json…）→ 前 256KiB → `SelectableText`（utf8 allowMalformed）；其它 → 仅信息卡。信息卡恒显：名称/路径/大小/删除状态/质量徽标/`byteOffset`（雕刻件展示"偏移"）；**exFAT VDL 说明**：若 `sizeBytes < 实际可读` 无从得知（契约不含 DL）→ 不显示猜测，仅对短交付显示「实际数据短于声明大小」。
 
 - [ ] **Step 1: 页面结构（规范级）**：AppBar=displayName；body=加载态→内容；底部信息卡；[恢复此文件] 按钮 → RecoverPage(taskId,[idx])。
 - [ ] **Step 2: preview_page_test.dart**
-1. 图片：Fake 分两片返回 TINY_PNG（68B）→ 断言两次 `fsRead`（offset 0/68? 第二片 length 到 eof）、`Image.memory` 出现（`find.byType(Image)`）。
+1. 图片：Fake 分两片返回 TINY_PNG（**67B**——T7 归档勘误：原 68B 系笔误，实测 67B 且真可解码；Rust 夹具 70B 为另一物）→ 断言两次 `fsRead`（offset 0/67 第二片 length 到 eof）、`Image.memory` 出现（`find.byType(Image)`）。
 2. 损坏图片：返回随机字节 → errorBuilder 文案出现。
 3. >32MiB：Fake 报 sizeBytes 大 → 不调用 fsRead、显示"文件过大"。
 4. 文本：返回 UTF-8 中文 → SelectableText 内容匹配。
@@ -734,12 +744,20 @@ Scaffold(appBar: '扫描结果' + 计数 'N 项')
 
 ### Task 8: 恢复页（目标选择 / 导出进度 / 报告）
 
+> **T4 移交**：报告页「打开目标文件夹」与任何精确定位落盘文件的动作，一律用 `ExportReportItem.name`（实际落盘名）而非 `displayName`（展示名，见 T6 铁律）；成功件不在 items 里（契约如此）——「打开文件夹」只按目录打开，不按名定位成功件（M5b 注记）。
+>
+> **T5 移交**：通知/进度订阅取消一律 `unawaited(...)`（flutter_test fake async 下 `await sub.cancel()` 不收敛——见 T6 注记）；错误文案映射同 T6（RpcException 只显示 message）。
+
 **Files:**
 - Modify: `ui/pubspec.yaml`（+`file_selector`（官方，desktop 支持））
 - Create: `ui/lib/features/recover/{recover_page.dart, recover_controller.dart, report_view.dart}`
 - Create: `ui/test/recover_page_test.dart`
 
-**RecoverController：** `selectTarget()` 用 `file_selector.getDirectoryPath()`；`start()` → `exportStart(taskId, idxs, dir)`；订阅 `export.progress/finished`（按 exportId 过滤）；状态机 `picking → exporting → done(report)|failed|canceled`。目标目录展示预估大小 = `estimatedBytes`；报告页：`succeeded/degraded/failed` 三计数 + 降级/失败清单（reason 文案）+「打开目标文件夹」按钮（`Process.start('xdg-open', [dir])`——桌面 Linux；其他平台 no-op + 文案）。
+**RecoverController：** `selectTarget()` 用 `file_selector.getDirectoryPath()`；
+
+> **qual-m1d-t5 移交（测试缝，实施前必读）**：`file_selector.getDirectoryPath()` 是平台插件，**widget 测试直接调会挂**——测试缝推荐 `FileSelectorPlatform.instance` 注入 fake（不改页面签名；`TestDefaultBinaryMessenger` 平台通道 mock 为备选）。`start()` → `exportStart(taskId, idxs, dir)`；订阅 `export.progress/finished`（按 exportId 过滤）；状态机 `picking → exporting → done(report)|failed|canceled`。目标目录展示预估大小 = `estimatedBytes`；报告页：`succeeded/degraded/failed` 三计数 + 降级/失败清单（reason 文案）+「打开目标文件夹」按钮（`Process.start('xdg-open', [dir])`——桌面 Linux；其他平台 no-op + 文案）。
+
+> **T8 归档注记（lead）**：① `RecoverPage` 落码增必填 `client`（preview/results 两调用点同步传入，两枚上游钉测零改动）；② **finished 抢跑寄存回放加固**落地——T3 底盘竞序（daemon 可先发 finished 再回响应）而导出**无轮询兜底**，丢一条即永久卡「导出中」；计划外但 lead 追认，测试 7 钉死；③ O1（`start()` 重置 `_exportId/_done/_total/_writtenBytes`）+ O3（回放独立 try/catch）修复轮（qual-m1d-t8）+ 25 枚补测（`recover_page_supp*.dart`）；④ -32006/-32010 专用文案与 `itemsTruncated` 提示行已落；⑤ dev_dep `file_selector_platform_interface` + 6 件已跟踪生成物随提交（pub get 必需）；⑥ 未测三项（真 GTK 弹窗/真 xdg-open/真 daemon 全流程）归 T9。
 
 - [ ] **Step 1: 页面结构（规范级）**
 ```
@@ -785,6 +803,97 @@ Scaffold('恢复文件')
 4. 降权子进程模型：非 root 路径全测试覆盖；root/pkexec 路径**标注未验证（需真机）**并与 security 文档一致。
 5. UI 三页 + 报告页：widget 测试覆盖状态机与铁律文案（含"连续假设"零出现的 grep 断言）；集成测试全流程（镜像 → 扫描 → 预览 → 导出）在 CI 可复跑。
 6. 全量门禁绿（rust debug+release、clippy、fmt、flutter test+analyze、e2e.sh、e2e-loop.sh）。
+
+---
+
+## 执行记录
+
+### T1（契约 v1.2）—— impl-m1d-t1。提交沿革：`4c7194f`（主）→ `42455fa`（qual 补强）。DONE → spec **PASS** → qual ISSUES → 补强有牙（T1 关闭，382/0）
+
+- **计划缺陷 1**：Step 1 括注「`hello, xiaodun!` 16 字节」实为 **15**（base64 无 padding 实证）——golden 字面量未动（`eof:true` 在"请求 16>可得 15 短交付"语义下自洽）。
+- **集合 36 同步三点**：Rust 收口测试 + Dart 集合测试 + README 清单（计划 Files 漏了 Dart 侧，实施者按前置指示补上）；**spec 诱饵检验**（第 37 个文件）两侧均红——活守卫实证。
+- **spec 亮点**：13 golden 逐字节；params 反钉（snake_case/缺字段/错类型含 `length:-1`、`idxs:[0,-1]`）；错误五码与构造器逐字。
+- **qual 变异 12 条**：6 KILL；**同族弱钉实证（本任务最有价值发现）**——五构造器各只被"单值==golden 内嵌值"调用，任何**去参数化**实现全不可分（M8/8b；clippy `useless_format` 只挡纯字面量子类）；`idxs: Vec<u64>→Vec<i64>`（负值被接受，M4）。补强落地：负值/别名反钉 + 五构造器异值断言（`entry_too_large(67108865)` 破 64MiB 边界巧合）+ **README「params 演进规则」3 行**（新增字段必须可选/不得删改/不得 deny_unknown_fields）——字段级治理从无到有。有牙实证：去参数化后 **golden 测试仍绿、参数化断言红**（M8 族现场）。
+- **观察 C（双侧承诺）+ qual 细化 → T4 任务书**：Dart 需补四类值级覆盖（五码 expectRpcError / fs_read 值级 / export_start+cancel response / 两通知形状）——否则 11 个 non-error 新 golden 在 Dart 侧零值级覆盖。`idxs 去重后` 措辞两处对齐。
+- 记录不修：golden 单点守卫（同 PR 双改不会被第二道网拦——v1 既有约定）；`alias` 放宽（等价无害）。
+
+### T2（分片读取全链）—— impl-m1d-t2。提交沿革：`e7e16d9`（主，18 文件）→ `753897d`（qual 补测）。DONE → spec **PASS**（2691 窗口差分）→ qual **APPROVED** → 五处有牙（T2 关闭，407/0）
+
+- **计划 vs 仓库裁定差异 4 条（按"仓库 read_file 为规格"落地）**：range 版必须同源 M1c 三道界卫 + (a) 早分支（计划片段是裁定前旧稿）；live 回访截断（计划缺）；**不物化簇序列**（流式滑窗）；fat 删除=连续回退。差分测试比计划强：5×9 / 6×8 → spec 扩到 **2691 窗口**（独立 oracle：自给簇序+设备原始 read_at，先对 oracle 再对切片）。
+- **collector 化不採 sink（B 项，重要设计裁定）**：计划 sink 形态会**静默丢字节**（`Cursor::skip` 段体字节从不流经 sink；jpeg 段体含 `FF D9` 类标记字节时必漏——spec 探针实证"重读不止等价、是规格必需"）；改 `collect_*` = 裁决区间确定性重读（`read_prefix_at`）。M1c 47 测试零回归。
+- **计划片段编译缺陷 3+1 条**：死绑定 `let want`（-D warnings 必红）、`ReadError` 缺 `#[derive(Debug)]`、`map_err` 类型不成立（ScanError 无 Display）、`(offset as usize)` 32 位截断——全部实修（`saturating_add` 防溢出）。
+- **qual 变异 10 条：7 KILL；关键覆盖发现**——**range 分支的可达界卫/回访查重逃逸全部 401 个仓库测试**（repo 夹具盲区），仅差分探针捕获 → 两场景（`ranged_read_deleted_unreachable_is_empty`/`..._revisit_is_empty`）搬进 read_tests 并以有牙实证；`saturating_add` 裸 `+`（debug panic）与 `run.end→u64::MAX`（交付 5000≠4096）两缺口同样补测闭合；`read_prefix_at` 钳位=等价突变（补可选取值契约测试）。
+- **裁定/移交**：(a) read_back 两遍 TOCTOU 可接受（源盘只读+确定性重读）；(b) `complete` 与交付长解耦（零消费者，doc 已注）；(c) **雕刻件"完整/截断"信号不落库**（quality 恒 "carved"）——UI 保守文案（"仅雕刻·可能不完整"）已覆盖，持久化列列为 **v1.3 契约候选**。(d) 性能快速路径的 ponytail 建议不成立（坏读/零读/短读三停点都可在窗口前发生——已改注"升级须以差分网格为裁判"）。
+- 过程：实施者误用 `git checkout` 清掉未提交文档改动 → 自查重写并复核（终提交纯文档差异）；"只追加不 amend"本轮遵守。
+
+### T3（恢复导出：降权子进程）—— impl-m1d-t3。提交沿革：`e90a79b`（父侧）→ `bc4a8e6`（worker）→ `4d3e40d`（路由+集成）→ `b041617`（盘级祖先）→ `6725c2d`（qual 八项修复）→ `55924e4`（测试底盘竞序）→ `9d4b5ea`（scan_ipc 同法收敛）。DONE → spec **PASS** → qual **ISSUES** → 修复有牙（T3 关闭，444/0）
+
+- **★ 安全：#2 提权面封堵（实施者抓，计划断言在库层不成立）**：计划"worker 设备 id 来自自家 store、无越权面"对 RPC 层成立、**对库层不成立**（库文件属主即可被改写，伪造 `image:/etc/shadow` → 提权 worker 沦为任意 root 可读文件读取器）→ worker 的 `image:` 分支复用 `--image` 同闸（O_NOFOLLOW + 属主==PKEXEC_UID）；非 root 不加闸（语义正确）。**★ 盲区 #7（lead 裁定本轮修）**：整盘 `/dev/sdb`(8,16) vs 分区 `sdb1`(8,17) rdev 不等 → 同盘判定升 **盘级祖先**（sysfs 走链 + 注入根测试 + 真 /sys 冒烟）；fail-open（解析失败退回 rdev 相等 + stderr）经裁定；mountinfo 不解析有内核事实等价论证（采纳）。
+- **spec 独立核验**：端到端导出逐字节（含删除件/雕刻件）；命名注入 `../evil` 等落盘安全；worker 协议故障矩阵（空数组/坏 JSON/坏目标→fatal exit 2；EPIPE→exit 0；SIGTERM→无 finished、已写保留）；伪造库行（`unix:/etc/shadow` 等）非 root 全拒。
+- **qual 变异 12 条 + 4 测试缺口修复**：cancel 测试**两态恒真**（删 kill 也全绿）→ 补 `succ+deg<total` 真断言；MAX_PREVIEW **自指盲区** → 绝对锚 + 字面量；failed 件 E2E（cleanup+reason+无残骸）；EPIPE 转正。**实现级三修**：cancel 持 child 锁会阻塞全 daemon RPC（worker D 态）→ `Job.pid` 直发 SIGTERM；**雕刻导出 ∝size² 读放大**（峰值≈offset+4MiB）→ 单次全量回读（≤64MiB 上限）+内存切片（预览路径留 ponytail 注归 M4/M2）；`unique_name` O(n²)→name→counter map；**ext 未净化可在成功路径越出目标目录**（伪造行）→ ext 过 sanitize + 注入测试。
+- **★ 测试底盘竞序（teeth 复验抓出）**：`scan.start`/`export.start` 先起后台线程再回响应 → `finished` 通知可抢在响应前（150 次插桩 6 次）；旧读法丢弃通知→永等。**`Wire` 寄存读口**（两序容忍、通知寄存不丢）收敛 export_ipc + scan_ipc 全量；确定性靶 + 变异版 6× 负载 2 FAIL vs 修复版 60/60（真抢跑负载诱发约 3%/跑，集中 cancel 响应侧）。
+- **记录不修**：M6（items>1000 截断无构造）、M5a（--export-id 错值纯诊断）、I1 µs 残窗（终态×计数同锁发布归 M4）、stale-pid（M4 pidfd）、`{stem}_N` 规则已补 README v1.2。
+- **未验证（需真机 root/pkexec）**：降权链与 root-mode `image:` 门；-32006 真环回断言归 T9/scripts。
+
+### T4（Dart 传输层 v1.2）—— impl-m1d-t4。提交沿革：`88ff380`（主）→ `f35f7a1`（qual 补牙）。DONE → spec **PASS** → qual ISSUES(轻微) → 补牙有牙（T4 关闭；34+1 / 带 daemon 35/0）
+
+- **交付**：v1.2 模型（`ScanEntry+byteOffset/contiguous/displayName`、`FsRead`/`Export*` 模型）；`CoreClient` 11 方法 + 通知流；`_call(params)`；`startPrivileged`（标注未验证）；`FakeCoreClient`（测试公用，home_page_test 全部换用）；`ipc_transport_test.dart`（`/bin/sh` 假 daemon 钉住"无 id=通知"唯一真分支——CI 真 daemon 无法产通知）。
+- **spec 独立核验（强）**：独立 dart 解码器 + python 假 daemon；11 请求 golden 编码逐字 + 真 `IpcCoreClient` 发 23 条线上线文与 golden **逐字节相同**；**displayName 两端对齐表**（ext="" 两端同回退 bin；ext 注入形态 Dart 不 sanitize → 仅展示层——**铁律已入 T6/T8**：写路径只传 idx、报告用 `ExportReportItem.name`）。
+- **qual 变异 10 条**：5 KILL；3 缺口补牙（broadcast 多监听/close onDone/Fake 分页 off-by-one——均实测有牙）；等价 1（null-id 行）;接受 1（startPrivileged argv 归真机清单）。**借文件热关 Fake 保真 P1/P2**（limit 1..=1000 校验文案逐字 + idx 升序）；P3/P4 记录。
+- **错误语义修正（qual 实测）**：close 后**新**调用是挂 10s `TimeoutException`（非 StateError）；`StateError(-15)` 仅在途调用——T5 展示层映射已入计划。
+- helper 重复不合并（YAGNI，第 4 个消费文件出现时再提取）；`"id":null` 行入通知流 → 分发器容忍 `method==null`（已入 T5）。
+
+### T5（扫描页）—— impl-m1d-t5。提交沿革：`c654047`（主）→ `1a1b219`（qual 修复）。DONE → spec **PASS** → qual ISSUES → 修复有牙（T5 关闭；49+1 跳过 / 带 daemon 50/0）
+
+- **★ unawaited 陷阱（实施者抓，spec 机制级定位）**：broadcast 订阅 `await sub.cancel()` 在 flutter_test fake async 下永不收敛（`Future._nullFuture`=root-zone 已完成 future，续体在 fake 时区外执行）→ **非 broadcast 专属**；EACCES 重试链曾当场卡死；修 `unawaited(...)`（取消同步生效，安全）。**已移交 T6/T8**。附注：`ipc_transport.close()` 内 `await _sub.cancel()` 是 M1b 既有，真实时区无碍。
+- **接口 `CoreClient.restartPrivileged()`**（注入缝设计，替代三层参数穿透）；spec 以**桩 pkexec 亲测 argv 逐项保持**（`[daemonPath, --image, x.img, --verbose]`）+ 旧进程先死透。
+- **spec 13 场景状态机探针**：通知全丢仅轮询收敛、daemon 死→failed 文案、percent 语义、终态先到先得、8 种畸形通知注入零影响。
+- **qual 变异 12 条 + 2 补**：5 KILL；**O2 实证为真竞态**（在途 scanStatus 过期响应把暂停态拉回 scanning——探针 H 在 HEAD 红）→ 一行守卫修复（`id/state` 双查）；`describeScanError` 的 RpcException 前缀（我那"只显示 message"的裁定此前只在注记里）→ 落码 + 断言；7 有牙（含 D 的 `fresh!` 行为杀修正与"独立删除 dismissElevation=等价"的如实转录）。
+- **裁定**：O1 保持单次失败即终态（容错等真机抖动证据，M5）；O3 记录（离页不打断 daemon / 连点并发窗 / `_confirmCancel` 无 mounted 复检——M4/产品）。
+- **T6/T8 移交（已入计划）**：quality 过滤**只能客户端对已加载页**（契约无 quality 参数，禁扩冻结契约）；`file_selector` 测试缝=`FileSelectorPlatform.instance` fake；取消态无「查看结果」入口=主动收窄（契约可查属实）。
+
+### T6（结果浏览页）—— impl-m1d-t6。提交沿革：`6ebe341`（主）→ `a7dbfbc`（qual 修复）。DONE → spec **PASS** → qual ISSUES → 修复有牙（T6 关闭；65+1 跳过 / 带 daemon 66/0）
+
+- **交付**：结果页 13→16 枚测试；分页 200/页 80% 阈值；`deletedOnly` 服务端 + **quality 客户端过滤**（组合序列 `[(0,f),(0,t),(0,t),(200,t)]`，offset 恒=已加载数）；三层计数语义（AppBar total/已加载/过滤命中+提示行）；`_generation` 过期响应守卫（双向）；total 虚高封口；两下游桩（Preview/Recover，签名兼容 T7/T8）；`util/errors.dart` 上收（T5 的 describeScanError 迁入）。
+- **spec 独立核验**：18 探针（[0,200,400] 零网络尾、79%/82% 双侧阈值、失败序列 [0,200,200]、封口同 offset 不重拉、铁律五组+禁词 lib/** 非空扫 canary、FAT null 三义）；**禁词「连续假设」全仓 0**（Rust 注释中字样属引擎文档，不在断言范围）。
+- **★ F1（spec+qual 双抓，高危真缺口）**：`entry_tile` 的 `true` 臂不看 quality → 删除+连续+`maybeDamaged`（**删后被部分复用=必经场景**）文案「完整性高」与徽标「可能损坏」打架，且与引擎「位图逐簇全空才算 Complete」冲突 → 门控 `true when quality=='complete'` + `null`→`_`（穷尽性，spec 的"一行"实为两处）+ 测试（含未知档前向兼容）。
+- **qual 变异 12 条**：8 KILL；3 缺口补测（G1 `_generation` 仓库零回归网→移植 P8a/P8b 脚本化 client；G2 未知档整记录断言；G3 降序点选）；`false,complete` 软冲突 by-design over-warn（记录）。**FAT 删除文案裁定：维持保守「恢复质量见分级」**——更正后的理由：fat 分级虽逐簇查 FAT 表，但「假设 run 空闲」≠文件真实簇序（碎片化不可考），且 null 混迁移前 exFAT 旧行（链读），无措辞对三义皆成立。
+- 过程趣闻：spec 曾报"并发写者告警"——实为 qual 的变异作业（改-测-还原），确认后已把「qual 变异振荡属正常」记入团队记忆。
+
+### T7（预览页）—— impl-m1d-t7。（跨会话续跑：实现 `c4078cc` 在上会话完成，本会话评审关闭——上会话中断遗留 qual 变异残骸 `offset +=`，lead 还原后重启管线。）提交沿革：`c4078cc`（主）→ `1f27824`（-32009 同文案追补）→ `425b6f9`（qual 补测八枚）→ `a3db50e`（P2 硬化）。DONE → spec **PASS** → qual ISSUES（14 存活变异）→ 补测有牙 + P2 修复 → qual 增量 **APPROVED**（T7 关闭；80+1 跳过 / 带 daemon 81/0）
+
+- **交付**：预览页 7→15 枚测试（计划六枚 + 导航 + 8 补测）；ext 三分派（jpg/jpeg/png 图片、txt/log/md/json 文本、其余仅信息卡）；1MiB 分片循环到 eof（上限 32MiB：恰界放行、+1 零读取拒绝）；文本 256KiB 前缀 utf8(allowMalformed)；信息卡恒显（byteOffset「偏移」仅非空显示——"不猜 VDL"）；短交付判定 `eof && 实收<声明`（实收>声明不报）；`QualityBadge`/`entryQualityNote` 由 entry_tile 提取为上收件（零行为变化）；-32009 与本地 cap 同文案「文件过大，暂不支持预览」且原始 `Entry too large` 不泄漏 UI。
+- **P2 硬化（qual 抓，lead 裁定本轮落地）**：`Image.memory(cacheWidth: 2048)` 封大图原分辨率解码 OOM 面（`ResizeImage` 默认 allowUpscaling=false，小图零代价）；钉测 `ResizeImage.width==2048`；残余 PNG 解码瞬态归 M4/M5。
+- **spec 独立核验**：8 枚探针全绿；两条契约外防御分支"两读"（删防御①非 eof 零交付 → 探针红；删防御②越上限 → 探针红）；残留变异 `offset +=` 独立 kill（探针 3 红 + 仓库套件挂死=死循环防线本体）；cap 恰界/短交付四边界/错误映射双路/信息卡字段。**计划 68B 系笔误**（实测 67B、Rust 夹具 70B）→ 本归档修订任务书。
+- **qual 变异 24 条**：10 KILL → 14 SURVIVE 全为测试缺口（分派臂 png/json、cap `>`/`>=`、短交付去 `eof &&`、allowMalformed、null 偏移照显、`_disposed` 守卫、循环防御行、ext toLowerCase 等）→ 8 枚补测成品（+161 行）**14/14 KILL 归因干净**；P2 落码后仓库侧 **24/24 KILL**（新增 M20 删 cacheWidth=KILL）。
+- **工件更替记录**：qual 权威件 v1（`4ebeae…`）CI format 门禁不过 → qual 落地期重写 v2（`32629c…`/399 行）；impl 对 v1 的机械 format 结果与 v2 **逐字节相同**（cmp exit 0；6 处纯空白/换行逐处记录）。**裁定：绑定 v2**（`32629c98…`），v1 废止。
+- **记录级偏差（裁定归档）**：① 提交信息非逐字（T6 先例）；② 超 Files 清单改 2 文件（QualityBadge 提取 + results_page 调用点透传=编译必需，无夹带）；③ 68B 笔误修订。
+- **P3/P4 记录不修（归 M4/M5）**：P3 文本 >256KiB 无截断提示；P3 同位重建 State 复用（**T8/T9 勿在同槽位重建 PreviewPage**）；P4：eof 检查先于越限（撒谎件 ≤33MiB 界内多收 1 片）、takeBytes 2× 峰值 ≤66MiB+base64 瞬态、失败臂无重试按钮、QualityBadge 第三消费者出现时按 util/errors 先例上收。
+- **移交 T8/T9**：T8=RecoverPage 接导出链路时同步 `preview_page.dart:51` 调用点（传 client）；错误映射复用 `describeCoreError`；-32006/-32010 文案按计划 773。T9=-32009 集成须用文本件（图片被 32MiB 本地截先行）；雕刻件预览断言 `fsRead(idx)`+字节；qual 24 条变异并入 T9 抽检池。未验证：真 daemon 分片/eof 行为、-32009 真路径、大图真解码耗时/内存、eof+cap 同片多收。
+
+### T8（恢复页）—— impl-m1d-t8。提交沿革：`94c61fb`（主）→ `2928b19`（qual 两修复 + 25 枚补测）。DONE → spec **PASS** → qual ISSUES（O1/O3 必修）→ 修复有牙（T8 关闭；115+1 跳过 / GATE2 待二进制刷新，见★）
+
+- **交付**：恢复页桩→正式（controller/page/report_view 三件）；状态机 `picking → exporting → done|failed|canceled`；`file_selector` 目标选择（测试缝 `FileSelectorPlatform.instance`）；`exportStart(taskId,idxs,dir)`；`export.progress/finished` 按 exportId 过滤；-32006/-32010 专用文案、其余 describeCoreError；报告三计数+清单（落盘名一律 `ExportReportItem.name`）+ `itemsTruncated` 提示；[打开目标文件夹] 仅按目录；`RecoverPage` 增必填 client、两调用点同步；测试 10→35 枚。
+- **★ finished 抢跑寄存回放（impl 计划外加固，lead 追认）**：T3 底盘竞序——daemon 可先发 finished 再回响应；导出**无轮询兜底**，丢一条即永久卡「导出中」→ 未知 exportId 在途寄存、响应到达后双检回放；spec 穿透（删寄存/删回放→测试 7 红；异 id 双检拒、非在途丢弃、单槽三处清零=无界增长不存在、串扰自愈、重复幂等）。
+- **★ O1/O3 修复轮（qual 修正因果链）**：O1=二次导出在途窗口 `_exportId` 残留 → 新导出自己的抢跑 finished 被双拒 → 永久「导出中」（实测取消指旧 id、旧计数残留）→ `start()` 重置四字段；O3=畸形 finished 回放落外层 catch → failed+TypeError 上屏而导出在跑 → 回放独立 try/catch。回退变异 m30/m31 → 恰 3 枚红（与 impl 自证一致）。
+- **qual 变异 51→54 枚**：v1 44 KILL/7 SURVIVE → 25 枚补测落地后 **47 KILL/6 等价 SURVIVE**；repo 单跑杀不掉的 20 枚全转 KILL；**m26 修正为 KILL**（v1「等价」判定有误——新补测正好观测到）。工艺披露：m30/m31 首跑 harness 缺陷自修、m31 单独复跑补齐。
+- **spec 独立核验**：15 探针；6 项偏离逐项实证接受（dev_dep lint 必要性 / 生成物逐字节重生成 + lock enforce / 寄存回放重点穿透 / itemsTruncated 字段对齐 / 骨架必要偏差 / 未测三项）；两枚上游钉测 diff 零改动。
+- **O2 异议（qual 胜）**：formatBytes 边界实测正确（0/1023/1024/1048575/1MiB/1TiB），spec「进位毛刺」不成立 → 不改码 + 3 枚边界断言。
+- **记录不修（归 M4/M5）**：`start()` 不清 `_report`（单引用被下次 finished 替换、exporting 不渲染 → 无泄漏/无陈旧显示，清理代价大于收益）；非 Linux SnackBar 臂无测试缝；清单渲染非懒加载（≤1000 量级可接受）；cancel 后 `_error` 瞬态残留。
+- **★ 环境前置（T9 首步）**：GATE2（XD_DAEMON_BIN 集成）红——target 中 daemon 二进制过期（构建早于 T3 起全部引擎改动），报 `-32601 Method not found: fs.read`；父提交 94c61fb 同红，**非 T8 回归**。T9 首步 `cargo build`（debug+release）刷新后复跑确认。
+- **移交 T9**：集成须覆盖真 daemon exportId 过滤与至少一次真抢跑时序；-32006/-32010 可直接断言 UI 文案；不得引入真 xdg-open 进程断言；变异池 54 枚可抽检（`matrix2_result.json`）；-32009 集成须用文本件（>64MiB）；雕刻件预览断言 `fsRead(idx)`+字节。未验证：真 GTK 弹窗、真 xdg-open、真 daemon 全流程（GATE2 绿态待刷新复跑）。
+
+### T9（全链路集成测试 + 出口验收）—— impl-m1d-t9。提交沿革：`6cc05db`（夹具 example）→ `cf36919`（Dart 全链路集成）→ `8a79df8`（e2e-loop 增段）→ `4cc5a54`（EPIPE 观测快路径=前存假红修复）→ `7fc6601`（出口文档）→ **可移植性修复链** `e4b59c9` → `f44efb1` → `b349d14` → `5a1ae39` → `c069efa`（qual A/B 补覆盖落码）。DONE → spec **PASS**（5 偏离全 ACCEPT）→ qual **APPROVED**（Step 4 七项 + 附加矩阵 + 三笔链终审）→ T9 关闭
+
+- **交付**：Rust 夹具 example `make_carve_fixture`（live 4141B / 删除 65536B / 雕刻 2045B@96768 / 坏卡声明大件 BIG.TXT 68157441）；Dart 真 daemon 全链路（quick 扫描 → fsRead 逐字节 → **-32009 同文案** → 深扫雕刻回读逐字节 → **两笔并发导出**：exportId 互异 + 报告 2/0/0 与 1/0/0 + 落盘逐字节 + 订阅先行全量寄存两序）；`e2e-loop.sh` 3c/3d（**真环回挂载**导出断言 -32006 + umount 后逐字节 `cmp skip=26112 count=2045`）；README / security §6 / 设计 §4.5 文档。**ci.yml 原计划增补零 diff**（`cargo build -p xd-daemon` 前置 + `XD_DAEMON_BIN` 早在 `bbca93f`；本轮新增仅 `--no-fail-fast` 见下）。
+- **★ 可移植性修复链（并行预推 CI 在出口前抓出 3 OS 编译/运行回归；本会话最大增量）**：macOS `st_dev` i32/u64（→ `MetadataExt::dev` 统一 u64）；Windows 三批 unix-only 未门控（`rustix::process`/`Errno::SRCH`/测试 symlink → `statvfs` → `check_space` dead_code，最后一处由 impl **cfg-flip 探针**自抓）；Windows 运行期 1 枚（`-32008` 用例 unix 路径字面量撞 `is_absolute()` 边界校验 → tempdir 绝对路径中立化）；ci.yml `--no-fail-fast`（申报偏离——前 3 轮 fail-fast 下 Windows 从未跑到 xd-daemon 测试目标，逐轮只见 1 红）。
+- **可移植性裁定（lead）**：非 unix 同盘校验/取消 = **显式 `PlatformUnsupported`**（-32603 + 留痕，不静默）；**余量预检特例 = warn 后跳过**（UX 预检非安全边界、逐件 degraded 兜底、保住 Windows 测试矩阵运行资格）；真实现归 M1e-tail。
+- **qual A/B 补覆盖（产出 → `git apply` 逐字节落码，blob 级复核）**：多片导出 4MiB+1 逐字节（A2 偏移不推进变异 = **只有逐字节比对能杀**——终报仍 succeeded=1、长度正确、首差字节 @4194304）+ EPIPE 宽夹具硬化（B0 对照臂直证旧窗静默通过；`dir_names<30`）。A3「CHUNK 改小」不红属可观测等价变异（lead 期望被实证驳回，接受）。
+- **Step 4 七项（qual 全 KILL/记录核验，带重编译实证）**：eof 恒 true/false（4/8 红）；skip_bytes fat+exfat；雕刻 run 界（恰 1 红）；重名去重；sanitize；降权（记录项，与 security §6/e2e/README 三处口径一致）；cancel kill。附加：A1d 旧 /proc 慢扫**不稳定红**（承重成立）。
+- **CI 沿革（并行预跑 4 轮）**：`37106733704`（macos 类型 + windows 6 错）→ `37107356111`（macos ✓、windows 1 错）→ `37107808841`（编译全绿、windows 1 运行期）→ `37108287985` **5/5 全绿**（Windows 首次全 workspace 跑通且含 e2e-loop 的 ubuntu 真跑）。
+- **本地不可跑项**：e2e-loop 无免密 sudo → **特权容器真跑逐字脚本**（`LOOP E2E OK`：-32006 拒 + 逐字节 == 埋点）；真 pkexec 降权 / 真 GTK 弹窗 / 真 xdg-open 未验证（security 清单一致）；真实 cf 交叉编译被 libsqlite3-sys C 构建挡 → cfg-flip 探针为等价替代。
+- **记录不修（归 M4/M5）**：eprintln 未含 M1e-tail 字样（指向在模块 doc/注释）；A1a zombie 封口无回归测试（vacuous-pass 低危）；`formatBytes` 类同 T8。
+- 未验证：真机 root/pkexec；CI 2vCPU 实测耗时（按本机外推，超时余量 ≥30×）；B 断言 30× 余量极端压测。
 
 ---
 

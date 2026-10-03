@@ -35,6 +35,16 @@ pub fn carve_jpeg(cur: &mut Cursor<'_>, max_len: u64) -> Option<Carved> {
     })
 }
 
+/// 收集版：与 `carve_jpeg` 共用同一 `walk` 与出口归一（**不复制走链逻辑**），按裁决长度在
+/// `[起点, 起点+len)` 重读字节。重读是确定性的（同设备、同规则）：交付绝不超过裁决区间，
+/// 且只交付实际读到的前缀（坏读/设备外 → 诚实短，与雕刻期交付同判）。
+/// 返回 `(bytes, complete)`；`None` = 与雕刻期同判的假阳性。
+pub fn collect_jpeg(cur: &mut Cursor<'_>, max_len: u64) -> Option<(Vec<u8>, bool)> {
+    let start = cur.pos;
+    let c = carve_jpeg(cur, max_len)?;
+    Some((cur.read_prefix_at(start, c.len), c.complete))
+}
+
 /// 走链主体。返回点的 len 语义见 `carve_jpeg`（上限归一由出口统一执法）。
 fn walk(cur: &mut Cursor<'_>, max_len: u64) -> Option<Carved> {
     let start = cur.pos;

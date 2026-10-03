@@ -64,6 +64,8 @@ pub struct FatImageBuilder {
     fat_type: FatType,
     files: Vec<BuildFile>,
     subdirs: Vec<String>,
+    /// Some(total_sectors)：扩容 FAT16 卷（`fat16_sized`）；None = `FatType::layout` 默认值。
+    total_override: Option<u32>,
 }
 
 impl FatImageBuilder {
@@ -72,6 +74,7 @@ impl FatImageBuilder {
             fat_type: FatType::Fat12,
             files: Vec::new(),
             subdirs: Vec::new(),
+            total_override: None,
         }
     }
 
@@ -80,6 +83,20 @@ impl FatImageBuilder {
             fat_type: FatType::Fat16,
             files: Vec::new(),
             subdirs: Vec::new(),
+            total_override: None,
+        }
+    }
+
+    /// 扩容 FAT16：装下 > CHUNK（4MiB）的单件与多件宽夹具。卷 = total_sectors 扇区；FAT 表
+    /// 按 (total+2)×2B 上取整覆盖（4224 → 17 扇区，与 `layout` 默认值一致 ⇒
+    /// `fat16_sized(TOTAL_SECTORS)` 与 `fat16()` 逐字节相同）。簇数 = 2 + total − data_start，
+    /// 仍须落在 4085..65524（真 FAT16 判定区间）；容量不足时 build 的簇池断言 fail-fast。
+    pub fn fat16_sized(total_sectors: u32) -> Self {
+        Self {
+            fat_type: FatType::Fat16,
+            files: Vec::new(),
+            subdirs: Vec::new(),
+            total_override: Some(total_sectors),
         }
     }
 
@@ -88,6 +105,7 @@ impl FatImageBuilder {
             fat_type: FatType::Fat32,
             files: Vec::new(),
             subdirs: Vec::new(),
+            total_override: None,
         }
     }
 
@@ -126,8 +144,14 @@ impl FatImageBuilder {
     pub fn build(&self) -> Vec<u8> {
         // 布局（扇区）：reserved / FAT#1 / [固定根目录区] / 数据区（簇 N → 扇区
         // data_start + (N-2)）；FAT32 无固定根目录区，根目录占簇 2。
-        let (root_entries, fat_size, reserved, root_cluster, total_sectors) =
+        let (root_entries, fat_size, reserved, root_cluster, default_total) =
             self.fat_type.layout();
+        // FAT16 扩容（`fat16_sized`）：FAT 表覆盖 (total+2) 个 2B 表项；默认布局即本式在
+        // 4224 的取值（17 扇区），故 total_override=None 路径与既往逐字节相同。
+        let (fat_size, total_sectors) = match self.total_override {
+            Some(t) => (((t as u64 + 2) * 2).div_ceil(BPS as u64) as u32, t),
+            None => (fat_size, default_total),
+        };
         let root_sectors = ((root_entries as u32) * 32).div_ceil(BPS);
         let fat_start = reserved;
         let root_start = fat_start + fat_size;
@@ -436,6 +460,33 @@ mod tests {
             .position(|w| &w[..11] == b"HELLO   TXT")
             .unwrap();
         assert_eq!(image[de + 11], 0x20);
+    }
+
+    #[test]
+    fn fat16_sized_reproduces_default_and_extends() {
+        // 默认布局 = 本式在 TOTAL_SECTORS(4224) 的取值：逐字节相同（防公式漂移——
+        // 若 (total+2)×2/512 上取整给出 16/18，data_start 不同 ⇒ 此处即红）
+        assert_eq!(
+            FatImageBuilder::fat16_sized(TOTAL_SECTORS).build(),
+            FatImageBuilder::fat16().build()
+        );
+        // 扩容：卷大小与 BPB 的 total32 / fat_size16 同步放大
+        let img = FatImageBuilder::fat16_sized(9000).build();
+        assert_eq!(img.len(), 9000 * 512);
+        assert_eq!(
+            u32::from_le_bytes([img[32], img[33], img[34], img[35]]),
+            9000
+        );
+        assert_eq!(
+            u16::from_le_bytes([img[22], img[23]]),
+            36,
+            "(9000+2)×2B / 512B 上取整"
+        );
+        // 装得下 4MiB+1 单件（8193 簇；卷池 8931）——簇池不足时 build 已 fail-fast
+        let big = FatImageBuilder::fat16_sized(9000)
+            .add_file("/", "HUGE.BIN", &vec![0u8; 4 * 1024 * 1024 + 1])
+            .build();
+        assert_eq!(big.len(), 9000 * 512);
     }
 
     #[test]
