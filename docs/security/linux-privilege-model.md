@@ -472,3 +472,24 @@ Windows SmartScreen 需「仍要运行」（包内 `README-安装.txt` 亦有说
 - [ ] macOS 签名/公证链（M2）；`xd-daemon` 作为嵌套可执行在硬签名下的 TCC/FDA 授权归属
       （授权属主是 app 还是 daemon）M2 定。
 - [ ] 无 VC++ 运行库的 Windows 机器上便携包的行为（依赖已写入 `README-安装.txt`）。
+
+## 12. M1e 未验证边界总表（M1 出口汇总）
+
+> 口径：以下全部标注「未验证（需真机）」；CI 已实证面**不列入**（各节「已验」段为准——含 Windows/macOS
+> runner 的枚举/读冒烟、root 属主交还双腿 `ran:` 直证、packaging 两 job 产物冒烟、3 OS 全量矩阵）。
+> §5 的 Linux 平台手测清单与本表互补。
+
+| # | 边界 | 来源 | 处置 |
+|---|------|------|------|
+| 1 | 真 UAC / osascript / pkexec 授权对话框与三平台提权端到端链 | T4 §10 | M1 出口真机手测 |
+| 2 | **Windows 提权入口不可达**（非提权枚举为空 ⇒ 首页无设备 ⇒ 走不到提权引导） | T4 计划缺陷② | **M2 补首页入口**（方案 A 已记；现状走 `--device`/镜像注册） |
+| 3 | Windows port-file 可读性 ACL（`icacls`）与 `OpenProcess` 存活探针语义 | T1/T4 §7/§10 | 真机手测 + M2 ACL 收紧 |
+| 4 | **Windows 目标盘同源校验（-32006）缺口**（无 `st_rdev`，`source_rdev` 恒 `None`） | T2 §8 | M2 卷句柄盘号比较 |
+| 5 | **macOS「源=整盘/目标=其分区」-32006 实质盲区**（挂载卷 `st_dev`=分区 dev_t；无 `/sys` 兜底） | T3 §9 | M2 IOKit 盘/分区归属 |
+| 6 | **macOS 未签名包 Gatekeeper**（右键-打开 / `xattr -d com.apple.quarantine`）；F2：模板 `app-sandbox=true` + ad-hoc 签名后 daemon 后插致 bundle seal 失效（首开或报「已损坏」） | T5 §11 | 签名/公证归 M2；首开两路真机手测 |
+| 7 | `packagedDaemonPath()` 运行时回退（仅纯函数单测）；改名 `xiaodun.exe` 真机首启 + SmartScreen；无 VC++ 运行库机器 | T5 §11 | 真机手测 |
+| 8 | 真机枚举/只读/引导区读（Win `\\.\PhysicalDriveN`、mac `/dev/diskN`）；4Kn 512B 读；USB-SATA 桥接盘 BusType/removable；换盘热插拔 | T2/T3 §8/§9 | 真机手测 |
+| 9 | 提权 daemon 生命周期真机行为（owner-pid/空转自退/授权超时弃留窗口/pid 复用与双 daemon 窗口；无 shutdown RPC） | T1/T4 §7/§10 | 真机手测（R11 root 真路径仅 CI） |
+| 10 | `-macos-x64.zip` 物证缺（CI runner=arm64）；`Runner.rc` 版本资源仍写 `xiaodun_ui.exe`（装饰性） | T5 §11 | M2 / 顺手 |
+| 11 | 真机降权落盘属主 / `setgroups` / passwd 缺 uid 警告 | M1d T3 §6 | 真机 root 手测 |
+| 12 | TCC/FDA 真机链路；GUI 真机首启全系（冒烟只证引擎 ping）；`README-安装.txt` 中文条目名在第三方解压器下显示 | T4/T5 §10/§11 | 真机手测 / 记录 |

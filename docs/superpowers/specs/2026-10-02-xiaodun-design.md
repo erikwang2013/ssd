@@ -206,6 +206,13 @@ UI 选设备
 
 IPC：stdio 为主（spawn 时建立），本地 socket 作为重连/CLI 复用通道。
 
+> **实现注记（M1e-tail，2026-10）**：M1 落地与上文目标形态的差异（均已如实标注，见 security 文档 §7-§12 与 README）：
+> - **提权会话通道 = TCP 回环 + 令牌**（`--listen 127.0.0.1:0 --port-file <0600 令牌文件>`；非 pipe/句柄继承——Windows UAC 后父进程 stdio 不可继承）→ §7/§10。
+> - **Windows**：SetupAPI 枚举 + `CreateFileW` 只读；UAC 经 `Start-Process -Verb RunAs`（`-EncodedCommand`）；**应用内入口未接入归 M2**（非提权枚举为空 ⇒ 首页无设备）→ §8/§10.6。
+> - **macOS**：`/dev/diskN`（非 rdisk）+ `osascript do shell script … with administrator privileges`（**≠ FDA**）；`SMAppService` LaunchDaemon helper 归 M2 → §9。
+> - **Linux**：uaccess + polkit 按原案；daemon 生命周期 = `--owner-pid` 监督 + 空转自退（无 shutdown RPC）→ §10。
+> - **打包**：Linux deb（CI 全自动）；Windows 便携 zip / macOS staged zip（**未签名**，公证归 M2；CI 手动 job `packaging=true`）→ §11。
+
 ### 5.2 移动端边界
 
 - **Android**：无 root 仅 MediaStore/SAF 可见范围；root 模式经
