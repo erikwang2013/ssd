@@ -22,6 +22,10 @@ app=$(ls -d "$tmp"/xiaodun-v*-macos-*/xiaodun_ui.app 2>/dev/null | sed -n 1p || 
 [ -x "$app/Contents/MacOS/xiaodun_ui" ] || { echo "FAIL: 缺主程序 Contents/MacOS/xiaodun_ui"; exit 1; }
 [ -x "$app/Contents/MacOS/xd-daemon" ] || { echo "FAIL: 缺引擎 Contents/MacOS/xd-daemon（打包布局约定）"; exit 1; }
 
+# 签名状态如实打印（T10）：签/未签都通过，但留证据（未签名包 codesign -dv 非零退出属预期；
+# 公证/装订状态以 package-macos.sh 的 notarize 输出为准）。
+codesign -dv "$app" 2>&1 || echo "note: codesign -dv 失败（未签名包属预期）——本产物未签名/未公证"
+
 img=$tmp/test.img
 dd if=/dev/zero of="$img" bs=1024 count=64 2>/dev/null
 

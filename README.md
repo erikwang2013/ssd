@@ -202,8 +202,15 @@ bash scripts/e2e-package-smoke.sh
 （常规轮次不跑 flutter build windows/macos）；产物 artifact 名 `xiaodun-windows-zip` /
 `xiaodun-macos-zip`。开发机无法本地验证打包，以 dispatch 一轮 CI 实证。
 
-**macOS 未签名**：当前包未签名/未公证（归 M2，`scripts/notarize.sh` 为占位），首次打开需
-**右键 → 打开**（或 `xattr -d com.apple.quarantine <app>`）绕过 Gatekeeper。
+**macOS 签名/公证（M2 T10）**：打包末尾由 `scripts/notarize.sh` 走真链——逐嵌套 `codesign`
+（引擎 → Frameworks → 整包，`--options runtime --timestamp`）→ `codesign --verify --strict`
+断言 seal 有效 → `notarytool submit --wait` → `stapler staple` + `spctl` 断言。凭据走 CI
+secrets（`APPLE_CERT_P12_BASE64`/`APPLE_CERT_PASSWORD`/`APPLE_TEAM_ID`/`APPLE_ID`/
+`APPLE_APP_PASSWORD`）：**缺任一 ⇒ 具名 `skip:` 行 + 产物名不变（未签名包）**，绝不产半签包。
+Windows 同理：`WINDOWS_CERT_PFX_BASE64`/`WINDOWS_CERT_PASSWORD` 齐备时 `signtool` 签名，缺则具名
+skip。**未签名包首次打开需右键 → 打开**（或 `xattr -d com.apple.quarantine <app>`）绕过
+Gatekeeper；Windows 未签名包 SmartScreen 提示选「仍要运行」。真签名/公证/Gatekeeper 首开归
+**未验证**（凭据未配置，见计划开放问题 O5）。
 
 ## 路线图
 
