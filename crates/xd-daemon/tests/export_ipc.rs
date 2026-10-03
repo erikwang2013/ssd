@@ -488,36 +488,49 @@ fn dir_names(dir: &Path) -> Vec<String> {
     v
 }
 
-/// 本测试的 export worker 在场与否（cmdline 含 `--export-worker` + 本测试独有的 db 路径；
-/// 同二进制并跑的其它用例各用各的 tempdir，不会误配）。
-fn find_export_worker(db: &Path) -> Option<i32> {
-    let db = db.to_str().unwrap();
-    let dir = std::fs::read_dir("/proc").ok()?;
-    for e in dir.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+/// 本测试的 export worker 在场与否：直读 **daemon 的子进程表**
+/// （`/proc/<dpid>/task/*/children`——daemon 只 spawn worker 这一个子进程，故 pid 无歧义），
+/// 再复核 cmdline 含 `--export-worker`（父刚 fork 未 exec 时是父的 cmdline，跳过）；
+/// **zombie（已跑完待收尸）不算在场**（vacuous-pass 封口：拿不到在跑的子就该红）。
+///
+/// 为何不用 `/proc` 全扫 + cmdline 匹配（T3 原实现）：release 下 30×32KiB 全量导出仅 ~4ms
+/// （子进程寿命与之同级），而全扫一次 ~3ms（本机实测，见 T9 报告）⇒ 采样粒度与寿命同量级，
+/// 观测纯靠运气：本机 release 单跑 5 次漏配 4 次（parent b93267a 同样红 = 前存缺陷，非 T9 回归）。
+/// 快路径单次 ~0.1ms ⇒ 同一寿命内可采数十次；CI（更慢）余量更大。
+fn find_export_worker(dpid: u32) -> Option<i32> {
+    for t in std::fs::read_dir(format!("/proc/{dpid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let Ok(children) = std::fs::read_to_string(t.path().join("children")) else {
             continue;
         };
-        let Ok(cmd) = std::fs::read(e.path().join("cmdline")) else {
-            continue; // 他人进程/已退出：权限或竞态
-        };
-        let cmd = String::from_utf8_lossy(&cmd);
-        if cmd.contains("--export-worker") && cmd.contains(db) {
-            return Some(pid);
+        for pid in children
+            .split_whitespace()
+            .filter_map(|x| x.parse::<i32>().ok())
+        {
+            let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue; // 已退出（竞态）
+            };
+            if String::from_utf8_lossy(&cmd).contains("--export-worker") && !worker_exited(pid) {
+                return Some(pid);
+            }
         }
     }
     None
 }
 
-fn wait_export_worker(db: &Path, timeout: Duration) -> Option<i32> {
+fn wait_export_worker(dpid: u32, timeout: Duration) -> Option<i32> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(pid) = find_export_worker(db) {
+        if let Some(pid) = find_export_worker(dpid) {
             return Some(pid);
         }
         if Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -700,8 +713,9 @@ fn epipe_worker_exits_silently_when_parent_dies() {
     let st = read_response(&rx, 3, Duration::from_secs(10));
     assert!(st.get("error").is_none(), "{st}");
 
-    // 子此刻必在场（export.start 返回 = 子已 spawn；30×32KiB 远未跑完）
-    let worker = wait_export_worker(&db, Duration::from_secs(2))
+    // 子此刻必在场：响应写出（t≈1.5ms）远早于子退出（t≈5.5ms，本机 release 实测），
+    // 且采样走子进程表快路径（~0.1ms/次，见 find_export_worker）。
+    let worker = wait_export_worker(child.id(), Duration::from_secs(2))
         .expect("worker 应在场（响应先于子进程结束）");
     // 杀父：子的 stdout 读端关闭 ⇒ 下一次 writeln 必 EPIPE
     child.kill().unwrap();
