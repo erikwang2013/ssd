@@ -6,12 +6,14 @@
 // ③ 扫描页 widget：平台注入（debugDefaultTargetPlatformOverride）+ 假启动器写假 port-file
 //    + 假连接器 → 断言走通、取消文案「未获得授权」、macOS「已提权但仍缺 FDA」栏。
 // **未验证（需真机）**：真 UAC/osascript/pkexec 对话框与提权链、真 FDA 交互。
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:xiaodun_ui/core_client/core_client.dart';
 import 'package:xiaodun_ui/core_client/elevation.dart';
 import 'package:xiaodun_ui/core_client/ipc_transport.dart';
 import 'package:xiaodun_ui/core_client/protocol.dart';
@@ -38,6 +40,9 @@ const _hostilePaths = [
   "/tmp/it's/daemon",
   r'C:\Users\Erik Doe\AppData\Local\Temp\xiaodun-elev-1\session.port',
   r'C:\a"b\x.port',
+  // 含空格且结尾反斜杠：此形态**必须**加引号，加倍规则才被触发（无空格则整串不加引号，
+  // 规则不可达）——Win32 引用若不在收尾引号前加倍，\" 会把收尾引号逃逸掉、参数被吞。
+  r'C:\Program Files\',
   r'/tmp/$(touch /tmp/pwned)',
   '/tmp/`touch /tmp/pwned`',
   '/tmp/a;b&c|d>e',
@@ -178,6 +183,12 @@ void main() {
           reason: silly,
         );
       }
+    });
+
+    test('缺省提权时限/间隔 = 计划裁定（≤30s / 500ms）', () {
+      // 计划 Task 4 Step 2 逐字：「轮询 port-file（≤30s，500ms 间隔；用户可能在认证框上耗时）」
+      expect(kElevationTimeout, const Duration(seconds: 30));
+      expect(kElevationPollInterval, const Duration(milliseconds: 500));
     });
 
     test('macosPlan：osascript 结构 + shell 串在 /bin/sh 上真跑（argv 逐字）', () async {
@@ -400,6 +411,7 @@ void main() {
         FakeCoreClient elevated,
         List<ElevationPlan> plans,
         List<String> portFilesSeen,
+        List<Object> replaced,
       })
     >
     pumpElevation(
@@ -419,11 +431,13 @@ void main() {
       final elevated = FakeCoreClient(failWith: elevatedFailWith);
       final plans = <ElevationPlan>[];
       final seen = <String>[];
+      final replaced = <Object>[];
       await tester.pumpWidget(
         MaterialApp(
           home: ScanPage(
             client: local,
             device: _device,
+            onClientReplaced: replaced.add,
             elevationLauncher: (plan) async {
               plans.add(plan);
               final code = launcherExit == null
@@ -465,6 +479,7 @@ void main() {
         elevated: elevated,
         plans: plans,
         portFilesSeen: seen,
+        replaced: replaced,
       );
     }
 
@@ -499,6 +514,9 @@ void main() {
         contains('scanStart(image:test.img, mode:quick)'),
       );
       expect(find.text('暂停'), findsOneWidget);
+      // 应用层换用提权 client：main.dart 靠这个回调把 app 级 `_client` 换成提权会话
+      // （摘掉回调后首页后续页面仍持**已关闭**的旧 client；qual-m1e-t4 变异 D13 的钉子）。
+      expect(ctx.replaced.single, same(ctx.elevated));
       await tester.pumpWidget(const SizedBox());
       await tester.pump();
       debugDefaultTargetPlatformOverride = null;
@@ -524,6 +542,50 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     });
 
+    testWidgets('提权期间：页面如实显示「等待授权…」且交互禁用（认证框可久置）', (tester) async {
+      // 计划 Task 4 Step 2 / §10.2：提权会话建立中禁交互（starting 即 busy）、文案「等待授权…」
+      // ——挂起的连接器（授权框久置的替身）下必须有此可见状态（qual-m1e-t4 补钉）。
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      final local = FakeCoreClient(
+        daemonPathOverride: _daemon,
+        failWith: (method) =>
+            method == 'scanStart' ? const RpcException(-32001, 'denied') : null,
+      );
+      final hang = Completer<CoreClient>();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScanPage(
+            client: local,
+            device: _device,
+            elevationLauncher: (plan) => Completer<int>().future, // 假启动器：不落定
+            elevationConnect: ({
+              required portFile,
+              required launcherExit,
+              required timeout,
+              required interval,
+            }) => hang.future, // 授权框久置：连接器挂起
+          ),
+        ),
+      );
+      await tester.tap(find.text('开始扫描'));
+      await flush(tester);
+      await tester.tap(find.text('授权后重试'));
+      await flush(tester);
+
+      expect(find.text('等待授权…'), findsOneWidget, reason: '提权建立中必须如实告知');
+      expect(
+        find.text('扫描中…'),
+        findsOneWidget,
+        reason: 'starting 即 busy：开始按钮禁用',
+      );
+
+      // 收尾：让挂起的连接器以超时落定，控制器走失败分流（不悬挂）
+      hang.completeError(ElevationTimeoutException('测试收尾'));
+      await flush(tester);
+      expect(find.textContaining('未获得授权'), findsOneWidget);
+      debugDefaultTargetPlatformOverride = null;
+    });
+
     testWidgets('macOS：已提权仍 -32001 → 「已提权但仍缺完全磁盘访问」栏，不再弹提权框', (tester) async {
       final ctx = await pumpElevation(
         tester,
@@ -540,11 +602,15 @@ void main() {
       expect(ctx.plans.single.executable, 'osascript');
       // 会话目录必须**真为** 0700：`createTempSync` 跟随 umask（实测 0002 ⇒ 0775），
       // 同组用户可替换 session.port ⇒ 控制器建目录后显式 chmod（见 scan_controller）。
-      expect(
-        File(ctx.portFilesSeen.single).parent.statSync().mode & 0x1FF,
-        0x1C0,
-        reason: '会话目录须显式 chmod 0700，不得听凭 umask',
-      );
+      // Windows 无 POSIX 位且控制器跳过 chmod ⇒ 该断言在 Windows 主机上无意义（先例：
+      // ipc_transport_test 的 `skip: Platform.isWindows ? … : null`）。
+      if (!Platform.isWindows) {
+        expect(
+          File(ctx.portFilesSeen.single).parent.statSync().mode & 0x1FF,
+          0x1C0,
+          reason: '会话目录须显式 chmod 0700，不得听凭 umask',
+        );
+      }
       expect(find.textContaining('已提权但仍缺完全磁盘访问'), findsOneWidget);
       expect(find.textContaining('隐私与安全性'), findsOneWidget);
       expect(
