@@ -343,7 +343,10 @@ argv（§3），能少一个「任意文件路径」参数就少一个攻击面�
 
 1. 扫描页 -32001 → 对话框「需要管理员权限访问该设备」→ [授权后重试]；
 2. UI 自建 **0700 会话目录**（`Directory.systemTemp.createTempSync('xiaodun-elev-')`，属主恒为
-   UI 用户）→ port-file 路径 `<dir>/session.port` → 构造平台计划（`--owner-pid` = UI 进程 pid）；
+   UI 用户；**建后显式 `chmod 700`**——`createTempSync` 无 mode 参数且跟随 umask，实测 umask
+   `0002` ⇒ `0775`，同组用户可 unlink/替换 `session.port`（UI 读前 race）故不能听凭 umask；
+   Windows 无 POSIX 位，跳过）→ port-file 路径 `<dir>/session.port` → 构造平台计划
+   （`--owner-pid` = UI 进程 pid）；
 3. 起提权进程与轮询**并行**：`connectElevatedSession` 轮询 port-file（≤30s、500ms——用户可能
    在认证框上久置），读到就连接 + `ping` 握手探针；
 4. 成功后：换 `_client`（新 `SocketCoreClient` 提权会话）、关旧 client、清旧会话目录、重试
@@ -379,7 +382,8 @@ UAC/osascript 提权后父进程拿不到子进程句柄（这正是 TCP 会话�
 0600 的语义是「**属主**可读」：root daemon 写的 port-file 属主 = root ⇒ UI 用户读不到令牌，
 **整条提权链在此断掉**（提权成功、会话建不起来）。修法：daemon 写 port-file 时若自身 euid 为
 root，把临时文件的属主/属组改成**目标目录的属主/属组**（`adopt_owner_of_dir`，紧接在原子
-`rename` 前）；UI 侧对应地用自己 0700 的临时目录，故交还后读者恒为 UI 用户。非提权写入
+`rename` 前）；UI 侧对应地用自己 0700（**显式 chmod**，见 10.2）的临时目录，故交还后读者恒为
+UI 用户。非提权写入
 （属主 == 目录属主）不改属主，行为与 §7 一致（测试
 `port_file_is_0600_and_leaves_no_temp_file` 断言这一点）。
 
@@ -389,8 +393,9 @@ root，把临时文件的属主/属组改成**目标目录的属主/属组**（`
   （比如共享 `/tmp` 下他人预设的目录），令牌会落到那个用户手里。M1 的调用方只有本项目 UI
   （`createTempSync` 随机名 + `create_new`），风险面 = 同机其他用户**预先**用可预测路径诱导；
   M2 改为 fd 传递或校验调用者 uid，去掉「按目录属主推断」这一环。
-- **交还只改属主不改目录权限**：目录权限由 UI 保证（0700）。UI 目录若被替换/软链，交还目标随之
-  变化——同样归 M2 的 fd 传递方案。
+- **交还只改属主不改目录权限**：目录权限由 UI 保证（**显式 `chmod 700`**，见 10.2——仅靠
+  `createTempSync` 会跟随 umask，`0002` 下实为 0775，已修）。UI 目录若被替换/软链，交还目标
+  随之变化——同样归 M2 的 fd 传递方案。
 
 ### 10.5 已知限制（M1 明示接受）
 
@@ -411,7 +416,8 @@ root，把临时文件的属主/属组改成**目标目录的属主/属组**（`
   编解码往返。
 - 会话建立：真 socket + 假 daemon 全跑——成功、两种半行形态重试、超时收口（<2s）、取消快速
   拒绝（<3s）、`spawnElevation` 真起进程返回退出码。
-- 扫描页：三平台 widget 流（走通换 client 并重试 `scanStart`、取消文案、macOS FDA 栏）。
+- 扫描页：三平台 widget 流（走通换 client 并重试 `scanStart`、取消文案、macOS FDA 栏），
+  含会话目录**实际 mode 断言** `mode & 0o777 == 0o700`（umask `0002` 下曾为 0775）。
 - daemon 生命周期（非 root 可跑）：属主消亡 ⇒ 自退 + 清 port-file（`daemon_exits_and_cleans_
   port_file_when_owner_dies`）、末连接断开 ⇒ 空转自退（`daemon_exits_after_last_authenticated_
   connection_drops`）、`--owner-pid` 单独给出被拒（`owner_pid_without_tcp_session_is_rejected`）。

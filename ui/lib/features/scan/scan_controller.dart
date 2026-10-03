@@ -98,7 +98,7 @@ class ScanController extends ChangeNotifier {
   bool _elevatedSession = false;
   bool get elevatedSession => _elevatedSession;
 
-  /// 提权会话目录（UI 自建的 0700 临时目录，root daemon 把 port-file 属主交还其属主）。
+  /// 提权会话目录（UI 自建并 chmod 0700 的临时目录，root daemon 把 port-file 属主交还其属主）。
   Directory? _elevationDir;
 
   /// 生效中的客户端（特权重启/提权会话替换后为新的；页面转结果页须用它而非旧引用）。
@@ -234,9 +234,14 @@ class ScanController extends ChangeNotifier {
     _notify();
     Directory? dir;
     try {
-      // UI 自建 0700 会话目录：root daemon 写 port-file 时把属主交还目录属主（本用户），
-      // 否则 0600 属主=root，UI 读不到令牌（见 crates/xd-daemon/src/portfile.rs）。
+      // UI 自建 0700 会话目录（建后显式 chmod，防 umask 放宽）：root daemon 写 port-file 时把
+      // 属主交还目录属主（本用户），否则 0600 属主=root，UI 读不到令牌（见 portfile.rs）。
       dir = Directory.systemTemp.createTempSync('xiaodun-elev-');
+      // `createTempSync` 无 mode 参数且**跟随 umask**（实测 0002 ⇒ 0775）：同组用户可 unlink/
+      // 替换 session.port（UI 读前 race）⇒ 显式收紧到 0700。Windows 无 POSIX 位（ACL 见 §10.5）。
+      if (!Platform.isWindows) {
+        Process.runSync('chmod', ['700', dir.path]);
+      }
       final portFile = '${dir.path}/session.port';
       final plan = elevationPlanFor(
         defaultTargetPlatform,

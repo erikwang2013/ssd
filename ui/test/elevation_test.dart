@@ -538,6 +538,13 @@ void main() {
       await flush(tester);
 
       expect(ctx.plans.single.executable, 'osascript');
+      // 会话目录必须**真为** 0700：`createTempSync` 跟随 umask（实测 0002 ⇒ 0775），
+      // 同组用户可替换 session.port ⇒ 控制器建目录后显式 chmod（见 scan_controller）。
+      expect(
+        File(ctx.portFilesSeen.single).parent.statSync().mode & 0x1FF,
+        0x1C0,
+        reason: '会话目录须显式 chmod 0700，不得听凭 umask',
+      );
       expect(find.textContaining('已提权但仍缺完全磁盘访问'), findsOneWidget);
       expect(find.textContaining('隐私与安全性'), findsOneWidget);
       expect(
