@@ -51,6 +51,8 @@ try {
 
   $out = '{"jsonrpc":"2.0","id":1,"method":"ping","params":null}' | & $daemon --image $img
   $out | Out-Host
+  # Exit code first: a daemon that answered ping and then crashed must not pass.
+  if ($LASTEXITCODE -ne 0) { throw "FAIL: daemon exited with $LASTEXITCODE" }
   if (-not ($out -match '"pong":true')) { throw 'FAIL: ping produced no pong' }
 
   Write-Host 'PACKAGE SMOKE OK (Windows)'
