@@ -198,6 +198,10 @@ cd ui && XD_DAEMON_BIN=../target/debug/xd-daemon flutter test   # 追加真 daem
   （Rust 夹具镜像 → 真 daemon → 扫描 → 预览回读 → 导出 → 报告逐字节）进 CI，e2e-loop 增
   「环回挂载点导出断言 `-32006` + 普通目录导出逐字节比对」真集成段
 
+**已知限制（M1e 平台层）**：Windows 目标盘同源校验（-32006）M1 不做——Windows 无 `st_rdev`，
+`source_rdev` 恒 `None`（M2 补，卷句柄盘号比较）；Windows 物理盘枚举/只读打开**未验证（需真机）**
+（CI 只证枚举/读冒烟，且枚举需管理员权限）。细节见 `docs/security/linux-privilege-model.md` §8。
+
 M1 剩余切片：Windows/macOS 平台层与打包。
 目标：全端 1.0 约 9-12 个月（5-6 人团队，4 条工作流并行）。
 

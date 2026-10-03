@@ -469,6 +469,7 @@ version = "0.3.0"
 dependencies = [
  "serde",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

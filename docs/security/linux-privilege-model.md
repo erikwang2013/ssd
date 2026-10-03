@@ -230,3 +230,34 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
       用户可读——M1 出口真机 `icacls` 核对。
 - [ ] 真 UAC/osascript 提权引导拉起 TCP daemon 的端到端（Task 4 交付；CI 无桌面）。
 - [ ] macOS 全盘访问（TCC）路径下的提权会话（同上）。
+
+## 8. Windows 平台层（M1e-tail T2：SetupAPI 枚举 + 只读物理盘句柄）
+
+**实现**：`crates/xd-device/src/windows.rs` —— `SetupDiGetClassDevsW(GUID_DEVINTERFACE_DISK)`
+逐盘取接口路径 → 只读打开（desired access 仅 `GENERIC_READ`，共享 `READ|WRITE`，`OPEN_EXISTING`，
+**不加** `FILE_FLAG_NO_BUFFERING`）→ `IOCTL_STORAGE_GET_DEVICE_NUMBER` 得盘号 → 路径/id
+`win:\\.\PhysicalDriveN` → `IOCTL_DISK_GET_LENGTH_INFO` 取大小、`IOCTL_STORAGE_QUERY_PROPERTY
+(BusType)` 映射 transport（usb/sata/nvme/other；removable = Usb/1394/Sd）→ `read_at` =
+`SetFilePointerEx`+`ReadFile`（`io_lock` 串行化内核文件游标；读越尾按设备大小钳位为短读，
+同 Linux pread 语义）。daemon 侧 `--device \\.\PhysicalDriveN` 走同源打开。只读铁律：全文件
+无任何写 API（无 `GENERIC_WRITE`/`WriteFile`/`FILE_WRITE_DATA`）。
+
+**已知限制（M1 明示接受）**：
+
+- **同盘校验缺口（-32006）**：Windows 无 `st_rdev`，`WindowsBlockDevice::source_rdev` 恒 `None`
+  ⇒ 按 M1d 契约（None = 不做同盘校验，与镜像源同款），导出目标与源盘**同盘时不被拦截**。
+  M1 的 Windows 用户须自行避免把恢复结果写回源盘；**Windows 目标盘同源校验 M2 补
+  （卷句柄卷号比较：对目标卷与源盘各取 `IOCTL_STORAGE_GET_DEVICE_NUMBER` 比盘号）**。
+- **枚举需管理员**：`IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 带 `FILE_READ_ACCESS`，且 Vista+
+  上物理盘 `GENERIC_READ` 打开即需提权 ⇒ 非提权进程拿不到盘列表。M1e 本切片 daemon 侧未接
+  Windows 枚举（Windows 上 `device.list` 仅含 `--image` 注册项）；Windows daemon 由 UAC 提权
+  拉起（Task 4）——非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）归 M2 评估。
+- **transport/removable 仅提示**：BusType 归类不参与任何过滤（同 Linux 口径）；两平台归类可
+  不一致（如 USB-SATA 桥接盘），以各自真机行为为准（见下）。
+
+**未验证（需真机）**：
+
+- [ ] 真机枚举/只读打开/引导区读（CI windows runner 实跑同路径冒烟：枚举 ≥1 盘、`PhysicalDrive0`
+      读 512B、越尾短读——`crates/xd-device/tests/windows_smoke.rs`）；真机差异面：换盘热插拔、
+      USB-SATA 桥接盘的 BusType/removable 归类、4Kn 扇区盘的 512B 读。
+- [ ] UAC 提权 daemon 下 `--device` 全链路与同盘校验缺口的用户可见性（Task 4 交付）。

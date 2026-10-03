@@ -4,6 +4,8 @@
 pub mod image;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(windows)]
+pub mod windows;
 
 use serde::{Deserialize, Serialize};
 
