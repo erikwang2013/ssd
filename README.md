@@ -36,7 +36,7 @@
 | 平台 | 引擎（枚举 / 只读 / 提权） | 打包 | 状态 |
 |---|---|---|---|
 | Linux | sysfs 枚举 + 只读 + `pkexec` 提权（uaccess 免密路径） | deb（daemon + polkit + udev） | 可用（真机未验证） |
-| Windows | SetupAPI 枚举 + 只读；UAC 提权链已备、**应用内入口未接入（M2）** | 便携 zip | 可用（真机未验证） |
+| Windows | SetupAPI 枚举 + 只读；UAC 提权（首页空列表「以管理员身份重启引擎」入口 + 应用内引导） | 便携 zip | 可用（真机未验证） |
 | macOS | `/dev/diskN` 枚举 + 只读 + `osascript` 提权（≠ 完全磁盘访问授权） | staged zip（未签名；公证归 M2） | 可用（真机未验证） |
 
 「可用（真机未验证）」= 代码与 CI 冒烟（两 runner 真跑枚举/读）已通过，真机路径
@@ -196,7 +196,7 @@ bash scripts/e2e-package-smoke.sh
 
 包内布局：主程序与 `xd-daemon[.exe]` **同目录**（`xiaodun.exe` + `xd-daemon.exe` / `.app` 的
 `Contents/MacOS/xd-daemon`）——界面按此自动发现引擎（`XD_DAEMON_BIN` 可覆盖），冒烟脚本断言该布局。
-包内 `README-安装.txt` 说明当前 Windows 权限现状（提权入口未接入，M2）。
+包内 `README-安装.txt` 说明当前 Windows 权限现状（首页提权入口；真机 UAC 交互未验证）。
 
 两个平台都是**手动 CI job**：Actions → CI → Run workflow 勾选 `packaging=true`
 （常规轮次不跑 flutter build windows/macos）；产物 artifact 名 `xiaodun-windows-zip` /
@@ -249,7 +249,9 @@ Gatekeeper；Windows 未签名包 SmartScreen 提示选「仍要运行」。真�
 **已知限制（M1e 平台层）**：Windows 目标盘同源校验（-32006）M1 不做——Windows 无 `st_rdev`，
 `source_rdev` 恒 `None`（M2 补，卷句柄盘号比较）；Windows 物理盘枚举/只读打开**未验证（需真机）**
 （CI 只证枚举/读冒烟，且枚举需管理员权限）。Windows 的 UAC 提权链（命令构造/回环会话/生命周期，
-T4）已就位，但**应用内入口未接入**：非提权时枚举为空 ⇒ 首页无设备 ⇒ 走不到提权引导，M2 补首页入口。
+T4）已就位，**应用内入口已补（M2 T6）**：非提权时枚举为空 ⇒ 首页给「以管理员身份重启引擎」入口
+（走同一条提权会话流；取消/超时给出原因，macOS 侧另有「已提权仍空 ⇒ 完全磁盘访问」提示）。
+真 UAC 授权框交互仍**未验证（需真机）**。
 macOS `/dev/diskN` 枚举/只读打开同样**未验证（需真机）**（非 root/无完全磁盘访问时枚举仅列盘、容量记 0）；
 macOS 的 -32006 亦实质未封——挂载卷 `st_dev` 是分区 `dev_t`、源侧 `st_rdev` 是整盘 `dev_t`，
 且无 `/sys` 祖先链兜底（M2 以 IOKit 补，与 Windows 缺口同级）；macOS 的 `osascript` 提权

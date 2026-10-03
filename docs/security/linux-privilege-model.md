@@ -255,8 +255,8 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
 - **枚举需管理员**：`IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 带 `FILE_READ_ACCESS`，且 Vista+
   上物理盘 `GENERIC_READ` 打开即需提权 ⇒ 非提权进程拿不到盘列表。daemon 侧枚举已由 T4 接线
   （`enumerate_startup_list` + `win:` 分派 opener，`device.list` = 启动枚举 + `--image`/`--device`
-  注册项）；但**应用内 UAC 入口未接入**（非提权 ⇒ 枚举空 ⇒ 首页无设备 ⇒ 走不到提权引导，§10.6 末条，
-  M2 补）。非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）归 M2 评估。
+  注册项）；**应用内 UAC 入口已接入（M2 T6）**：首页空列表给「以管理员身份重启引擎」入口（§13.1）；
+  非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）已评估、不实现（§13.2，方案 A 定稿）。
 - **transport/removable 仅提示**：BusType 归类不参与任何过滤（同 Linux 口径）；两平台归类可
   不一致（如 USB-SATA 桥接盘），以各自真机行为为准（见下）。
 
@@ -435,6 +435,8 @@ UI 用户。非提权写入
 - [ ] 真机 pid 复用窗口与双 daemon 并存窗口的可见性（需构造属主瞬时被杀）。
 - [ ] **UI 侧入口缺口（T4 已记录，未修）**：Windows 非提权时枚举为空 ⇒ 首页无设备 ⇒ 用户走
       不到扫描页的 -32001 引导。M2 需在首页给提权入口（或非提权枚举面，§8）。
+      → **M2 T6 已补**：首页空列表提权入口（方案 A 定稿）+ 非提权枚举评估结论（§13）；
+      真 UAC 授权框交互仍归真机手测（上一条）。
 
 ## 11. 打包与分发（M1e-tail T5）
 
@@ -495,7 +497,7 @@ macOS Gatekeeper 首次打开需右键-打开（或清 quarantine 属性）、Wi
 | # | 边界 | 来源 | 处置 |
 |---|------|------|------|
 | 1 | 真 UAC / osascript / pkexec 授权对话框与三平台提权端到端链 | T4 §10 | M1 出口真机手测 |
-| 2 | **Windows 提权入口不可达**（非提权枚举为空 ⇒ 首页无设备 ⇒ 走不到提权引导） | T4 计划缺陷② | **M2 补首页入口**（方案 A 已记；现状走 `--device`/镜像注册） |
+| 2 | **Windows 提权入口不可达**（非提权枚举为空 ⇒ 首页无设备 ⇒ 走不到提权引导） | T4 计划缺陷② | **M2 T6 已补**：首页空列表提权入口「以管理员身份重启引擎」（方案 A 定稿，§13）；真 UAC 端到端归真机手测（行 1） |
 | 3 | Windows port-file 可读性 ACL（`icacls`）与 `OpenProcess` 存活探针语义 | T1/T4 §7/§10 | 真机手测 + M2 ACL 收紧 |
 | 4 | **Windows 目标盘同源校验（-32006）缺口**（无 `st_rdev`，`source_rdev` 恒 `None`） | T2 §8 | M2 卷句柄盘号比较 |
 | 5 | **macOS「源=整盘/目标=其分区」-32006 实质盲区**（挂载卷 `st_dev`=分区 dev_t；无 `/sys` 兜底） | T3 §9 | M2 IOKit 盘/分区归属 |
@@ -506,3 +508,64 @@ macOS Gatekeeper 首次打开需右键-打开（或清 quarantine 属性）、Wi
 | 10 | `-macos-x64.zip` 物证缺（CI runner=arm64）；`Runner.rc` 版本资源仍写 `xiaodun_ui.exe`（装饰性） | T5 §11 | M2 / 顺手 |
 | 11 | 真机降权落盘属主 / `setgroups` / passwd 缺 uid 警告 | M1d T3 §6 | 真机 root 手测 |
 | 12 | TCC/FDA 真机链路；GUI 真机首启全系（冒烟只证引擎 ping）；`README-安装.txt` 中文条目名在第三方解压器下显示 | T4/T5 §10/§11 | 真机手测 / 记录 |
+
+## 13. 首页提权入口（M2 T6）与非提权枚举评估（缺陷②）
+
+**实现**：`ui/lib/home_page.dart`（空列表提权入口 → 换 client → 重列设备）、
+`ui/lib/core_client/elevation.dart::elevateSession`（提权流自 `scan_controller` 抽出的**唯一**
+实现：0700 会话目录 → 平台计划 → 起提权进程 → 轮询 port-file ≤30s/500ms（半行双形态重试）→
+TCP 握手 → 返回提权会话 client；失败清理会话目录并抛异常）。
+
+### 13.1 入口语义（三平台同一分支）
+
+设备列表为空且平台 ∈ {Windows, macOS, Linux} ⇒ 首页展示「以管理员身份重启引擎」按钮 + 说明
+文案；点击经 `elevateSession`（`--owner-pid` = UI pid；`daemonPath` = client 记录的实际二进制，
+打包布局 `packagedDaemonPath()` 回退）建立提权会话 → `onClientReplaced`（main.dart 换 app 级
+client）→ 重列设备；**旧非提权 client 显式关闭**（其为 UI 子进程，关闭等价令其退出——§10.2
+的旧路径；`daemon.shutdown` RPC 属 T7）。失败 ⇒ 既有文案「未获得授权（原因）」+ 可重试
+（不换 client、不关旧 client）；macOS 提权成功仍空列表 ⇒「已提权但仍缺完全磁盘访问（系统设置 >
+隐私与安全性）」（`kMacosFdaHint`，与扫描页同一常量，§9/§10.2）；会话目录失败即清、换用时清旧目录、页面销毁即清（含提权在途卸载分支）；daemon 侧自清 port-file（§10）。
+
+**已验（widget 层，假启动器 + 假 port-file + 假连接器）**：三平台按钮可见性；走通 = 换 client
+并重列设备、旧 client 被关闭；取消 = 「未获得授权」+ 不换/不关旧 client + 失败会话目录已清；
+macOS FDA 提示。扫描页 17 枚提权钉（实测）零回归（同一 `elevateSession` 共享流）。
+
+**未验证（需真机）**：真 UAC/osascript/pkexec 对话框与提权端到端（CI runner 无桌面/无交互
+会话）；真 FDA 交互（与 §10.6 同口径）。
+
+### 13.2 非提权枚举评估（一步；结论：方案 A 定稿，不追加实现）
+
+评估对象：Windows 下用 0 access（`dwDesiredAccess = 0`）打开 `\\.\PhysicalDriveN` +
+`IOCTL_STORAGE_QUERY_PROPERTY` 能否在非提权下列盘（含容量）。
+
+**查证事实（文档级，未真机复验）**：
+
+- `dwDesiredAccess = 0` 是 CreateFile 的文档化用法——「允许应用在不访问设备的情况下查询设备
+  属性」，物理盘名 `\\.\PhysicalDriveN` 为文档列举形态（Microsoft CreateFileW 文档）。
+- `IOCTL_STORAGE_QUERY_PROPERTY` 的 CTL_CODE 访问位 = **FILE_ANY_ACCESS**（`CTL_CODE(FILE_DEVICE_MASS_STORAGE 0x2D, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)`；`IOCTL_STORAGE_BASE` = 0x2D，0x0500 为 Function 号）⇒ 任意句柄（含 0 access）可查 `STORAGE_DEVICE_DESCRIPTOR`（BusType/vendor/product
+  ——即现有 `query_descriptor` 的全部字段）；`IOCTL_STORAGE_GET_DEVICE_NUMBER` 同为
+  FILE_ANY_ACCESS（§8 已依赖）。
+- `IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 访问位 = **FILE_READ_ACCESS**（`0x7405C`）⇒ 需读
+  权限；非提权对物理盘的 `GENERIC_READ` 打开本身即被拒 ⇒ **容量在非提权上下文拿不到**（与计划
+  预判一致；现有枚举「size 必得」（§8）即由此而来）。
+- 残余不确定性：有个别存储栈（报告为 stornvme）对句柄访问位更严的记载——「非提权一定可查」
+  不是硬保证，需真机逐机型复验。
+  （Microsoft CreateFileW 文档对物理盘/卷打开本身另注「caller must have administrative
+  privileges」——若该条对 0-access 亦成立，只会加强「不追加实现」结论。）
+- 备选（唯一能拿容量的路径）：Storage WMI（`MSFT_PhysicalDisk` / `Get-PhysicalDisk`）——该
+  命名空间对标准用户常见 Access Denied（需管理员预授权限才可读），且引入 COM/WMI 机制，
+  代价远大于收益。
+
+**判定（不追加实现，方案 A 定稿）**：
+
+1. 0-access 列盘只能给出**无容量**的设备行（首页设备 tile 的主信息就是容量）——T6 入口已给出
+   完整可用路径（空列表 → 一键提权 → 带容量的完整列表），半成品列表反而是退化 UX；
+2. 它**不减少任何提权需求**：读/扫描仍要 `GENERIC_READ`（管理员），点开无容量设备仍会在扫描页
+   撞 -32001 再弹提权框——只是把「看不到设备」换成「看得到、点了报权限」；
+3. **无验证环境**：CI Windows runner 以管理员身份运行（该回退分支永不触发）、开发机为 Linux ⇒
+   新增平台路径在现有全部环境都跑不到——即交付一条无人验证过的分支代码，违背纪律 #4
+   （CI 能验的必须验；不能验的必须标注未验证）；据此不纳入本里程碑。
+
+M2 内不再评估；若日后具备真机 Windows 测试条件且产品确需「非提权亦可见设备」，按上述三条
+IOCTL 访问位事实实施即可（`open_readonly` 的 0-access 变体 + size 0 语义 + 首页/扫描页「容量待
+提权后补全」文案）。

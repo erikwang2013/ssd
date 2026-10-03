@@ -222,8 +222,12 @@ class FakeCoreClient implements CoreClient {
     _fail('exportCancel');
   }
 
+  /// close() 是否被调用过（换 client 后旧 client 必须被处置；取消/失败路径不得关它）。
+  bool closed = false;
+
   @override
   Future<void> close() async {
+    closed = true;
     if (!_notifications.isClosed) await _notifications.close();
   }
 }
