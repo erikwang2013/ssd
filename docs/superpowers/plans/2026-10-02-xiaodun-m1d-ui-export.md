@@ -895,6 +895,18 @@ Scaffold('恢复文件')
 - **记录不修（归 M4/M5）**：eprintln 未含 M1e-tail 字样（指向在模块 doc/注释）；A1a zombie 封口无回归测试（vacuous-pass 低危）；`formatBytes` 类同 T8。
 - 未验证：真机 root/pkexec；CI 2vCPU 实测耗时（按本机外推，超时余量 ≥30×）；B 断言 30× 余量极端压测。
 
+## 执行记录：出口验收（lead 执行）
+
+**Step 1 全量门禁（本地，冻结态 `c069efa`）**：build ✓ / `fmt` ✓ / `clippy -D warnings` ✓ / **workspace debug 446 passed / 0 failed（24 目标）** / **release 同数全 ok** / `scripts/e2e.sh` **E2E OK** / flutter `+115 ~2`（无 env）与 `+117`（XD_DAEMON_BIN，含 T9 集成）/ `analyze` 0 issues / `dart format` 33 文件 0 changed。
+
+**Step 2 评审与变异账**：T9 轮 qual 计划 Step 4 七项全 KILL（#6 降权为记录项，与 security/e2e/README 三处口径一致）；附加矩阵 A1d 把旧 /proc 慢扫跑出**不稳定红**（EPIPE 快路径修复承重成立）、A2「偏移不推进」**只有逐字节比对能杀**（终报仍 succeeded=1、首差字节 @4194304）、B0 对照臂直证加固前该窗静默通过。累计变异：T7 24 + T8 54 + T9 约 25 ≈ **103**（qual）；spec 探针另计 30+。
+
+**Step 3 文档**：README（功能表/项目状态）；security §6（T9 验证面 + **非 unix 边注** + 未验证清单）；设计 §4.5 实现注记；本计划 T7/T8/T9 执行记录 + 可移植性链 + T3 任务书同步（`MetadataExt::dev`/非 unix 语义）。
+
+**Step 4 合入与 CI**：`--no-ff` merge 至 main（`c51530e`）；**CI run `37108993766` 全 5 job 绿**（rust×3 + flutter + package-deb，head=c51530e）。并行预跑 4 轮（`37106733704`→`37107356111`→`37107808841`→`37108287985`）在出口前抓出并闭环 **3 OS 编译/运行回归**（macOS `st_dev` 类型；Windows `rustix` 三批未门控；`-32008` 用例 unix 路径伪影 + fail-fast 掩盖），修复链 5 笔（`e4b59c9`…`c069efa`）；ubuntu job 的 e2e-loop 真环回（-32006 拒 + 逐字节）与 flutter job 的真 daemon 集成（117/0）随 CI 闭环。
+
+**M1d 验收结论：通过 → 本切片关闭（M1 收口）。** 关键账：计划级缺陷 3+（68B 笔误、e2e-loop 字面 `/mnt` 不可建、骨架计数歧义）；施工漏网 4 类（可移植性，由并行 CI 预跑在出口前抓出）；交付面：契约 v1.2（13 new golden + 5 错误码双侧逐字）、三页 UI + 导出报告、分片读取（引擎 + 雕刻回读）、降权导出子进程（非 root 路径全覆盖；root/pkexec 待真机）、全链路集成测试（镜像→扫描→预览→导出逐字节）。provenance 待发版重签（用户触发的发布流程）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
