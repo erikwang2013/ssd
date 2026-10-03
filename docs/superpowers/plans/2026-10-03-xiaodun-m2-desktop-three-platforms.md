@@ -485,6 +485,14 @@ pub fn media_hints(dev: &str) -> (Option<&'static str>, Option<bool>)
 - **移交**：T2=勿重复已就位映射/快扫臂；填引擎时删 `Unsupported`；observer「后序+quality 终值」须镜像或声明偏离。T4=superblock 结构校验（fail-closed 硬要求）。T7=shutdown handler（契约已钉，Dart 分发臂同步）。共享热点=4 分派点穷尽 + golden 集合断言 3 处联动。
 - **未验证**：真卷/真设备 probe（T2 oracle 首检）、真块设备 2048B 读语义、Windows 本地检出复现（CI 代）、packaging×`-text` 交互未演练。
 
+### T10（签名/公证链 + F2 entitlements + Runner.rc）—— impl-m2-t10。提交沿革：`a0c68cf`（主）→ `98dfe1a`（收口补钉 P-A..P-E）→ 合并 `785641a` → CI 红（macOS 腿，误诊为 `${!v:-}`）→ `de2eebd`/`090f184`（误修）→ CI 再红 → **R2 真根因**：`0e81949` → qual 3/3 KILL 验证 → 合并 `af40294`。DONE → spec **PASS**（含 P2 无牙修正为 P-A）→ qual **APPROVED**（收口增复后）→ R2 **通过**（3/3 KILL）。**CI 5/5 全绿 @ `af40294`（macOS 腿真 bash 3.2 通过）**
+
+- **交付**：`scripts/notarize.sh` 真链（逐嵌套 codesign → `--verify --strict` → notarytool `--wait` → staple → spctl；凭据门控先于一切动作，缺任一 ⇒ 具名 `skip:` + exit 0，**绝无半签包**）；F2 entitlements（App Sandbox 键删除、JIT 保留）；Runner.rc 版本资源收口；Windows `signtool` 钩子同构 skip 门控；打包 3.2 兼容 smoke。
+- **★ macOS 腿二红真根因（lead 实证，R2）**：报错 `line 30`（改前）/`line 36`（改后）= **同一行**（skip echo，位移 6 = 新增注释行数）。真根因：`$missing` 后紧跟 CJK 标点 `；`（UTF-8 首字节 0xEF）被 macOS bash 3.2 并入变量名（`missing\xEF`）⇒ `set -u` 下 unbound。R1 的 `${!v:-}` 间接展开归因**不成立**（该形态未报错）。修法：三处 `$var` 邻非 ASCII 一律花括号定界（`notarize.sh:40/94`、`e2e-loop.sh:132`）；新增静态钉 `shell_scripts_avoid_unbraced_var_adjacent_to_non_ascii`（`git ls-files '*.sh'` 全量字节扫描——本机 bash 5 任意 locale 复现不出，静态钉是本机唯一确定性门禁）。
+- **R2 qual 独立验证**：杀灭力 3/3 KILL（均报精确 file:line）；误报面 7 种合法形态零误报（唯一保守面=行内注释命中照报，整行注释豁免）；覆盖缺口=未跟踪文件/数字参数形态不扫描（0 实例，不补）；回归 workspace 494/0 + fmt + clippy 全绿；worktree 与 `0e81949` 逐字节一致。
+- **移交**：T11=packaging 矩阵 x64 腿 + 真签名/公证归凭据配置后（O5 未验证）；Windows cert 采购后 `signtool` 真链首验。
+- **未验证**：真 codesign/notarytool/staple/spctl 全链（凭据未配置——skip 分支即当前验收面，用户裁定 2）；真 Windows 签名。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
