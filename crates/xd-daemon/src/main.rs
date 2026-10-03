@@ -3,7 +3,8 @@
 //! 传输二选一：stdio（缺省）或 TCP 回环提权会话（`--listen`+`--port-file` 成对给出，
 //! 协议与威胁模型见 transport.rs 头注与 docs/security）。
 //! 提权归 M4；M1e 起 Linux 支持 --device 注册物理块设备 + 启动时 sysfs 枚举供 device.list
-//! （Windows 侧 --device 支持 `\\.\PhysicalDriveN` 只读打开，真机语义未验证，见 docs/security §8），
+//! （Windows 侧 --device 支持 `\\.\PhysicalDriveN`、macOS 侧支持 `/dev/diskN` 整盘只读打开，
+//! 真机语义均未验证，见 docs/security §8/§9），
 //! 并在 root（pkexec 兜底）路径做 --image 参数纵深防御（privcheck，见 docs/security/linux-privilege-model.md）。
 //! M1b：扫描 worker 线程与主循环经唯一写口（`transport::write_line`）串行化；`--db` 指定任务库
 //! （缺省 XDG state 路径，打开失败降级内存库并 warn）。
@@ -131,9 +132,27 @@ fn main() {
                         std::process::exit(2);
                     }
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                // macOS：只读整盘句柄（id `unix:/dev/diskN`；FDA 缺失 → EPERM/EACCES ⇒ 提示
+                // 完全磁盘访问；未验证=需真机，见 docs/security §9）。打开/形态校验同源，
+                // 见 xd-device/src/macos.rs。枚举接线（list_only/opener）归 T4。
+                #[cfg(target_os = "macos")]
+                match xd_device::macos::MacosBlockDevice::open(&PathBuf::from(&path)) {
+                    Ok(dev) => devices.push(Arc::new(dev)),
+                    Err(e) => {
+                        eprintln!("error: cannot open device {path}: {e}");
+                        if matches!(&e, xd_device::DeviceError::Io(io)
+                            if io.kind() == std::io::ErrorKind::PermissionDenied)
+                        {
+                            eprintln!(
+                                "hint: 需在系统设置授权完全磁盘访问（系统设置 > 隐私与安全性 > 完全磁盘访问）"
+                            );
+                        }
+                        std::process::exit(2);
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
-                    eprintln!("error: --device 仅 Linux 支持: {path}");
+                    eprintln!("error: --device 仅 Linux/Windows/macOS 支持: {path}");
                     std::process::exit(2);
                 }
             }

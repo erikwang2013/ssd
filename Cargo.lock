@@ -467,6 +467,8 @@ dependencies = [
 name = "xd-device"
 version = "0.3.0"
 dependencies = [
+ "libc",
+ "rustix",
  "serde",
  "tempfile",
  "windows-sys",

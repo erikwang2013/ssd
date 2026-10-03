@@ -19,5 +19,11 @@ windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Devices_DeviceAndDriverInstallation",  # SetupAPI 枚举（SetupDiGetClassDevsW…）
 ] }
 
+# macOS 物理盘枚举/只读打开（macos.rs）。仅 macOS 目标编译；真机语义未验证（见 docs/security §9）。
+# rustix 走 workspace 依赖表（1.1.5）；libc 取 lockfile 既有版本（0.2.189，DKIOC ioctl 出参）。
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+rustix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -4,6 +4,8 @@
 pub mod image;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(windows)]
 pub mod windows;
 
@@ -73,4 +75,26 @@ pub trait BlockDevice: Send + Sync {
     fn source_rdev(&self) -> Option<(u64, u64)> {
         None
     }
+}
+
+/// unix 系共用的源设备 rdev（`linux.rs` 与 `macos.rs` 各自 `impl` 都调这里）：
+/// fstat **已打开的 fd**（不重开路径、无写路径——只读铁律不破）→ `st_rdev` → (major, minor)。
+///
+/// 解码恒用 glibc 式（[`dev_major_minor`]，与 `xd-core::export` 的本地副本 `major_minor` 同式）：
+/// 同盘校验 -32006 是 `st_dev(目标) == st_rdev(源)` 的**相等比较**，两侧必须同解码才不失效——
+/// macOS 的真实 dev_t 布局（Darwin：major 高 8 位 / minor 低 24 位）与此不同，但确定性解码不改变
+/// 相等判定；换 Darwin 解码而 xd-core 侧不改，会让 -32006 在 macOS 上**静默失效**（见 macos.rs 头注）。
+#[cfg(unix)]
+pub(crate) fn source_rdev_of(file: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some(dev_major_minor(file.metadata().ok()?.rdev()))
+}
+
+/// glibc `dev_t` 解码（gnu_dev_major/minor）。跨 unix 共用——`xd-core` 有同式本地副本
+/// （`export.rs::major_minor`，那份需跨 unix 编译、不能依赖本 crate 的 linux 模块）。
+#[cfg(unix)]
+pub(crate) fn dev_major_minor(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
 }

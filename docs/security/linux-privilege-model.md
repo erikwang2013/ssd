@@ -265,3 +265,45 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
       读 512B、越尾短读——`crates/xd-device/tests/windows_smoke.rs`）；真机差异面：换盘热插拔、
       USB-SATA 桥接盘的 BusType/removable 归类、4Kn 扇区盘的 512B 读。
 - [ ] UAC 提权 daemon 下 `--device` 全链路与同盘校验缺口的用户可见性（Task 4 交付）。
+
+## 9. macOS 平台层（M1e-tail T3：/dev/diskN 枚举 + 只读打开 + Full Disk Access 提示）
+
+**实现**：`crates/xd-device/src/macos.rs` —— `read_dir("/dev")` + 形态解析枚举整盘
+（`disk<纯数字>`；分区 `diskXsY`/裸盘 `rdiskX` 不列）→ 容量经 `libc::ioctl` 的
+`DKIOCGETBLOCKSIZE`(u32) × `DKIOCGETBLOCKCOUNT`(u64)（libc 未导出这两个常量 ⇒ 按 Darwin
+`_IOC` 编码常量求值：`_IOR('d',24,u32)`/`_IOR('d',25,u64)`，头文件值 0x40046418/0x40086419
+钉在单测）→ 打开 `/dev/diskN` 仅 `O_RDONLY`（`rustix::fs::open`；无任何写位）→ `read_at` =
+`pread` 循环补齐（同 Linux 口径）。daemon 侧 `--device /dev/diskN` 走同源打开（信任边界校验：
+仅整盘形态，分区/裸盘/任意路径拒绝）；FDA 缺失（EPERM）/非 operator 组（EACCES）→
+`ErrorKind::PermissionDenied`，daemon 打印「需在系统设置授权完全磁盘访问」提示。
+`source_rdev` 复用 `xd_device::source_rdev_of`（unix 共用，`linux.rs` 同函数）。
+
+**同盘校验（-32006）在 macOS 的语义**：精快路径 `st_dev(目标) == st_rdev(源)` 是**同式解码下的
+相等比较**——`xd-core::export` 的目标侧解码同为 glibc 式（其 `major_minor` 本地副本，跨 unix
+编译），故 macOS 上两侧一致、相等语义成立；解码出的数字并非 Darwin major/minor 语义，但确定性
+解码不改变相等判定（若改 Darwin 解码而 xd-core 侧不改，-32006 会**静默失效**——两侧必须同式，
+见 `xd-device/src/lib.rs`）。盘级祖先第二道走 sysfs，macOS 无 `/sys` ⇒ 恒不可用 → fail-open +
+stderr 留痕（§6 语义），macOS 只剩精快路径。
+
+**已验（CI 实跑）**：`rust (macos-latest)` 实跑 `tests/macos_smoke.rs`（枚举 ≥1 **硬断言**；
+打开/读 512B **弱断言**——PermissionDenied 接受并 stderr 标注）与 `macos::tests` 纯函数单测
+（run id 随归档补引，照 §8 先例）。
+
+**已知限制（M1 明示接受）**：
+
+- **枚举容量需权限**：`DKIOCGETBLOCK*` 需打开 fd，而 `/dev/diskN` 为 `brw-r----- root:operator`
+  （普通用户 EACCES；现代 macOS 上 root 无 FDA 亦 EPERM）⇒ 普通用户上下文枚举出的盘
+  `size_bytes=0`（该盘仍列入 + stderr 留痕——跳盘会让普通用户 `device.list` 全空；容量**成功
+  读到 0** 的盘仍跳过）。macOS daemon 由 osascript 提权拉起（Task 4）⇒ 真机路径容量恒可查。
+- **transport 恒 None / removable 恒 false**：M1 不引 IOKit（计划裁定：`diskutil info -plist`
+  子进程太慢），UI 分组提示在 macOS 暂缺；M2 用 IOKit 补（含 `kIOMediaRemovable`）。
+- **枚举接线缺口（与 Windows 同一枚，T4 统一修）**：daemon 的 macOS `list_only` 恒空 +
+  `DeviceOpener` 恒 `Noopener`（`main.rs` 本任务仅接 `--device` 臂）⇒ 提权 daemon 若只传
+  `--listen/--port-file` 则列零设备、扫描走不通。T4 必须一并接线（枚举 → `list_only`；`unix:`
+  id 的 opener 臂按平台分派；`image:` 拒绝语义保持）。
+
+**未验证（需真机）**：
+
+- [ ] root + 完全磁盘访问（FDA/TCC）下的真机打开/读取/扫描；FDA 缺失时 EPERM 与提示文案。
+- [ ] 真机枚举盘号/容量正确性（外接 USB 盘、Apple Fabric 命名差异）；`rdisk` 性能与权限评估。
+- [ ] 未签名包 + FDA 授权的 Gatekeeper 交互（归 Task 5/M2）。
