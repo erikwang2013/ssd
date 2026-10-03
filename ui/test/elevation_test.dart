@@ -300,31 +300,34 @@ void main() {
       expect(daemon.authLines.single, '{"auth":"tok"}');
     });
 
-    test('启动器未退出不阻塞连接：launcherExit 挂起 + port-file 就绪 ⇒ 照常握手（起提权与轮询并行）', () async {
-      // qual-m2-t6 补钉（E5 变形存活）：把 launcherExit 改回 await 语义，真实场景即死锁
-      // ——macOS osascript 直到 daemon 会话结束才返回，UI 将永远等不到连接。
-      final daemon = await FakeDaemon.start(
-        token: 'tok',
-        onRequest: (req, send) => send(pongLine(req)),
-      );
-      addTearDown(daemon.close);
-      final dir = Directory.systemTemp.createTempSync('xd_elev');
-      addTearDown(() => dir.deleteSync(recursive: true));
-      final pf = File('${dir.path}/session.port')
-        ..writeAsStringSync(daemon.portFileContent);
-      final never = Completer<int>(); // 提权进程不落定：osascript 长会话的替身
-      final sw = Stopwatch()..start();
+    test(
+      '启动器未退出不阻塞连接：launcherExit 挂起 + port-file 就绪 ⇒ 照常握手（起提权与轮询并行）',
+      () async {
+        // qual-m2-t6 补钉（E5 变形存活）：把 launcherExit 改回 await 语义，真实场景即死锁
+        // ——macOS osascript 直到 daemon 会话结束才返回，UI 将永远等不到连接。
+        final daemon = await FakeDaemon.start(
+          token: 'tok',
+          onRequest: (req, send) => send(pongLine(req)),
+        );
+        addTearDown(daemon.close);
+        final dir = Directory.systemTemp.createTempSync('xd_elev');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final pf = File('${dir.path}/session.port')
+          ..writeAsStringSync(daemon.portFileContent);
+        final never = Completer<int>(); // 提权进程不落定：osascript 长会话的替身
+        final sw = Stopwatch()..start();
 
-      final client = await connectElevatedSession(
-        portFile: pf.path,
-        launcherExit: never.future,
-        timeout: const Duration(seconds: 5),
-        interval: const Duration(milliseconds: 10),
-      );
-      addTearDown(client.close);
-      expect((await client.ping()).pong, isTrue);
-      expect(sw.elapsedMilliseconds, lessThan(2000), reason: '连接不得等提权进程退出');
-    });
+        final client = await connectElevatedSession(
+          portFile: pf.path,
+          launcherExit: never.future,
+          timeout: const Duration(seconds: 5),
+          interval: const Duration(milliseconds: 10),
+        );
+        addTearDown(client.close);
+        expect((await client.ping()).pong, isTrue);
+        expect(sw.elapsedMilliseconds, lessThan(2000), reason: '连接不得等提权进程退出');
+      },
+    );
 
     test('半行形态①：只有端口（1 段，FormatException）→ 重试到完整行', () async {
       final daemon = await FakeDaemon.start(
@@ -564,11 +567,7 @@ void main() {
       expect(ctx.replaced.single, same(ctx.elevated));
       // qual-m2-t6 补钉（S1 存活）：旧（非提权）daemon 是 UI 子进程，换用后必须关闭，
       // 否则它既无 owner-pid 监督触发（UI 仍活）也无空转自退触发（socket 未断），常驻。
-      expect(
-        ctx.local.closed,
-        isTrue,
-        reason: '旧 client 换用后必须被关闭（scan 侧此前无钉）',
-      );
+      expect(ctx.local.closed, isTrue, reason: '旧 client 换用后必须被关闭（scan 侧此前无钉）');
       await tester.pumpWidget(const SizedBox());
       await tester.pump();
       debugDefaultTargetPlatformOverride = null;

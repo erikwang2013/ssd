@@ -154,11 +154,9 @@ void main() {
     expect(ctx.local.closed, isTrue, reason: '旧 client 必须被关闭');
     // qual-m2-t6 候选 C：换用后旧 client **只准 close**，不得再发任何调用（exact-match 钉住
     // 交接边界；T7 增 daemon.shutdown RPC 后此断言放宽为「恰好一次 shutdown」）。
-    expect(
-      ctx.local.calls,
-      ['listDevices'],
-      reason: '旧 client 在换用后只被关闭，不得再被调用（shutdown RPC 归 T7）',
-    );
+    expect(ctx.local.calls, [
+      'listDevices',
+    ], reason: '旧 client 在换用后只被关闭，不得再被调用（shutdown RPC 归 T7）');
     debugDefaultTargetPlatformOverride = null;
   });
 
@@ -217,7 +215,10 @@ void main() {
   testWidgets('macOS：提权后列表非空 ⇒ 设备照常展示、不误显 FDA 提示（提示只属空列表态）', (tester) async {
     // qual-m2-t6 候选 B：FDA 文案的**时机**（只应出现在「已提权仍空」）此前无反向钉——
     // 若提示在非空列表也渲出，等于对权限已足够的用户误报缺 FDA。
-    final ctx = await pumpHome(tester, platform: TargetPlatform.macOS); // 缺省 elevatedDevices 非空
+    final ctx = await pumpHome(
+      tester,
+      platform: TargetPlatform.macOS,
+    ); // 缺省 elevatedDevices 非空
     await tester.tap(find.text('以管理员身份重启引擎'));
     await flush(tester);
 
@@ -347,6 +348,105 @@ void main() {
     }
     // 走到这里即通过：dispose 后 setState 会以 FlutterError 失败本测试
     expect(localB.closed, isFalse, reason: '失败路径不得关旧 client（页面已亡时同样不关）');
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('提权在途页面卸载：会话目录不残留（dispose 先于目录交出 ⇒ 卸载分支补清）', (tester) async {
+    // qual-m2-t6 收口（E2）：授权框久置时关窗 ⇒ dispose 跑在 elevateSession 交出会话目录**之前**
+    // （彼时 _elevationDir 仍为 null，dispose 的清理扑空）；卸载分支若不补清，含 0600 令牌文件的
+    // 会话目录永久残留在系统临时目录。
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+    final gate = Completer<void>();
+    final local = FakeCoreClient(daemonPathOverride: _daemon);
+    final elevated = FakeCoreClient(devices: const [_elevatedDevice]);
+    ElevationPlan? plan;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          client: local,
+          elevationLauncher: (p) async {
+            plan = p;
+            File(p.portFile).writeAsStringSync('41234 token\n');
+            return 0;
+          },
+          elevationConnect:
+              ({
+                required portFile,
+                required launcherExit,
+                required timeout,
+                required interval,
+              }) async {
+                await gate.future;
+                return elevated;
+              },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('以管理员身份重启引擎'));
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox()); // 提权在途卸载：dispose 此刻看不到会话目录
+    await tester.pump();
+    gate.complete();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(elevated.closed, isTrue, reason: '提权会话必须显式关闭（路径锚点）');
+    final dir = File(plan!.portFile).parent;
+    expect(dir.existsSync(), isFalse, reason: '在途卸载后会话目录必须清理（令牌目录泄漏 = E2）');
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('重复提权：换用时旧会话目录被清（临时目录不随重试累积）', (tester) async {
+    // qual-m2-t6 收口（E1）：提权成功但列表仍空（如 macOS 缺 FDA）⇒ 入口保持可见、用户会再点。
+    // 换用新会话后旧会话目录（0600 令牌文件）必须清掉；否则每次重试在系统临时目录留一根。
+    debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+    final dirs = <Directory>[];
+    final local = FakeCoreClient(daemonPathOverride: _daemon);
+    final elevated = FakeCoreClient(
+      devices: const [],
+      daemonPathOverride: _daemon,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          client: local,
+          elevationLauncher: (plan) async {
+            dirs.add(File(plan.portFile).parent);
+            File(plan.portFile).writeAsStringSync('41234 token\n');
+            return 0;
+          },
+          elevationConnect:
+              ({
+                required portFile,
+                required launcherExit,
+                required timeout,
+                required interval,
+              }) async {
+                await launcherExit;
+                return elevated;
+              },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('以管理员身份重启引擎'));
+    await flush(tester);
+    expect(dirs, hasLength(1));
+    expect(dirs.single.existsSync(), isTrue, reason: '在用会话目录在会话存续期间必须保留');
+
+    // 提权后仍空（缺 FDA 场景）⇒ 入口仍在，再点一次 = 换用第二个会话
+    await tester.tap(find.text('以管理员身份重启引擎'));
+    await flush(tester);
+    expect(dirs, hasLength(2));
+    expect(dirs[0].existsSync(), isFalse, reason: '换用后旧会话目录必须清理（E1：不得累积残留）');
+    expect(dirs[1].existsSync(), isTrue, reason: '在用的会话目录不得被误清');
+
+    // 收尾：卸载 ⇒ dispose 清掉在用目录（不留测试垃圾）
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+    expect(dirs[1].existsSync(), isFalse, reason: 'dispose 清理在用会话目录');
     debugDefaultTargetPlatformOverride = null;
   });
 }

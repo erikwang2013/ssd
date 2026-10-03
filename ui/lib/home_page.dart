@@ -124,6 +124,8 @@ class _HomePageState extends State<HomePage> {
       _elevationPending = true;
       _elevationNotice = null;
     });
+    // 换用前的会话目录：成功换用后清掉（重复提权不得在系统临时目录累积残留；同 scan 侧口径）
+    final oldDir = _elevationDir;
     final CoreClient fresh;
     try {
       fresh = await elevateSession(
@@ -148,6 +150,9 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) {
       // 页面已销毁：提权 daemon 虽由 --owner-pid 监督兜底，显式关掉更直接
       unawaited(fresh.close().catchError((Object _) {}));
+      // dispose 先于会话目录交出（彼时 _elevationDir 仍为 null）⇒ 在此补清，否则残留
+      final dir = _elevationDir;
+      if (dir != null) cleanupElevationDir(dir);
       return;
     }
     final old = _client;
@@ -161,6 +166,7 @@ class _HomePageState extends State<HomePage> {
           ? kMacosFdaHint
           : null;
     });
+    if (oldDir != null) cleanupElevationDir(oldDir);
     widget.onClientReplaced?.call(fresh);
     _reload();
   }
