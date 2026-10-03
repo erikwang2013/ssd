@@ -4,6 +4,7 @@
 // port-file）+ 假连接器 → 断言按钮可见性、换 client 并重列、取消文案与不换 client、macOS
 // FDA 提示。提权流本体（命令构造/会话建立）的钉在 elevation_test.dart（T6 抽取共享流，零回归）。
 // **未验证（需真机）**：真 UAC/osascript/pkexec 对话框与提权链、真 FDA 交互。
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -151,6 +152,13 @@ void main() {
     expect(find.text('U 盘 · SanDisk'), findsOneWidget, reason: '提权后设备必须重列出来');
     // 旧（非提权）daemon 是 UI 子进程：换用后必须显式处置，否则残留孤儿进程
     expect(ctx.local.closed, isTrue, reason: '旧 client 必须被关闭');
+    // qual-m2-t6 候选 C：换用后旧 client **只准 close**，不得再发任何调用（exact-match 钉住
+    // 交接边界；T7 增 daemon.shutdown RPC 后此断言放宽为「恰好一次 shutdown」）。
+    expect(
+      ctx.local.calls,
+      ['listDevices'],
+      reason: '旧 client 在换用后只被关闭，不得再被调用（shutdown RPC 归 T7）',
+    );
     debugDefaultTargetPlatformOverride = null;
   });
 
@@ -203,6 +211,142 @@ void main() {
     expect(find.textContaining('完全磁盘访问'), findsOneWidget);
     expect(find.textContaining('隐私与安全性'), findsOneWidget);
     expect(find.textContaining('未获得授权'), findsNothing, reason: '提权成功过，不是授权失败');
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('macOS：提权后列表非空 ⇒ 设备照常展示、不误显 FDA 提示（提示只属空列表态）', (tester) async {
+    // qual-m2-t6 候选 B：FDA 文案的**时机**（只应出现在「已提权仍空」）此前无反向钉——
+    // 若提示在非空列表也渲出，等于对权限已足够的用户误报缺 FDA。
+    final ctx = await pumpHome(tester, platform: TargetPlatform.macOS); // 缺省 elevatedDevices 非空
+    await tester.tap(find.text('以管理员身份重启引擎'));
+    await flush(tester);
+
+    expect(ctx.replaced.single, same(ctx.elevated));
+    expect(find.text('U 盘 · SanDisk'), findsOneWidget, reason: '提权后设备须照常列出');
+    expect(
+      find.textContaining('完全磁盘访问'),
+      findsNothing,
+      reason: '列表非空 = 权限已足够，FDA 提示不得误显',
+    );
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('父级换 client ⇒ 本页状态跟随并重列；同 client 重建不重复请求（didUpdateWidget）', (
+    tester,
+  ) async {
+    // qual-m2-t6 候选 A：main.dart 在扫描页提权重启后 setState 换 app 级 client，
+    // 首页须经 didUpdateWidget 跟随（identical 短路两条路径此前均无钉）。
+    final a = FakeCoreClient(devices: const [_localDevice]);
+    final b = FakeCoreClient(devices: const [_elevatedDevice]);
+    await tester.pumpWidget(MaterialApp(home: HomePage(client: a)));
+    await tester.pumpAndSettle();
+    expect(find.text('local.img'), findsOneWidget);
+    expect(a.calls.where((c) => c == 'listDevices'), hasLength(1));
+
+    // 同一 client 的重建（主题/尺寸等引发的父级 rebuild）：identical 短路，不重复拉设备
+    await tester.pumpWidget(MaterialApp(home: HomePage(client: a)));
+    await tester.pumpAndSettle();
+    expect(
+      a.calls.where((c) => c == 'listDevices'),
+      hasLength(1),
+      reason: '同一 client 不得重复请求设备表',
+    );
+
+    // 父级换用新 client（扫描页提权重启经 main.dart 的 setState 路径）：
+    // 本页必须跟随，并按新 client 重列设备（提权后枚举结果可能不同）
+    await tester.pumpWidget(MaterialApp(home: HomePage(client: b)));
+    await tester.pumpAndSettle();
+    expect(b.calls, contains('listDevices'), reason: '换 client 必须重列设备');
+    expect(find.text('U 盘 · SanDisk'), findsOneWidget);
+  });
+
+  testWidgets('提权在途页面卸载：成功不弃会话（新 client 显式关闭）、失败不崩（无 dispose 后 setState）', (
+    tester,
+  ) async {
+    // qual-m2-t6 补钉（H7 存活）：用户在授权框久置时关窗 ⇒ 页面先亡、提权后落定。
+    // 修前无人钉：成功分支不关 fresh = 无主 root daemon 只靠 --owner-pid 兜底；
+    // 失败分支摘 mounted 守卫 = dispose 后 setState 崩溃。
+    debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+
+    // ① 成功在途卸载
+    final gateOk = Completer<void>();
+    final localA = FakeCoreClient(daemonPathOverride: _daemon);
+    final elevatedA = FakeCoreClient(devices: const [_elevatedDevice]);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          client: localA,
+          elevationLauncher: (plan) async {
+            File(plan.portFile).writeAsStringSync('41234 token\n');
+            return 0;
+          },
+          elevationConnect:
+              ({
+                required portFile,
+                required launcherExit,
+                required timeout,
+                required interval,
+              }) async {
+                await gateOk.future;
+                return elevatedA;
+              },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('以管理员身份重启引擎'));
+    await tester.pump();
+    // 提权期间如实禁用 + 示意（认证框可久置）——首页侧此前无钉
+    expect(find.text('等待授权…'), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byType(FilledButton)).onPressed,
+      isNull,
+      reason: '提权建立中按钮必须禁用',
+    );
+    await tester.pumpWidget(const SizedBox()); // 页面卸载
+    await tester.pump();
+    gateOk.complete();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    expect(
+      elevatedA.closed,
+      isTrue,
+      reason: '页面已亡：提权会话必须显式关闭（owner-pid 监督之外的第一道）',
+    );
+
+    // ② 失败在途卸载：授权取消落到已销毁 State ⇒ 不得 setState（否则本测试以框架错误失败）
+    final gateFail = Completer<void>();
+    final localB = FakeCoreClient(daemonPathOverride: _daemon);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: HomePage(
+          client: localB,
+          elevationLauncher: (plan) => Completer<int>().future,
+          elevationConnect:
+              ({
+                required portFile,
+                required launcherExit,
+                required timeout,
+                required interval,
+              }) async {
+                await gateFail.future;
+                throw ElevationDeniedException('提权进程退出码 1');
+              },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('以管理员身份重启引擎'));
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+    gateFail.complete();
+    for (var i = 0; i < 10; i++) {
+      await tester.pump(const Duration(milliseconds: 20));
+    }
+    // 走到这里即通过：dispose 后 setState 会以 FlutterError 失败本测试
+    expect(localB.closed, isFalse, reason: '失败路径不得关旧 client（页面已亡时同样不关）');
     debugDefaultTargetPlatformOverride = null;
   });
 }
