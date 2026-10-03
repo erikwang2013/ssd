@@ -15,7 +15,9 @@
 //!
 //! **可移植性（T9 修复轮）**：同盘判定与取消的 SIGTERM 均为 unix 实现（`#[cfg(unix)]`）；
 //! 非 unix 无 dev_t / 无信号，故「源为物理设备」或「取消运行中作业」时**显式报
-//! `PlatformUnsupported`**（绝不静默放行/假装已取消；运行时平台层归 M1e-tail）。
+//! `PlatformUnsupported`**（绝不静默放行/假装已取消）。余量预检是 UX 预检、非安全边界，其
+//! `statvfs` 在非 unix 缺席时仅 **warn 后跳过**（写失败由逐件 degraded/failed 报告兜底——报错
+//! 会拖垮整条导出链而无安全收益）。运行时平台层（Win32 余量/信号）归 M1e-tail。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -112,9 +114,23 @@ pub fn check_target(
             ));
         }
     }
-    let vfs =
-        rustix::fs::statvfs(target).map_err(|_| ExportError::TargetNotWritable(dir.clone()))?;
-    check_space(vfs.f_bavail.saturating_mul(vfs.f_frsize), estimated)
+    // 余量预检是 UX 预检，**不是安全边界**（写失败由逐件 degraded/failed 报告兜底）⇒ 非 unix 平台
+    // 无 statvfs 时 warn 后放行，而不是像同盘校验/取消那样报 `PlatformUnsupported`：那会让整条导出链
+    // 在 Windows 上运行时必败（连带把 happy/-32007/degraded 等平台中立的用例拖成红 → 只能整组门控 =
+    // 静默丢覆盖）。真实现（GetDiskFreeSpaceEx 等）归 M1e-tail 平台层。
+    #[cfg(unix)]
+    {
+        let vfs =
+            rustix::fs::statvfs(target).map_err(|_| ExportError::TargetNotWritable(dir.clone()))?;
+        check_space(vfs.f_bavail.saturating_mul(vfs.f_frsize), estimated)
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!(
+            "warn: 本平台无 statvfs——跳过余量预检（需 {estimated} 字节；写失败将逐件报告）：{dir}"
+        );
+        Ok(())
+    }
 }
 
 /// 同盘校验：① 精快路径（内核事实 `st_dev(目标) == st_rdev(源)`）② 盘级祖先（sysfs 走链，
@@ -179,6 +195,8 @@ fn is_descendant_at(
 }
 
 /// 余量校验（纯函数）：`f_bavail * f_frsize < estimated` → -32010（非 root 可用块，不用 f_blocks）。
+/// 取值源 `statvfs` 为 unix 专属（见 `check_target` 尾段）⇒ 本函数随之 unix 门控（否则非 unix 无调用方）。
+#[cfg(unix)]
 fn check_space(avail: u64, estimated: u64) -> Result<(), ExportError> {
     if avail < estimated {
         Err(ExportError::InsufficientSpace(estimated))
@@ -666,6 +684,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn space_check_uses_estimated_upper_bound() {
         assert!(check_space(16007, 16007).is_ok(), "恰好够用放行");
