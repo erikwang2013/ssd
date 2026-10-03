@@ -191,4 +191,19 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 
 ---
 
+## 执行记录
+
+### T1（TCP 回环传输）—— impl-m1e-t1。提交沿革：`3d505cc`（主）→ `e309254`（spec 观察①：`SharedSink::write_all` 整行原子 + 并发布/响应交错钉测）→ `07710a2`（qual 修复轮：F-Dart-1 会话死亡语义 + 护栏钉 + security §7 事实化；原 `16720d3`，lead push 前 amend 消息）→ `1661088`（qual 第 5 件：`wait_port_file` 32-hex 收下加固）。DONE → spec **PASS** → qual **ISSUES**（1 行为缺陷 + 安全护栏缺钉）→ 修复有牙 + 复核 → **APPROVED**（T1 关闭；workspace 457/0；flutter 120+2 / 带 daemon 122；CI 四轮 5/5）
+
+- **交付**：daemon `--listen/--port-file` TCP 回环会话（令牌握手[首行 auth/常数时间/-32001 即断不读后续]、`serve_lines` stdio/TCP 共用、`Notifier` 广播[写失败剔除/drop 注销/`SharedSink` 整行原子]、`portfile.rs`[unix 0600+`.tmp-<pid>`+rename 原子；windows 直写+BCryptGenRandom 标注]）；Dart `LineCoreClient` 抽取 + `SocketCoreClient`（port-file 单次读；-32001 粘性会话失败快速失败）；security §7（威胁模型/令牌生命周期/已知限制）。
+- **spec 独立核验**：12 条对照 + 手工实证（错令牌+合法请求同包只回 -32001 即 EOF；CLI 成对/非回环/坏地址 exit 2；port-file 0600+32hex 无残留；stdout 全程 0 字节）；6 偏离 + 1 计划缺陷（骨架先写 port-file 用 `opts.addr.port()`，`:0` 时会写 0——按正文修正，**erratum 记录**）全接受。
+- **qual 变异 23 枚（R1-R16/D1-D7）**：KILL 归因干净（R15 write_all 摘除 3/3 稳定红）；SURVIVE = 2 时序等价/1 死代码 + **7 枚真缺钉补测**（前缀/空串令牌绕过、非回环放行、成对约束、空行、符号链接写穿、写失败剔除、SinkHandle 注销）+ **1 行为缺陷 F-Dart-1**（FIN 不触发 `Socket.done` → 在飞 + 后续每次 10s 悬挂；T4 重试流受影响）→ 粘性 `_sessionError` 修复（缺口钉 <1s 绿）。
+- **落地文件 sha 差异说明**：landed 两新文件含仓库既有零宽版权串（全树约定，非缺陷）；qual INDEX 已补 landed/CI 对照。
+- **记录项（归 M2）**：无行长上限（TCP 把可达面扩到任何本机进程）；accept 循环 EMFILE 紧旋（建议退避）；握手无超时；`lock().unwrap()` 中毒模式；`.tmp` 残留重试与 bind 失败 exit(2) 两分支无测试（近不可达）；`SharedSink::write_fmt/write` 保留为纵深（注释标注无调用路径）；一条注释归属措辞微瑕（记录不改）。
+- **T4 移交（头号设计输入）**：① 提权 daemon 生命周期缺口——协议无 shutdown RPC、client 无进程句柄 → root daemon 无主滞留 + 多轮提权累积 + port-file/令牌清理归属须定方案（shutdown RPC / owner-pid 监督 / 全断自退）；② port-file 半行**两形态**（FormatException / 截断 token→-32001）轮询须双形态重试；③ 白名单用字面 IP（勿 localhost）；④ TCP 形态新建 client 不走 restartPrivileged；⑤ taskId 过滤保留。
+- **T2/T3 移交**：port-file ACL 收紧（真机 `icacls` 核对）；Windows 直写可升级 tmp+rename（`MOVEFILE_REPLACE_EXISTING` 可原子）；中危四项随平台层加固；§7 未验证清单随演进同步。
+- **未验证**：Windows/macOS port-file ACL 可读性、真 UAC/osascript/TCC 提权链、提权 daemon 停机行为、中危四项行为面。
+
+---
+
 © 2026 erik · https://erik.xyz · erik@erik.xyz
