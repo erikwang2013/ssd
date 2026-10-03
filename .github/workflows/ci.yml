@@ -2,8 +2,16 @@
 name: CI
 
 # 仅手动触发（Actions 页 "Run workflow"），不随 push / PR 自动执行。
+# packaging=true 追加 package-windows/package-macos（flutter build windows/macos 重成本，
+# 常规轮次不摊；用法见 README「打包」节）。
 on:
   workflow_dispatch:
+    inputs:
+      packaging:
+        description: '构建 Windows/macOS 安装包并冒烟（约 +20 分钟；默认 false）'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
 
 permissions:
   contents: read
@@ -81,3 +89,46 @@ jobs:
       - run: flutter test
         env:
           XD_DAEMON_BIN: ${{ github.workspace }}/target/debug/xd-daemon
+
+  package-windows:
+    # 手动门控（T5）：仅 dispatch 输入 packaging=true 时运行——flutter build windows 重成本，
+    # 常规 CI 轮次不摊。用法：Actions → CI → Run workflow → packaging=true。
+    if: github.event.inputs.packaging == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.5
+      - run: flutter pub get --enforce-lockfile
+        working-directory: ui
+      - run: pwsh -NoProfile -File scripts/package-windows.ps1
+      - run: pwsh -NoProfile -File scripts/e2e-package-smoke.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xiaodun-windows-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  package-macos:
+    # 同 package-windows（手动门控）；zip 架构 = runner 架构（macos-latest 目前 arm64）。
+    if: github.event.inputs.packaging == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.5
+      - run: flutter pub get --enforce-lockfile
+        working-directory: ui
+      - run: bash scripts/package-macos.sh
+      - run: bash scripts/e2e-package-smoke.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xiaodun-macos-zip
+          path: dist/*.zip
+          if-no-files-found: error

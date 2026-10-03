@@ -70,4 +70,31 @@ sleep 5
     await client.close();
     expect(done, isTrue);
   }, skip: Platform.isWindows ? 'POSIX sh 假 daemon' : null);
+
+  // 打包布局回退（T4 移交）：打包场景没有 XD_DAEMON_BIN，daemonPath 必须能由
+  // 「与主程序同目录的 xd-daemon[.exe]」解析出来——为空的后果是扫描页提权引导
+  //（retryWithPrivileges）静默退化到旧支路。打包脚本（scripts/package-*.{ps1,sh}）
+  // 与产物冒烟按同一约定断言布局。
+  test('打包布局回退：Windows 形态（宿主 .exe ⇒ 同目录 xd-daemon.exe）', () {
+    final dir = Directory.systemTemp.createTempSync('xd_packaged_win');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final exe = File.fromUri(dir.uri.resolve('xiaodun.exe'))..createSync();
+    expect(
+      packagedDaemonPath(executablePath: exe.path),
+      isNull,
+      reason: 'daemon 不在 ⇒ 不得凭空返回路径',
+    );
+    final daemon = File.fromUri(dir.uri.resolve('xd-daemon.exe'))..createSync();
+    expect(packagedDaemonPath(executablePath: exe.path), daemon.path);
+  });
+
+  test('打包布局回退：macOS 形态（.app/Contents/MacOS，无 .exe 后缀）', () {
+    final dir = Directory.systemTemp.createTempSync('xd_packaged_macos');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final exe = File.fromUri(dir.uri.resolve('Contents/MacOS/xiaodun_ui'))
+      ..createSync(recursive: true);
+    final daemon = File.fromUri(dir.uri.resolve('Contents/MacOS/xd-daemon'))
+      ..createSync();
+    expect(packagedDaemonPath(executablePath: exe.path), daemon.path);
+  });
 }

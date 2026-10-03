@@ -182,6 +182,19 @@ abstract class LineCoreClient implements CoreClient {
   String? get daemonPath => null;
 }
 
+/// 打包布局下的引擎候选：与 [executablePath]（缺省 [Platform.resolvedExecutable]）
+/// 同目录的 `xd-daemon`（宿主可执行文件以 `.exe` 结尾时找 `xd-daemon.exe`）。
+/// Windows 便携 zip 与 macOS `.app/Contents/MacOS` 都按此布置；不存在返回 null，
+/// 开发树与测试进程（flutter_tester）环境不受影响。
+String? packagedDaemonPath({String? executablePath}) {
+  final exe = executablePath ?? Platform.resolvedExecutable;
+  final name = exe.toLowerCase().endsWith('.exe')
+      ? 'xd-daemon.exe'
+      : 'xd-daemon';
+  final candidate = File.fromUri(File(exe).parent.uri.resolve(name));
+  return candidate.existsSync() ? candidate.path : null;
+}
+
 /// 桌面实现：spawn 特权 daemon，stdio 上每行一条 JSON-RPC 消息。
 class IpcCoreClient extends LineCoreClient {
   IpcCoreClient._(this._process, [this._daemonPath, this._extraArgs = const []])
@@ -200,14 +213,19 @@ class IpcCoreClient extends LineCoreClient {
     );
   }
 
-  /// 启动 daemon。[daemonPath] 缺省取环境变量 XD_DAEMON_BIN。
+  /// 启动 daemon。[daemonPath] 优先级：显式参数 → 环境变量 XD_DAEMON_BIN →
+  /// [packagedDaemonPath]（打包布局同目录回退）。回退是打包场景 [daemonPath] 非空的前提，
+  /// 否则扫描页提权引导（`retryWithPrivileges`）会静默退化到旧支路。
   /// [environment] 追加到子进程环境（测试用；root 宿主注入 PKEXEC_UID）。
   static Future<IpcCoreClient> start({
     String? daemonPath,
     List<String> extraArgs = const [],
     Map<String, String>? environment,
   }) async {
-    final path = daemonPath ?? Platform.environment['XD_DAEMON_BIN'];
+    final path =
+        daemonPath ??
+        Platform.environment['XD_DAEMON_BIN'] ??
+        packagedDaemonPath();
     if (path == null) {
       throw StateError('设置 XD_DAEMON_BIN 或传入 daemonPath 指向 xd-daemon 可执行文件');
     }

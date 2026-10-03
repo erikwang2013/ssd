@@ -253,9 +253,10 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
   M1 的 Windows 用户须自行避免把恢复结果写回源盘；**Windows 目标盘同源校验 M2 补
   （卷句柄卷号比较：对目标卷与源盘各取 `IOCTL_STORAGE_GET_DEVICE_NUMBER` 比盘号）**。
 - **枚举需管理员**：`IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 带 `FILE_READ_ACCESS`，且 Vista+
-  上物理盘 `GENERIC_READ` 打开即需提权 ⇒ 非提权进程拿不到盘列表。M1e 本切片 daemon 侧未接
-  Windows 枚举（Windows 上 `device.list` 仅含 `--image`/`--device` 注册项）；Windows daemon 由 UAC 提权
-  拉起（Task 4）——非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）归 M2 评估。
+  上物理盘 `GENERIC_READ` 打开即需提权 ⇒ 非提权进程拿不到盘列表。daemon 侧枚举已由 T4 接线
+  （`enumerate_startup_list` + `win:` 分派 opener，`device.list` = 启动枚举 + `--image`/`--device`
+  注册项）；但**应用内 UAC 入口未接入**（非提权 ⇒ 枚举空 ⇒ 首页无设备 ⇒ 走不到提权引导，§10.6 末条，
+  M2 补）。非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）归 M2 评估。
 - **transport/removable 仅提示**：BusType 归类不参与任何过滤（同 Linux 口径）；两平台归类可
   不一致（如 USB-SATA 桥接盘），以各自真机行为为准（见下）。
 
@@ -302,10 +303,10 @@ stderr 留痕（§6 语义），macOS 只剩精快路径。
   盘/分区归属补。
 - **transport 恒 None / removable 恒 false**：M1 不引 IOKit（计划裁定：`diskutil info -plist`
   子进程太慢），UI 分组提示在 macOS 暂缺；M2 用 IOKit 补（含 `kIOMediaRemovable`）。
-- **枚举接线缺口（与 Windows 同一枚，T4 统一修）**：daemon 的 macOS `list_only` 恒空 +
-  `DeviceOpener` 恒 `NoopOpener`（`main.rs` 本任务仅接 `--device` 臂）⇒ 提权 daemon 若只传
-  `--listen/--port-file` 则列零设备、扫描走不通。T4 必须一并接线（枚举 → `list_only`；`unix:`
-  id 的 opener 臂按平台分派；`image:` 拒绝语义保持）。
+- **枚举接线缺口（T3 登记，T4 已修）**：当时 daemon 的 macOS `list_only` 恒空 + `DeviceOpener`
+  恒 `Noopener` ⇒ 提权 daemon 只传 `--listen/--port-file` 会列零设备。T4 已接线（枚举 →
+  `list_only`；`unix:` id 的 opener 臂按平台分派；`image:` 拒绝语义保持）——本项保留为历史记录，
+  当前实现见 `main.rs` 与 §10.1。
 
 **未验证（需真机）**：
 
@@ -434,3 +435,40 @@ UI 用户。非提权写入
 - [ ] 真机 pid 复用窗口与双 daemon 并存窗口的可见性（需构造属主瞬时被杀）。
 - [ ] **UI 侧入口缺口（T4 已记录，未修）**：Windows 非提权时枚举为空 ⇒ 首页无设备 ⇒ 用户走
       不到扫描页的 -32001 引导。M2 需在首页给提权入口（或非提权枚举面，§8）。
+
+## 11. 打包与分发（M1e-tail T5）
+
+**产物**：`scripts/package-windows.ps1` → `dist/xiaodun-v<版本>-windows-x64.zip`（zip 顶层 =
+同名目录：Flutter Release 全套 + `xiaodun.exe`（由 `xiaodun_ui.exe` 改名，BINARY_NAME 不动）+
+`xd-daemon.exe` + `README-安装.txt`）；`scripts/package-macos.sh` →
+`dist/xiaodun-v<版本>-macos-<arm64|x64>.zip`（架构 = 构建机架构，`ditto -c -k --keepParent`；
+`.app` 的 `Contents/MacOS/` 内含 `xd-daemon`）。版本号从 workspace `Cargo.toml` 注入（同
+`build-deb.sh`）；工作文件在 `dist/`（已 gitignore）。
+
+**布局约定（引擎发现 = `daemonPath` 非空的前提）**：引擎与主程序**同目录**；
+`ui/lib/core_client/ipc_transport.dart::packagedDaemonPath` 按「宿主可执行文件同目录的
+`xd-daemon[.exe]`」回退（优先级：显式参数 → `XD_DAEMON_BIN` → 同目录回退）。打包场景没有
+`XD_DAEMON_BIN`，为空会让扫描页提权引导静默退化到旧 `_retryViaClientRestart` 支路（T4 移交）——
+打包脚本注释与冒烟脚本按此约定布置/断言。
+
+**冒烟**：`scripts/e2e-package-smoke.{ps1,sh}` = 解压 → 清单/布局断言（主程序 + 引擎 + `data/` +
+`README-*.txt`）→ `--image <64KiB 零填充>` 起 daemon → 管道 ping → 断言 pong。**不用**
+`--listen/--port-file/--owner-pid`：提权会话链路由 §7/§10 的测试覆盖（计划 T5 明文）。
+
+**CI**：`package-windows`/`package-macos` 两个 job 由 `workflow_dispatch` 输入 `packaging=true`
+门控（flutter build windows/macos 重成本，常规轮次不摊）；artifact `xiaodun-windows-zip`/
+`xiaodun-macos-zip`（`dist/*.zip`）。
+
+**签名/公证（归 M2）**：`scripts/notarize.sh` 为占位（M2 实现顺序：逐嵌套可执行 codesign
+`--options runtime` → `notarytool submit --wait` → `stapler staple`；Apple 凭据走 CI secrets，
+不入仓）。**当前包未签名**：macOS Gatekeeper 首次打开需右键-打开（或清 quarantine 属性）、
+Windows SmartScreen 需「仍要运行」（包内 `README-安装.txt` 亦有说明）。`osascript` 提权 ≠ FDA
+（§9/§10）：提权后仍可能 EPERM。
+
+**未验证（需真机）**：
+
+- [ ] 真机解压双击/挂载 `.app`：引擎自动发现（`packagedDaemonPath` 只单测了纯函数，运行时
+      回退未在真机跑过）、未签名包的 Gatekeeper 实际交互、SmartScreen 提示。
+- [ ] macOS 签名/公证链（M2）；`xd-daemon` 作为嵌套可执行在硬签名下的 TCC/FDA 授权归属
+      （授权属主是 app 还是 daemon）M2 定。
+- [ ] 无 VC++ 运行库的 Windows 机器上便携包的行为（依赖已写入 `README-安装.txt`）。
