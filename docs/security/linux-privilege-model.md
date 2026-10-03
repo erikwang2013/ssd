@@ -242,6 +242,10 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
 同 Linux pread 语义）。daemon 侧 `--device \\.\PhysicalDriveN` 走同源打开。只读铁律：全文件
 无任何写 API（无 `GENERIC_WRITE`/`WriteFile`/`FILE_WRITE_DATA`）。
 
+**已验（CI 实跑）**：`rust (windows-latest)` 实跑 `tests/windows_smoke.rs` 2/2 与
+`windows::tests` 6/6 通过（枚举非空/读 boot 区/越尾钳位）——CI run `37114173261`
+（HEAD `810405d`）5/5 job 绿。
+
 **已知限制（M1 明示接受）**：
 
 - **同盘校验缺口（-32006）**：Windows 无 `st_rdev`，`WindowsBlockDevice::source_rdev` 恒 `None`
@@ -250,7 +254,7 @@ CI run `37111717813`（HEAD `e309254`）5/5 job 绿。
   （卷句柄卷号比较：对目标卷与源盘各取 `IOCTL_STORAGE_GET_DEVICE_NUMBER` 比盘号）**。
 - **枚举需管理员**：`IOCTL_DISK_GET_LENGTH_INFO` 的 CTL_CODE 带 `FILE_READ_ACCESS`，且 Vista+
   上物理盘 `GENERIC_READ` 打开即需提权 ⇒ 非提权进程拿不到盘列表。M1e 本切片 daemon 侧未接
-  Windows 枚举（Windows 上 `device.list` 仅含 `--image` 注册项）；Windows daemon 由 UAC 提权
+  Windows 枚举（Windows 上 `device.list` 仅含 `--image`/`--device` 注册项）；Windows daemon 由 UAC 提权
   拉起（Task 4）——非提权枚举面（0-access 句柄 + `IOCTL_STORAGE_QUERY_PROPERTY`）归 M2 评估。
 - **transport/removable 仅提示**：BusType 归类不参与任何过滤（同 Linux 口径）；两平台归类可
   不一致（如 USB-SATA 桥接盘），以各自真机行为为准（见下）。
