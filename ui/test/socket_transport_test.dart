@@ -3,73 +3,13 @@
 // （ServerSocket.bind 回环随机端口）照真 daemon 的握手语义：首行必须 {"auth":<token>}，
 // 否则回 -32001 即断；通过后逐行应答 + 可推通知。真 daemon 全链路见 Rust 侧
 // crates/xd-daemon/tests/tcp_session.rs（CI 三平台真跑）。
-import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xiaodun_ui/core_client/ipc_transport.dart';
 import 'package:xiaodun_ui/core_client/protocol.dart';
 
-/// 假 daemon：真 daemon transport.rs 行为的 Dart 镜像（认证首行 → 逐行处理 / -32001 即断）。
-class FakeDaemon {
-  FakeDaemon._(this._server, this.token);
-
-  final ServerSocket _server;
-  final String token;
-
-  /// 收到的首行（逐字断言握手）。
-  final List<String> authLines = [];
-
-  static Future<FakeDaemon> start({
-    required String token,
-    void Function(Map<String, dynamic> request, void Function(String) send)?
-    onRequest,
-  }) async {
-    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
-    final daemon = FakeDaemon._(server, token);
-    server.listen((socket) {
-      unawaited(daemon._serve(socket, onRequest));
-    });
-    return daemon;
-  }
-
-  int get port => _server.port;
-
-  Future<void> _serve(
-    Socket socket,
-    void Function(Map<String, dynamic>, void Function(String))? onRequest,
-  ) async {
-    void send(String line) => socket.writeln(line);
-    var authed = false;
-    final lines = socket
-        .cast<List<int>>()
-        .transform(const Utf8Decoder(allowMalformed: true))
-        .transform(const LineSplitter());
-    await for (final line in lines) {
-      if (!authed) {
-        authLines.add(line);
-        final ok = (jsonDecode(line) as Map<String, dynamic>)['auth'] == token;
-        if (!ok) {
-          send(
-            '{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"Authentication failed"}}',
-          );
-          await socket.flush();
-          await socket.close();
-          return;
-        }
-        authed = true;
-        continue;
-      }
-      onRequest?.call(jsonDecode(line) as Map<String, dynamic>, send);
-    }
-  }
-
-  Future<void> close() => _server.close();
-}
-
-String _pong(Map<String, dynamic> req) =>
-    '{"jsonrpc":"2.0","id":${req['id']},"result":{"pong":true,"version":"fake","protocol":1}}';
+import 'fake_daemon.dart';
 
 void main() {
   test('握手：auth 首行逐字、调用应答、通知进 notifications 流', () async {
@@ -81,7 +21,7 @@ void main() {
       onRequest: (req, send) {
         if (req['method'] == 'ping') {
           send(progress);
-          send(_pong(req));
+          send(pongLine(req));
         }
       },
     );
@@ -153,7 +93,7 @@ void main() {
     addTearDown(() => dir.deleteSync(recursive: true));
     final daemon = await FakeDaemon.start(
       token: 'tok42',
-      onRequest: (req, send) => send(_pong(req)),
+      onRequest: (req, send) => send(pongLine(req)),
     );
     addTearDown(daemon.close);
     final pf = File('${dir.path}/session.port');

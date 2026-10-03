@@ -118,6 +118,9 @@ class _MissingDaemonClient implements CoreClient {
   Stream<Map<String, dynamic>> get notifications => const Stream.empty();
 
   @override
+  String? get daemonPath => null;
+
+  @override
   Future<CoreClient?> restartPrivileged() async => null;
 
   @override

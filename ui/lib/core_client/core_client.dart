@@ -33,6 +33,11 @@ abstract class CoreClient {
   /// 服务端通知（无 id 行）：scan.progress/scan.finished/export.progress/export.finished。
   Stream<Map<String, dynamic>> get notifications;
 
+  /// daemon 可执行文件路径（提权命令构造用：UAC/osascript/pkexec 都要重新拉起同一个
+  /// 二进制）。拿不到路径的实现返回 null ⇒ UI 退回 [restartPrivileged]（同参数 in-place
+  /// 重启，pkexec stdio）或不做提权引导。
+  String? get daemonPath;
+
   /// EACCES（-32001）引导：以同一 daemon 路径/参数经 pkexec 重启，返回新 client
   /// （旧进程由实现关闭）；不支持的实现返回 null（UI 不进提权重试路径）。
   Future<CoreClient?> restartPrivileged();

@@ -176,6 +176,10 @@ abstract class LineCoreClient implements CoreClient {
   /// 提权重启：不支持 in-place 重启的实现返回 null（契约见 CoreClient）。
   @override
   Future<CoreClient?> restartPrivileged();
+
+  /// 缺省无 daemon 路径（SocketCoreClient 已是提权形态；测试 fake 也走这里）。
+  @override
+  String? get daemonPath => null;
 }
 
 /// 桌面实现：spawn 特权 daemon，stdio 上每行一条 JSON-RPC 消息。
@@ -227,10 +231,14 @@ class IpcCoreClient extends LineCoreClient {
 
   final Process _process;
 
-  /// 原始启动参数（restartPrivileged 以同参数重启）。
+  /// 原始启动参数（restartPrivileged 以同参数重启；提权命令构造取 [daemonPath]）。
   final String? _daemonPath;
   final List<String> _extraArgs;
   final List<String> stderrLines = [];
+
+  /// 提权命令构造用（三平台引导：UAC/osascript/pkexec 都要重新拉起同一个二进制）。
+  @override
+  String? get daemonPath => _daemonPath;
 
   /// EACCES（-32001）重试路径：关掉当前（非特权）daemon，经 pkexec 以**原路径/
   /// 原参数**重启并以 root 拉起；无原始路径（测试构造）时返回 null。
