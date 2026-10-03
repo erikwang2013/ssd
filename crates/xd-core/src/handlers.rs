@@ -270,6 +270,12 @@ fn export_err(req: &Request, e: ExportError) -> Response {
         ExportError::TargetOnSource(d) => err(req, RpcError::target_on_source(&d)),
         ExportError::TargetNotWritable(d) => err(req, RpcError::target_not_writable(&d)),
         ExportError::InsufficientSpace(need) => err(req, RpcError::insufficient_space(need)),
+        // 平台不支持（非 unix 的 Windows 臂；M1d 只要求编译/矩阵，运行时归 M1e-tail）：契约无对应码，
+        // 归 -32603 并**留痕**——静默成功会掩盖「同盘校验被跳过/取消没生效」。
+        ExportError::PlatformUnsupported(msg) => {
+            eprintln!("warn: export platform unsupported: {msg}");
+            err(req, RpcError::internal())
+        }
         ExportError::Internal(msg) => {
             eprintln!("warn: export internal: {msg}");
             err(req, RpcError::internal())

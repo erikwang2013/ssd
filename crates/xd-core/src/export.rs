@@ -12,6 +12,10 @@
 //! 同盘判定（-32006）两道：精快路径 `st_dev(目标) == st_rdev(源)` + 盘级祖先（sysfs 走链，
 //! 封「源=整盘 / 目标=其分区」；解析不到 sysfs 节点时 fail-open + stderr 留痕，见
 //! `check_on_source_at`；残窗 = 父/子校验间换靶 TOCTOU，归 M4）。
+//!
+//! **可移植性（T9 修复轮）**：同盘判定与取消的 SIGTERM 均为 unix 实现（`#[cfg(unix)]`）；
+//! 非 unix 无 dev_t / 无信号，故「源为物理设备」或「取消运行中作业」时**显式报
+//! `PlatformUnsupported`**（绝不静默放行/假装已取消；运行时平台层归 M1e-tail）。
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -21,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use rustix::process::{Pid, Signal};
 use serde_json::{Value, json};
 
@@ -33,6 +38,7 @@ pub const MAX_REPORT_ITEMS: usize = 1000;
 /// progress 转发节流（同 `scan.progress` 口径：≥250ms 一条）。
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(250);
 /// 盘级祖先判定的 sysfs 根（生产值；测试经 `check_on_source_at` 注入假根）。
+#[cfg(unix)]
 const SYSFS_ROOT: &str = "/sys";
 
 #[derive(Debug)]
@@ -47,6 +53,9 @@ pub enum ExportError {
     TargetNotWritable(String),
     /// 携带 `need`（= estimatedBytes）供 -32010 文案。
     InsufficientSpace(u64),
+    /// 平台不支持（非 unix 无 dev_t 同盘判定 / 无 SIGTERM 取消）。**显式失败，不静默放行**——
+    /// 静默 Ok 会让「写回源盘」或「UI 显示已取消而 worker 仍在写盘」无声通过（平台层归 M1e-tail）。
+    PlatformUnsupported(String),
     Internal(String),
 }
 
@@ -85,8 +94,24 @@ pub fn check_target(
     if !md.is_dir() {
         return Err(ExportError::TargetNotWritable(dir));
     }
-    let st = rustix::fs::stat(target).map_err(|_| ExportError::TargetNotWritable(dir.clone()))?;
-    check_on_source(major_minor(st.st_dev), source_rdev, &dir)?;
+    // dev_t 走 std 统一访问器（Linux/macOS 同为 u64；rustix 的 `st_dev` 在 macOS 是 i32）。
+    #[cfg(unix)]
+    check_on_source(
+        major_minor(std::os::unix::fs::MetadataExt::dev(&md)),
+        source_rdev,
+        &dir,
+    )?;
+    // 非 unix 无 dev_t ⇒ 同盘判定不可用。源为物理设备时**显式报不支持**（不得静默 Ok：那会让
+    // 「写回源盘」在 Windows 上无声通过）。当前 xd-device 非 Linux 恒给 None ⇒ 此臂实际不可达，
+    // 是「平台层接线后仍不得静默」的保险。
+    #[cfg(not(unix))]
+    {
+        if source_rdev.is_some() {
+            return Err(ExportError::PlatformUnsupported(
+                "same-device check is not implemented on this platform".to_string(),
+            ));
+        }
+    }
     let vfs =
         rustix::fs::statvfs(target).map_err(|_| ExportError::TargetNotWritable(dir.clone()))?;
     check_space(vfs.f_bavail.saturating_mul(vfs.f_frsize), estimated)
@@ -94,6 +119,7 @@ pub fn check_target(
 
 /// 同盘校验：① 精快路径（内核事实 `st_dev(目标) == st_rdev(源)`）② 盘级祖先（sysfs 走链，
 /// 封「源=整盘 / 目标=其分区」盲区）。镜像源（None）双道皆免。
+#[cfg(unix)]
 fn check_on_source(
     target_dev: (u64, u64),
     source_rdev: Option<(u64, u64)>,
@@ -103,6 +129,7 @@ fn check_on_source(
 }
 
 /// `sysfs_root` 注入版（测试用假根；生产恒 `/sys`，见 `SYSFS_ROOT`）。
+#[cfg(unix)]
 fn check_on_source_at(
     sysfs_root: &Path,
     target_dev: (u64, u64),
@@ -139,6 +166,7 @@ fn check_on_source_at(
 /// this filesystem」；本机实测 8:22/8:21 两例一致），故不另解析挂载表（最长前缀匹配只会
 /// 复现已有的一次 stat）。分区在 sysfs 里是整盘目录的子路径（`.../block/sdb/sdb1`，实测），
 /// 故「祖先」正是「同盘且源不更细」。
+#[cfg(unix)]
 fn is_descendant_at(
     sysfs_root: &Path,
     target_dev: (u64, u64),
@@ -285,20 +313,32 @@ impl ExportManager {
             return Ok(state);
         }
         // 先置标记再杀：转发线程 reap 后读到的必是「已取消」（否则终报会漏掉 canceled 标志）。
-        job.canceled.store(true, Ordering::SeqCst);
-        // pid 定向 SIGTERM（不借 child 句柄/锁，见 Job.pid 注释）。
-        // ESRCH 静默：reap 已完成～state 落定之间的 stale-pid 窗内目标可能已不在。
-        match Pid::from_raw(job.pid) {
-            Some(pid) => {
-                if let Err(e) = rustix::process::kill_process(pid, Signal::TERM)
-                    && e != rustix::io::Errno::SRCH
-                {
-                    eprintln!("warn: export {export_id} SIGTERM 失败：{e}");
+        #[cfg(unix)]
+        {
+            job.canceled.store(true, Ordering::SeqCst);
+            // pid 定向 SIGTERM（不借 child 句柄/锁，见 Job.pid 注释）。
+            // ESRCH 静默：reap 已完成～state 落定之间的 stale-pid 窗内目标可能已不在。
+            match Pid::from_raw(job.pid) {
+                Some(pid) => {
+                    if let Err(e) = rustix::process::kill_process(pid, Signal::TERM)
+                        && e != rustix::io::Errno::SRCH
+                    {
+                        eprintln!("warn: export {export_id} SIGTERM 失败：{e}");
+                    }
                 }
+                None => eprintln!("warn: export {export_id} 无有效子进程 pid：{}", job.pid),
             }
-            None => eprintln!("warn: export {export_id} 无有效子进程 pid：{}", job.pid),
+            Ok("canceled")
         }
-        Ok("canceled")
+        // 非 unix 无信号可发（Windows 无 SIGTERM）：**先于置标记**显式报不支持——若置了 canceled
+        // 再假装成功，UI 显示「已取消」而 worker 仍在写盘（静默撒谎）。平台层归 M1e-tail。
+        #[cfg(not(unix))]
+        {
+            Err(ExportError::PlatformUnsupported(format!(
+                "export cancel is not implemented on this platform (worker pid {})",
+                job.pid
+            )))
+        }
     }
 
     /// 起子进程：`current_exe --export-worker --db … --task … --export-id … --target …`。
@@ -449,6 +489,7 @@ mod tests {
         assert!(dedupe_idxs(&[]).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn on_source_is_kernel_fact_equality() {
         // 精快路径：同设备 → -32006（带目标目录文案）；镜像源（None）→ 放行。
@@ -471,6 +512,7 @@ mod tests {
     /// 假 sysfs 根（照 `xd_device::linux::BlockEnumerator::with_root` 先例）：
     /// `8:16 → .../block/sdb`（整盘）、`8:17/8:18 → .../block/sdb/sdb{1,2}`（其分区）。
     /// 生产 `/sys` 的真形态实测同构（sdb→sdb6），此处离线复刻以免依赖真机拓扑。
+    #[cfg(unix)]
     fn fake_sysfs() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         let disk = root.path().join("devices/pci0/block/sdb");
@@ -490,6 +532,7 @@ mod tests {
         root
     }
 
+    #[cfg(unix)]
     #[test]
     fn partition_of_source_disk_is_rejected_by_ancestor_walk() {
         // 盲区封堵的牙：源=整盘 sdb(8,16)、目标=其分区 sdb1(8,17)——rdev 不相等，旧判定放行；
@@ -507,6 +550,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn sibling_and_other_disk_targets_pass() {
         // 兄弟分区（同盘不同设备：sdb2 vs 源 sdb1）与另一块盘（sdc）都不是祖先 ⇒ 放行。
@@ -532,7 +576,9 @@ mod tests {
     #[test]
     fn check_target_uses_real_sysfs_ancestor_gate() {
         let dir = tempfile::tempdir().unwrap();
-        let dev = major_minor(rustix::fs::stat(dir.path()).unwrap().st_dev);
+        let dev = major_minor(std::os::unix::fs::MetadataExt::dev(
+            &std::fs::metadata(dir.path()).unwrap(),
+        ));
         // 测试侧独立取真值：**字面 "/sys"**（不用 SYSFS_ROOT——否则接线错会被测试侧同源盲掉，
         // 该错正是本测要咬的目标）。
         let canon = match std::fs::canonicalize(
@@ -567,7 +613,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn real_sysfs_ancestor_smoke() {
-        let dev = major_minor(rustix::fs::stat("/").unwrap().st_dev);
+        let dev = major_minor(std::os::unix::fs::MetadataExt::dev(
+            &std::fs::metadata("/").unwrap(),
+        ));
         let node = PathBuf::from("/sys").join(format!("dev/block/{}:{}", dev.0, dev.1));
         let canon = match std::fs::canonicalize(&node) {
             Ok(c) => c,
@@ -599,6 +647,23 @@ mod tests {
             ),
             None => eprintln!("skip: {canon:?} 无父 dev（根 fs 直接在整盘上？）——自后代已过"),
         }
+    }
+
+    /// 非 unix 的牙：源为物理设备 ⇒ 同盘判定不可用 ⇒ **显式 `PlatformUnsupported`**（静默 Ok 是
+    /// 缺陷：会让「写回源盘」无声通过）。镜像源（None）不受影响，继续走余量校验。仅非 unix 编译
+    /// （unix 上走真判定，此断言不成立）。
+    #[cfg(not(unix))]
+    #[test]
+    fn same_device_check_is_explicitly_unsupported_off_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            check_target(dir.path(), 0, Some((8, 0))),
+            Err(ExportError::PlatformUnsupported(_))
+        ));
+        assert!(
+            check_target(dir.path(), 0, None).is_ok(),
+            "镜像源不做同盘校验，不得被平台守卫误伤"
+        );
     }
 
     #[test]
@@ -728,9 +793,23 @@ mod tests {
             child: Mutex::new(None),
         });
         m.jobs.lock().unwrap().insert(7, job.clone());
-        assert_eq!(m.cancel(7).unwrap(), "canceled");
-        assert!(job.canceled.load(Ordering::SeqCst), "取消标记已置");
-        assert!(job.state.lock().unwrap().is_none(), "终态由转发线程落定");
+        // 非 unix 无信号：**显式报平台不支持，且不得置 canceled**——置了就是「UI 显示已取消而
+        // worker 仍在写盘」的静默撒谎（本断言即该铁律的牙）。
+        #[cfg(not(unix))]
+        {
+            assert!(matches!(
+                m.cancel(7),
+                Err(ExportError::PlatformUnsupported(_))
+            ));
+            assert!(!job.canceled.load(Ordering::SeqCst), "不得假装已取消");
+            assert!(job.state.lock().unwrap().is_none(), "终态不得被改写");
+        }
+        #[cfg(unix)]
+        {
+            assert_eq!(m.cancel(7).unwrap(), "canceled");
+            assert!(job.canceled.load(Ordering::SeqCst), "取消标记已置");
+            assert!(job.state.lock().unwrap().is_none(), "终态由转发线程落定");
+        }
     }
 
     #[test]
