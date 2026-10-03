@@ -60,14 +60,20 @@ fn spawn_tcp(args: &[&str], port_file: &Path) -> Daemon {
     Daemon { child, stdout }
 }
 
-/// 轮询 port-file 出现并解析 `<port> <token>`（原子 rename ⇒ 读到的必是完整一行）。
+/// 轮询 port-file 出现并解析 `<port> <token>`（unix 原子 rename ⇒ 必是完整一行；Windows 直写，
+/// 故以 token 形态判别就绪，见下）。
 fn wait_port_file(path: &Path) -> (u16, String) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(s) = std::fs::read_to_string(path) {
             let mut it = s.split_whitespace();
             if let (Some(p), Some(t)) = (it.next(), it.next()) {
-                return (p.parse().expect("port"), t.to_string());
+                // token 恒 32 位十六进制（契约）：Windows 的 port-file 是直写（非原子，
+                // 计划裁定），半行读取必须视作「未就绪」继续轮询——否则截断 token 会被
+                // 当结果返回，测试在 Windows CI 上颤动（spec 观察③）。
+                if t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return (p.parse().expect("port"), t.to_string());
+                }
             }
         }
         assert!(

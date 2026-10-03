@@ -52,7 +52,11 @@ fn wait_port_file(path: &Path) -> (u16, String) {
         if let Ok(s) = std::fs::read_to_string(path) {
             let mut it = s.split_whitespace();
             if let (Some(p), Some(t)) = (it.next(), it.next()) {
-                return (p.parse().expect("port"), t.to_string());
+                // 与 tcp_session.rs 同款加固：token 恒 32 位十六进制，形态不符 = 半行未就绪
+                // （Windows port-file 直写非原子），继续轮询而非把截断值当结果。
+                if t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return (p.parse().expect("port"), t.to_string());
+                }
             }
         }
         assert!(
