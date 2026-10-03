@@ -119,10 +119,11 @@ impl Lines {
         }
     }
 
+    /// 只读新行，**不回放 pending**（F1，qual/spec-m1e-t5）：回放与失配暂存会构成纯用户态
+    /// 死循环——首读即失配行（如通知抢在响应前）⇒ `pending.push` ⇒ 下一轮 next 原样取出
+    /// ⇒ 空转无 `read`、超时无效（spec 实证 98% CPU）。`pending` 只由 [Self::response]/
+    /// [Self::notification] 的谓词检索消费（两者入口先查 pending，故不丢件）。
     fn next(&mut self) -> Value {
-        if !self.pending.is_empty() {
-            return self.pending.remove(0);
-        }
         let mut line = String::new();
         let n = self
             .reader
