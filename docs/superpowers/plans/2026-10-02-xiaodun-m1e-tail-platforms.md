@@ -204,6 +204,15 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 - **T2/T3 移交**：port-file ACL 收紧（真机 `icacls` 核对）；Windows 直写可升级 tmp+rename（`MOVEFILE_REPLACE_EXISTING` 可原子）；中危四项随平台层加固；§7 未验证清单随演进同步。
 - **未验证**：Windows/macOS port-file ACL 可读性、真 UAC/osascript/TCC 提权链、提权 daemon 停机行为、中危四项行为面。
 
+### T2（Windows 平台层）—— impl-m1e-t2。提交沿革：`810405d`（主）→ `c2a6779`（§8 引 CI run id + `:253` 括注；qual docfix patch 原文落码）→ `aa4998f`（机械拆分 `windows/enumerate.rs` + 零盘跳过 + P2/P18/P19 钉补）。DONE → spec **PASS**（CI 面独立核验闭）→ qual **APPROVED**（20 枚移植变异 18 KILL / 2 记录）→ 收口增复 APPROVED（T2 关闭；457/0；Windows 腿 430/0；CI 两轮 5/5）
+
+- **交付**：`windows.rs`（287 行）+ `windows/enumerate.rs`（354 行）——SetupAPI 枚举（`GUID_DEVINTERFACE_DISK` → 盘号经 `IOCTL_STORAGE_GET_DEVICE_NUMBER`）/ 只读句柄（`GENERIC_READ` only、无 `NO_BUFFERING`）/ `read_at` 钳位短读（≈Linux pread）；`io_lock: Mutex<()>` 串行化（**计划缺陷①修正**：原 Send/Sync 注释不成立——内核文件游标即共享可变状态）；`win:\\.\PhysicalDriveN` + `--device` 信任边界校验（Linux/macOS 零改动）；冒烟 2 枚 **CI runner 真跑**；纯函数单测 6→8；README/§8 已知限制。
+- **spec 独立核验**：CI 面亲验（headSha 绑定、逐测试名、`runneradmin` 提权上下文旁证——预判风险消解）；计划缺陷②（daemon 臂本地不可交叉 check）由 CI 首次真编译关闭。
+- **qual**：移植变异 19+1=20 枚（**18 KILL**；存活 P3 等效 / P4 两平台同表同缺记 M2）；`SP_DEVICE_INTERFACE_DETAIL_DATA_W` cbSize 与 windows-sys 0.61.2 源码逐位核对属实；只读铁律零写 API；windows-sys 单版本 + feature 最小性微 crate 实证；**拆分机械性独立复现**（25→27 函数，仅 4 处申报差异）。Nit 记录（P18 冗余断言等）。
+- **★ T4 头号移交（opener/枚举接线缺口）**：`main.rs:199-200` Windows `list_only` 恒空 + `:254-255` opener 恒 `Noopener`；UAC 命令若只传 `--listen/--port-file` ⇒ 提权 daemon 列零设备、扫描走不通。必修：(a) Windows 枚举接线（提权上下文正是所需环境）；(b) `win:` id 的 `DaemonOpener` 臂（懒打开）或枚举即注册；(c) `image:` 拒绝语义保持；(d) `--device` 入 UAC 命令须显式规划（单盘注册 ≠ 替代枚举）。
+- **T3 移交**：同款缺口（macOS 亦 `Noopener`+空 list_only）；`main.rs:136`「仅 Linux 支持」消息随 T3 更新；macos.rs 从第一笔守 500 行线宽。
+- **未验证**：真机枚举/读、UAC 全链路与 `--device` 运行时、4Kn 512B 读、USB-SATA 桥接盘 BusType/removable、换盘热插拔、Windows port-file ACL（T1 项）、同盘校验缺口 UX（§8 M2 卷号比较）、IO 面 I1-I9 审查式裁定。CI 脆弱面：冒烟隐含 admin + 恒有 PhysicalDrive0（设计前提非 bug）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
