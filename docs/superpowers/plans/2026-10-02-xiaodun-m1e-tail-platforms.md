@@ -246,6 +246,16 @@ ElevationPlan linuxPlan({required String daemonPath, required String portFile}) 
 - **T6 移交**：**终轮 `packaging=true` 必办**（唯一途径修已发布 artifact 内旧 README + ps1 新行真机首解析）；未验证总表增行全集（运行时回退/真机首启/SmartScreen/无 VC++ 库/macOS 挂载+沙箱/F2/签名公证 M2/TCC-FDA M2/x64 zip/Runner.rc）；判据 4 取证点=两 artifact。
 - **未验证**：pwsh 脚本本机零执行（CI 已实证）；`packagedDaemonPath` 运行时回退（仅纯函数单测）；真机 GUI 首启/签名链全系。
 
+## 执行记录：出口验收（lead 执行）
+
+**Step 1 全矩阵 CI（含打包两 job，双轮）**：分支终轮 `37125671074`@`950f186` **7/7 绿**——**拆包直验**重建 zip 内 README 为逐字修正版（旧误导句消失/新句在案）、`$LASTEXITCODE` 新行真机首次解析（`PACKAGE SMOKE OK` 双平台）；**main 终验 `37126214694`@`2c5fc47`（headSha 绑定）7/7 绿**（rust×3 + flutter + package-deb + package-windows + package-macos）。常规轮 `37125459698` 双打包 job 正确 skipped（门控零扰动）。
+
+**Step 2 未验证边界总表**：security **§12**（12 行汇总）+ §5（Linux 平台项）互补；README 平台矩阵/已知限制已如实（Windows 提权入口「未接入（M2）」等）——全部随 `43529f9` 落地。
+
+**Step 3 文档与合入**：README 项目状态（M1e 段落 + 剩余切片更新）/设计 **§5.1 实现注记**/security §12（`43529f9`）；`--no-ff` merge 至 main（**`2c5fc47`**）；push main。
+
+**M1e-tail 验收结论：通过 → 本切片关闭（M1 完整收盘）。** 里程碑账：5 任务三评审管线全关闭（T1-T5：4+3+3+9+6 笔实现/测试/修复提交 + 5 笔任务归档）；关键拆弹 **F1 测试活锁**（T1 遗留，修复+回归钉双向有牙）；平台层变异矩阵 ~110 枚（T1 23 + T2 20 + T3 36 + T4 39）；workspace **470/0**、flutter **139+2**（带 daemon 141+2）；CI 全矩阵含双平台打包真跑（zip 产物首次进 CI 资产）。provenance 与发版归用户触发的发布流程（v0.4.0）。
+
 ---
 
 © 2026 erik · https://erik.xyz · erik@erik.xyz
